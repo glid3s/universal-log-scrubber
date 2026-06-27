@@ -3280,7 +3280,13 @@ function Add-JsonSamplePairs {
         Add-ProfileBuilderTextFacts -Stats $Stats -Text $Node
         return
     }
-    if ($Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal]) {
+    if ($Node -is [bool] -or
+        $Node -is [int] -or
+        $Node -is [long] -or
+        $Node -is [double] -or
+        $Node -is [decimal] -or
+        $Node -is [datetime] -or
+        $Node -is [guid]) {
         if ($KeyName) { Add-ProfileBuilderColumnValue -Stats $Stats -Name $KeyName -Value ([string]$Node) }
         return
     }
