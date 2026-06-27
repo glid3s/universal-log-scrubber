@@ -7,9 +7,9 @@ events can still be correlated without exposing the original identifiers.
 
 It works offline against Windows Event exports, EVTX files, CSV/TSV/PSV,
 JSON/NDJSON, IIS/W3C, web access/proxy logs, key=value/logfmt/CEF-style logs,
-syslog, and mixed diagnostic text. Version 4.9 expands the tool into a stronger
-universal scrubber with configurable BYOP profiles, seed files, allowlists,
-custom regex rules, and universal label-aware detection.
+syslog, and mixed diagnostic text. Version 4.10 adds a local sample-log profile
+builder, safer upload bundling, profile validation, and more non-technical
+guidance for profile-driven scrubbing.
 
 ## Safety First
 
@@ -21,6 +21,7 @@ Private artifacts include:
 
 - `scrub_token_map_DO_NOT_UPLOAD.csv`
 - `*_DO_NOT_UPLOAD.csv`
+- `profile_build_report_DO_NOT_UPLOAD.md`
 - `scrub_run_manifest.json`
 - local salt files
 - detailed detection review reports
@@ -31,12 +32,12 @@ Private artifacts include:
 Open PowerShell in the repository root:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_9.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
-  -WorkDir C:\scrubbed `
+  -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
   -Profile Generic `
   -DryRun `
@@ -46,6 +47,39 @@ Invoke-ScrubSelfTest
 
 For noninteractive use, provide one of `-Salt`, `-SaltFromEnv`, or `-SaltFile`.
 Prefer `-SaltFromEnv` or `-SaltFile` so the salt is not left in command history.
+
+## Build A Profile From A Sample
+
+When the built-in profiles are not specific enough, point the tool at a local
+sample. It will create an editable BYOP profile without storing raw sample
+values in the profile.
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -BuildProfileFromSample `
+  -Path C:\logs\sample.log `
+  -WorkDir C:\profiles `
+  -ProfileOut C:\profiles\generated-profile.json `
+  -ProfileReportOut C:\profiles\profile_build_report_DO_NOT_UPLOAD.md `
+  -NonInteractive
+```
+
+Then preview with the generated profile:
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -Path C:\logs `
+  -WorkDir C:\scrubbed-preview `
+  -ProfileFile C:\profiles\generated-profile.json `
+  -DryRun `
+  -ExplainDetections `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+```
+
+Add `-ProfileWizard` when you want the tool to ask whether to write optional
+seed and allowlist files from the sample evidence. Those files may contain raw
+values and stay local.
 
 ## What Gets Scrubbed
 
@@ -66,21 +100,19 @@ domains, and common built-in Windows accounts are preserved where that is safer
 and more readable. You can add your own allowlist values in a profile or
 `-AllowlistFile`.
 
-## v4.9 Highlights
+## v4.10 Highlights
 
-- BYOP profile schema v2 with `SchemaColumns`, `WholeColumnRules`,
-  `LabelRules`, `CustomRegexRules`, `Allowlist`, `AllowlistFile`, `SeedTerms`,
-  and `SeedFiles`.
-- CLI seed files via `-SeedFile` and alias-friendly `-SensitiveTermsFile`.
-- Universal label-aware detection for non-Windows logs.
-- Built-in non-Windows presets for web access/proxy, cloud audit, firewall,
-  VPN, app JSON, database, container, Kubernetes, and identity-provider logs.
-- Custom regex detectors with capture groups, keyword prefilters, entropy
-  thresholds, and allowlists.
-- Dry-run detector counts and safer profile validation messages.
-- v4.8 reliability retained: token-map merge/replace, atomic map writes,
-  collision-safe outputs, EVTX progress, EventData/UserData extraction, and
-  24-hex-character default HMAC tokens.
+- `New-ScrubProfileFromSample` and `-BuildProfileFromSample` generate schema v2
+  BYOP profiles from local sample logs.
+- Optional `-ProfileWizard` can write sample-derived seed and allowlist files
+  only when the user asks for them.
+- `Test-ScrubProfile` validates profiles without running a scrub.
+- `-SafeBundleOut` creates a zip with only clean scrubbed outputs and a safe
+  readme, excluding token maps, salts, manifests, and detailed reports.
+- Dry-run summaries now separate high-confidence detections, values to review,
+  and values preserved by allowlist/diagnostic rules.
+- v4.9 BYOP support remains: `SchemaColumns`, `WholeColumnRules`, `LabelRules`,
+  `CustomRegexRules`, `Allowlist`, `AllowlistFile`, `SeedTerms`, and `SeedFiles`.
 
 ## Repository Layout
 
@@ -88,16 +120,17 @@ and more readable. You can add your own allowlist values in a profile or
 src/            PowerShell module
 scripts/        runnable launcher
 docs/           security and operational notes
-docs/profiles/  ready-to-edit BYOP profile examples
+docs/profiles/  BYOP handbook and ready-to-edit profile examples
+.github/        CI self-test workflow
 ```
 
 ## Validation
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_9.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
@@ -111,6 +144,6 @@ detections without writing scrubbed output files.
 
 ## Documentation
 
-See [USAGE.md](USAGE.md) for detailed workflows, profile authoring, seed and
-allowlist file formats, policy modes, token map handling, EVTX conversion
-guidance, and safe-upload checklists.
+See [USAGE.md](USAGE.md) for step-by-step workflows, profile generation,
+profile authoring, seed and allowlist file formats, policy modes, token map
+handling, EVTX conversion guidance, and safe-upload checklists.

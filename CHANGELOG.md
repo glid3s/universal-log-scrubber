@@ -1,5 +1,22 @@
 # Changelog
 
+## v4.10
+
+- Added `New-ScrubProfileFromSample` and launcher support via
+  `-BuildProfileFromSample` for local sample-log profile generation.
+- Added analyzer-only profile generation that writes raw sample evidence only to
+  `profile_build_report_DO_NOT_UPLOAD.md`, not to the generated profile.
+- Added optional `-ProfileWizard` support for user-selected seed and allowlist
+  file generation.
+- Added `Test-ScrubProfile` for profile validation without running a scrub.
+- Added `-SafeBundleOut` for safe upload zip creation from clean scrubbed
+  outputs only.
+- Improved dry-run summaries with high-confidence, review-needed, and preserved
+  value counts.
+- Expanded `USAGE.md` for non-technical workflows and expanded
+  `docs/profiles/README.md` into a BYOP handbook.
+- Added GitHub Actions self-test workflow.
+
 ## v4.9
 
 - Added BYOP profile schema v2 with schema-column rules, whole-column rules,

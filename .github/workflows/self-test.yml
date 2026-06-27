@@ -1,0 +1,31 @@
+name: Self Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  scrubber-self-test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run synthetic self-test
+        shell: pwsh
+        run: |
+          Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+          $ok = Invoke-ScrubSelfTest
+          if (-not $ok) { throw "Invoke-ScrubSelfTest failed." }
+
+      - name: Validate example profiles
+        shell: pwsh
+        run: |
+          Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+          Get-ChildItem .\docs\profiles\*.json | ForEach-Object {
+            if (-not (Test-ScrubProfile -Path $_.FullName -Quiet)) {
+              throw "Profile failed validation: $($_.FullName)"
+            }
+          }

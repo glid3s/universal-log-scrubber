@@ -1,68 +1,115 @@
 # Universal Log Scrubber Usage Guide
 
-This guide walks through the local workflow for scrubbing logs before they leave
-a secure environment. The tool is offline and deterministic: the same original
-value becomes the same token when the same salt and HMAC length are used.
+This guide is written for people who need to safely prepare logs for external
+analysis, including LLM-assisted analysis, without sending sensitive values out
+of a secure environment.
 
-## Recommended Workflow
+The short version:
 
-1. Put raw logs in a local working folder that will not be uploaded.
-2. Set a run salt using an environment variable or protected salt file.
-3. Run a dry run on a representative sample with `-ExplainDetections`.
-4. Add a BYOP profile, seed file, or allowlist when the preview needs tuning.
-5. Re-run dry-run until sensitive values are tokenized and public diagnostics are preserved.
-6. Run the scrubber against the approved log set.
-7. Review the leak-check result and any local-only detection report.
-8. Upload only the scrubbed output files that passed review.
-9. Keep the token map and salt private for local re-identification.
+1. Use a dry run first.
+2. Review what would be tokenized.
+3. Tune with a profile, seed file, or allowlist if needed.
+4. Scrub only after the preview looks right.
+5. Upload only scrubbed outputs, never token maps or local reports.
 
-## Salt Handling
+## First Run
 
-The salt controls deterministic token generation. Reuse the same salt only when
-you intentionally need tokens to correlate across files or runs.
+Open PowerShell in the repository root and run the built-in self-test:
+
+```powershell
+Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+Invoke-ScrubSelfTest
+```
+
+Set a salt. The salt makes the same real value become the same token every time.
+Use the same salt when multiple logs need to correlate with each other.
 
 ```powershell
 $env:SCRUB_SALT = 'use-a-long-random-secret-value'
+```
 
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+Run a dry-run preview. This writes no scrubbed files and no token map:
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -Path C:\logs `
+  -WorkDir C:\scrubbed-preview `
+  -SaltFromEnv SCRUB_SALT `
+  -DryRun `
+  -ExplainDetections `
+  -NonInteractive
+```
+
+If the preview looks good, run the real scrub:
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -SaltFromEnv SCRUB_SALT `
   -NonInteractive
 ```
 
-You can also use `-SaltFile C:\secure\scrub_salt.txt`. Avoid `-Salt` for
-repeatable production workflows because command history may retain it.
+## What Files Are Safe To Upload?
 
-## Basic Scrubs
+Usually safe after review:
 
-CSV or Windows Event CSV:
+- `*_scrubbed.*` files that passed leak check.
+- A `-SafeBundleOut` zip created by the tool.
+- A counts-only detection summary after local review.
+
+Never upload:
+
+- `scrub_token_map_DO_NOT_UPLOAD.csv`
+- `profile_build_report_DO_NOT_UPLOAD.md`
+- `detection_review_DO_NOT_UPLOAD.csv`
+- `scrub_run_manifest.json`
+- raw logs, intermediate converted logs, salts, or seed files
+
+Create a safer upload zip:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs\Security.evtx.csv `
-  -WorkDir C:\scrubbed `
-  -Profile WindowsEventCsv `
-  -SaltFromEnv SCRUB_SALT `
-  -NonInteractive
-```
-
-Recursive mixed folder:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
-  -Include *.csv,*.log,*.json,*.evtx `
-  -Recurse `
+  -SafeBundleOut C:\scrubbed\safe-upload.zip `
   -SaltFromEnv SCRUB_SALT `
   -NonInteractive
 ```
 
-JSON or NDJSON:
+The bundle includes only clean scrubbed outputs and a plain safe readme. It
+excludes maps, salts, manifests, raw logs, and detailed local reports.
+
+## How To Read Dry-Run Output
+
+Dry-run output shows what would be tokenized.
+
+- `High confidence tokenizations` are things like IPs, SIDs, secrets, emails,
+  GUIDs, MACs, auth headers, and provider tokens.
+- `Review for context/readability` means the value is likely sensitive, but a
+  human may want to confirm the profile is not over-scrubbing useful diagnostics.
+- `Preserved by allowlist/diagnostic rules` means the tool recognized something
+  public or diagnostic and left it readable.
+
+If a sensitive value appears in dry-run examples and has a token, good. If a
+sensitive value appears in the source but not in dry-run output, add a profile
+rule or seed term. If a public value would be tokenized, add an allowlist.
+
+## Choosing A Profile
+
+Use `Generic` when unsure. Use a specific profile when the log type is known:
+
+- `WindowsEventCsv` for Windows event CSV/EVTX conversions.
+- `AppJson` for JSON and NDJSON application logs.
+- `Logfmt`, `Cef`, or `Kv`-style profiles for `key=value` logs.
+- `WebAccess` or `Proxy` for access/proxy logs.
+- `CloudAudit`, `Firewall`, `Vpn`, `Database`, `Container`, `Kubernetes`, or
+  `IdentityProvider` when those labels match the source.
+
+Example:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs\app.ndjson `
   -WorkDir C:\scrubbed `
   -Profile AppJson `
@@ -70,116 +117,102 @@ JSON or NDJSON:
   -NonInteractive
 ```
 
-key=value, logfmt, CEF, or LEEF-style text:
+## Build A Profile From A Sample
+
+When no built-in profile fits, let the tool inspect a local sample and generate
+a BYOP profile.
+
+Analyzer-only mode:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs\gateway.log `
-  -WorkDir C:\scrubbed `
-  -Profile Logfmt `
-  -SaltFromEnv SCRUB_SALT `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -BuildProfileFromSample `
+  -Path C:\logs\sample.log `
+  -WorkDir C:\profiles `
+  -ProfileOut C:\profiles\generated-profile.json `
+  -ProfileReportOut C:\profiles\profile_build_report_DO_NOT_UPLOAD.md `
+  -MaxSampleRows 500 `
   -NonInteractive
 ```
 
-## Built-In Profiles
+What this creates:
 
-Use `Generic` when you are unsure. More specific built-ins are available for:
+- `generated-profile.json`: editable schema v2 profile. It does not store raw
+  sample values by default.
+- `profile_build_report_DO_NOT_UPLOAD.md`: local-only evidence report with raw
+  examples, suggestions, and confidence hints.
 
-- `WindowsEventCsv`, `CA`, `IIS`, `Syslog`, `Apache`, `Cef`, `Logfmt`
-- `WebAccess`, `CloudAudit`, `Firewall`, `Vpn`, `Proxy`
-- `AppJson`, `Database`, `Container`, `Kubernetes`, `IdentityProvider`
-- `Text`, `Tsv`, `Psv`
-
-Built-ins are intentionally conservative. Use BYOP profiles when a log source
-has local schema, custom labels, or organization-specific identifiers.
-
-## EVTX Conversion
-
-EVTX files are converted to CSV before scrubbing. Conversion streams rows and
-shows progress so large event logs do not look hung.
+Optional wizard mode:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs\Security.evtx `
-  -WorkDir C:\scrubbed `
-  -SaltFromEnv SCRUB_SALT `
-  -EvtxProgressMode Fast `
-  -NonInteractive
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -BuildProfileFromSample `
+  -Path C:\logs\sample.log `
+  -WorkDir C:\profiles `
+  -ProfileWizard
 ```
 
-Use `CountFirst` when you want true percentage progress. It does a pre-pass to
-count events, then writes CSV rows with EventData/UserData columns when present.
+The wizard can write `generated-seeds.txt` and `generated-allowlist.txt` when
+you explicitly choose to create them. Those files may contain raw values and
+must stay local.
+
+Preview with the generated profile:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs\Security.evtx `
-  -WorkDir C:\scrubbed `
-  -SaltFromEnv SCRUB_SALT `
-  -EvtxProgressMode CountFirst `
-  -NonInteractive
-```
-
-## Token Maps
-
-The token map is the private lookup table that lets local reviewers re-identify
-tokens later. It must not be uploaded.
-
-Use merge mode when adding logs to an existing map:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\more-logs `
-  -WorkDir C:\scrubbed `
-  -TokenMapCsv C:\scrubbed\scrub_token_map_DO_NOT_UPLOAD.csv `
-  -TokenMapMode Merge `
-  -SaltFromEnv SCRUB_SALT `
-  -NonInteractive
-```
-
-Use replace mode only when intentionally starting a new map:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
-  -WorkDir C:\scrubbed `
-  -TokenMapMode Replace `
+  -WorkDir C:\scrubbed-preview `
+  -ProfileFile C:\profiles\generated-profile.json `
+  -DryRun `
+  -ExplainDetections `
   -SaltFromEnv SCRUB_SALT `
   -NonInteractive
 ```
+
+Validate a profile without scrubbing:
+
+```powershell
+Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+Test-ScrubProfile -Path C:\profiles\generated-profile.json
+```
+
+## What To Do When Something Looks Wrong
+
+Sensitive value was missed:
+
+- Add it to a seed file if it is a shapeless name, project, tenant, vendor, or
+  local product term.
+- Add a label rule if it appears after a label like `username=`, `host:`, or
+  `API Key =`.
+- Add a whole-column rule if an entire column is sensitive.
+- Add a custom regex if it follows a local pattern like ticket IDs or internal
+  asset IDs.
+
+Useful public value was tokenized:
+
+- Add it to an allowlist file.
+- Use `regex:` for repeated public labels like build names.
+- Use `domain:` for public domains and subdomains.
+
+Too much was tokenized:
+
+- Check whether `Strict` policy is being used.
+- Add `PassThrough` schema rules for analytical columns such as timestamps,
+  status codes, methods, levels, durations, counts, and event categories.
+
+Too little was tokenized:
+
+- Use `Strict`.
+- Add a BYOP profile.
+- Add seed terms for values that cannot be detected by shape.
 
 ## Seed Terms
 
-Seed terms are for shapeless sensitive values that cannot be inferred reliably:
-organization names, client names, project names, vendor nicknames, internal
-product names, tenant display names, and host prefixes.
+Seed terms are sensitive terms that do not have a reliable pattern. Examples:
+client names, internal project names, organization names, vendor nicknames,
+tenant display names, and internal product names.
 
-Inline terms still work:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs `
-  -WorkDir C:\scrubbed `
-  -SensitiveTerms ExampleCorp,ProjectFalcon,legacy-host-prefix `
-  -SaltFromEnv SCRUB_SALT `
-  -NonInteractive
-```
-
-For real workflows, prefer a seed file:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs `
-  -WorkDir C:\scrubbed `
-  -SeedFile C:\profiles\client-seeds.txt `
-  -SaltFromEnv SCRUB_SALT `
-  -NonInteractive
-```
-
-`-SensitiveTermsFile` is an alias-friendly seed-file input. Profiles can also
-include `SeedTerms` and `SeedFiles`. The tool trims whitespace, ignores blank
-lines and `#` comments, removes duplicates, and reports counts only.
-
-Seed file format:
+Seed file:
 
 ```text
 # One term per line. Comments start with #.
@@ -189,14 +222,39 @@ LegacyVendorName
 internal-product-code
 ```
 
+Use it:
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -Path C:\logs `
+  -WorkDir C:\scrubbed `
+  -SeedFile C:\profiles\client-seeds.txt `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+```
+
+`-SensitiveTermsFile` is also accepted as an alias-friendly seed-file input.
+
 ## Allowlists
 
 Allowlists preserve public diagnostics or harmless values that would otherwise
-look sensitive. Use them for known public domains, health-check words, loopback
-values, build labels, status names, and similar non-sensitive values.
+look sensitive.
+
+Allowlist file:
+
+```text
+127.0.0.1
+::1
+public.example.com
+domain:microsoft.com
+regex:^(health|ready|live)$
+regex:^build-[0-9]+$
+```
+
+Use it:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -AllowlistFile C:\profiles\public-allowlist.txt `
@@ -204,107 +262,23 @@ values, build labels, status names, and similar non-sensitive values.
   -NonInteractive
 ```
 
-Allowlist file format:
+## BYOP Profile Basics
 
-```text
-# Plain text means exact value.
-127.0.0.1
-::1
-public.example.com
+BYOP means bring your own profile. A profile tells the scrubber how to interpret
+your log source.
 
-# Preserve a domain and its subdomains.
-domain:microsoft.com
+Main schema v2 sections:
 
-# Regex values are supported.
-regex:^(health|ready|live)$
-regex:^build-[0-9]+$
-```
+- `SchemaColumns`: decide whether columns/JSON keys are scrubbed, scanned, or
+  passed through.
+- `WholeColumnRules`: tokenize entire values in sensitive columns.
+- `LabelRules`: tokenize values after labels in text, JSON strings, or cells.
+- `CustomRegexRules`: define local patterns with capture groups, keywords, and
+  optional entropy thresholds.
+- `SeedTerms` and `SeedFiles`: add shapeless sensitive terms.
+- `Allowlist` and `AllowlistFile`: preserve approved public values.
 
-## BYOP Profiles
-
-BYOP means bring your own profile. Use it when the built-ins do not know your
-schema, labels, local ID formats, or organization-specific vocabulary.
-
-Practical BYOP workflow:
-
-1. Start with `Generic` dry-run.
-2. Identify schema columns that are always sensitive, always public, or need free-text scanning.
-3. Identify labels that introduce sensitive values, such as `Account Name =`, `API Key =`, `username=`, `host:`, `src_ip=`, or `tenantId=`.
-4. Put organization, client, project, tenant, vendor, and product names in a seed file.
-5. Add custom regex rules for local IDs that no generic detector can know.
-6. Add allowlists for public diagnostics, status values, known public domains, and health-check labels.
-7. Re-run dry-run with `-ExplainDetections`.
-8. Scrub only after the preview looks right.
-
-Generate a starter profile:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -WorkDir C:\profiles `
-  -ProfileTemplate Csv `
-  -NonInteractive
-```
-
-Run with a profile:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs\export.csv `
-  -WorkDir C:\scrubbed-preview `
-  -ProfileFile C:\profiles\csv-schema-profile.json `
-  -SeedFile C:\profiles\client-seeds.txt `
-  -AllowlistFile C:\profiles\public-allowlist.txt `
-  -DryRun `
-  -ExplainDetections `
-  -SaltFromEnv SCRUB_SALT `
-  -NonInteractive
-```
-
-Ready-to-edit examples live in [docs/profiles](docs/profiles):
-
-- `csv-schema-profile.json`
-- `json-app-profile.json`
-- `kv-log-profile.json`
-- `webaccess-profile.json`
-- `seed.example.txt`
-- `allowlist.example.txt`
-
-### Profile Schema v2 Fields
-
-`SchemaColumns` defines how named columns or JSON keys behave:
-
-- `Action = Scrub` tokenizes the entire value.
-- `Action = Scan` scans the value as free text.
-- `Action = PassThrough` preserves the value.
-- Match columns with `Exact`, `Wildcard`, or `Regex`.
-- Optional `Prefix` controls token type.
-- Optional `SplitOn` tokenizes list-like values item by item.
-
-`WholeColumnRules` tokenizes entire column/key values, useful for `UserID`,
-`Machine`, `Server`, `ClientIP`, `APIKey`, and similar fields.
-
-`LabelRules` tokenizes values after labels in any scanned text:
-
-- `Labels`: label names such as `username`, `host`, `API Key`, `tenantId`.
-- `SeparatorRegex`: defaults to `[:=]`.
-- `ValueRegex`: optional custom value boundary.
-- `Prefix`: token prefix, such as `PRINCIPAL`, `DNS`, `IP`, `SECRET`, `X500`, or `OBJECT`.
-- `Preserve` and `PreserveRegex`: rule-local values to keep.
-
-`CustomRegexRules` adds local detectors:
-
-- `Name`: rule name shown in dry-run/detection reports.
-- `Regex`: PowerShell/.NET regular expression.
-- `CaptureGroup`: group to tokenize. Use `0` for the whole match.
-- `Prefix`: token prefix.
-- `Keywords`: cheap prefilter words that must appear before the regex runs.
-- `Entropy`: optional minimum entropy threshold for secret-like values.
-- `Allowlist` and `AllowlistRegex`: rule-local public values to preserve.
-
-`Allowlist`, `AllowlistFile`, `SeedTerms`, and `SeedFiles` behave the same as
-the CLI inputs. Relative file paths are resolved relative to the profile file.
-
-### CSV Schema Example
+Example:
 
 ```json
 {
@@ -322,104 +296,72 @@ the CLI inputs. Relative file paths are resolved relative to the profile file.
     { "Regex": "(?i)^(clientip|src_ip|dst_ip)$", "Prefix": "IP", "SplitOn": "[;,|]" },
     { "Regex": "(?i)(api[_ -]?key|token|secret|password)", "Prefix": "SECRET" }
   ],
+  "LabelRules": [
+    { "Name": "InlineUsers", "Labels": [ "username", "user", "account" ], "Prefix": "PRINCIPAL" },
+    { "Name": "InlineHosts", "Labels": [ "host", "server", "node" ], "Prefix": "DNS" },
+    { "Name": "InlineSecrets", "Labels": [ "API Key", "api_key", "client_secret" ], "Prefix": "SECRET" }
+  ],
   "SeedFiles": [ "client-seeds.txt" ],
   "AllowlistFile": [ "public-allowlist.txt" ]
 }
 ```
 
-### JSON/Application Logs
+More detailed BYOP guidance and copy/paste examples are in
+[docs/profiles/README.md](docs/profiles/README.md).
 
-JSON keys are preserved. String values are scrubbed, and each key acts like a
-column name for schema rules.
+## EVTX Conversion
 
-```json
-{
-  "SchemaVersion": 2,
-  "Name": "JsonAppExample",
-  "Format": "Json",
-  "DenyByDefault": true,
-  "WholeColumnRules": [
-    { "Regex": "(?i)^(user|username|actor|principal)$", "Prefix": "PRINCIPAL" },
-    { "Regex": "(?i)^(host|server|node|pod|container)$", "Prefix": "DNS" },
-    { "Regex": "(?i)^(ip|src_ip|client_ip|remote_addr)$", "Prefix": "IP" },
-    { "Regex": "(?i)(api[_-]?key|token|secret|password)", "Prefix": "SECRET" }
-  ],
-  "LabelRules": [
-    { "Name": "TenantLabels", "Labels": [ "tenant", "tenantId", "org" ], "Prefix": "X500" }
-  ]
-}
+EVTX files are converted to CSV before scrubbing. Conversion streams rows and
+shows progress so large event logs do not look hung.
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -Path C:\logs\Security.evtx `
+  -WorkDir C:\scrubbed `
+  -SaltFromEnv SCRUB_SALT `
+  -EvtxProgressMode Fast `
+  -NonInteractive
 ```
 
-### key=value, logfmt, and CEF-Style Logs
+Use `CountFirst` when you want true percentage progress. It does a pre-pass to
+count events, then writes CSV rows with EventData/UserData columns when present.
 
-Use `Format = "Kv"` when the file is mostly `key=value` or extension fields.
+## Token Maps
 
-```json
-{
-  "SchemaVersion": 2,
-  "Name": "GatewayKvExample",
-  "Format": "Kv",
-  "DenyByDefault": true,
-  "LabelRules": [
-    { "Name": "Users", "Labels": [ "user", "username", "suser", "duser" ], "Prefix": "PRINCIPAL" },
-    { "Name": "Hosts", "Labels": [ "host", "dhost", "shost" ], "Prefix": "DNS" },
-    { "Name": "Addresses", "Labels": [ "src", "dst", "src_ip", "dst_ip" ], "Prefix": "IP" },
-    { "Name": "Secrets", "Labels": [ "api_key", "token", "secret", "password" ], "Prefix": "SECRET" }
-  ]
-}
+The token map is the private lookup table that lets local reviewers re-identify
+tokens later. It must not be uploaded.
+
+Merge into an existing map:
+
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -Path C:\more-logs `
+  -WorkDir C:\scrubbed `
+  -TokenMapCsv C:\scrubbed\scrub_token_map_DO_NOT_UPLOAD.csv `
+  -TokenMapMode Merge `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
 ```
 
-### Web Access and Proxy Logs
+Use replace mode only when intentionally starting a new map:
 
-For parsed web exports, use column rules. For raw access lines, use `WebAccess`
-or a profile with `Format = "Text"`/`Auto`.
-
-```json
-{
-  "SchemaVersion": 2,
-  "Name": "WebProxyExample",
-  "Format": "Auto",
-  "DenyByDefault": true,
-  "SchemaColumns": [
-    { "Regex": "(?i)^(date|time|method|status|bytes)$", "Action": "PassThrough" },
-    { "Regex": "(?i)^(uri|url|referer|user-agent|message)$", "Action": "Scan" }
-  ],
-  "WholeColumnRules": [
-    { "Regex": "(?i)^(c-ip|clientip|src_ip|remote_addr|x-forwarded-for)$", "Prefix": "IP", "SplitOn": "[,; ]+" },
-    { "Regex": "(?i)^(cs-username|username|user)$", "Prefix": "PRINCIPAL" },
-    { "Regex": "(?i)^(host|cs-host|server|upstream_host)$", "Prefix": "DNS" }
-  ]
-}
-```
-
-### Custom Regex With Capture Group and Entropy
-
-This keeps the label readable and tokenizes only the second capture group:
-
-```json
-{
-  "CustomRegexRules": [
-    {
-      "Name": "CompanySessionToken",
-      "Regex": "(?i)\\b(session[_ -]?token\\s*[:=]\\s*)([A-Za-z0-9_-]{24,})",
-      "CaptureGroup": 2,
-      "Prefix": "SECRET",
-      "Keywords": [ "session", "token" ],
-      "Entropy": 3.2,
-      "Allowlist": [ "not-a-real-token" ]
-    }
-  ]
-}
+```powershell
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+  -Path C:\logs `
+  -WorkDir C:\scrubbed `
+  -TokenMapMode Replace `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
 ```
 
 ## Policy Modes
 
 - `Balanced` is recommended for most secure-client log sharing.
 - `Strict` scrubs more aggressively and may reduce readability.
-- `Readable` preserves more known diagnostics and should be paired with local review.
+- `Readable` preserves more known diagnostics and should be paired with review.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -ScrubPolicy Strict `
@@ -433,7 +375,7 @@ Detailed detection reports can contain original values or context. Treat them as
 local-only.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
+.\scripts\Run-UniversalScrubber_v4_10.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -FalsePositiveReport C:\scrubbed\detection_review_DO_NOT_UPLOAD.csv `
@@ -450,7 +392,7 @@ externally, but still review it before sharing.
 Use restore only inside the secure environment with the private token map.
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_9.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
 
 Restore-ScrubbedFile `
   -InputPath C:\analysis\findings_from_llm.csv `
@@ -463,29 +405,15 @@ Restore-ScrubbedFile `
 - Leak check passed.
 - Output file is scrubbed, not raw or intermediate.
 - No `DO_NOT_UPLOAD` files are included.
-- No token map, salt, manifest, or detailed detection review is included.
+- No token map, salt, manifest, profile build report, or detailed detection review is included.
 - A local reviewer checked representative rows and edge cases.
 - The same salt/map strategy is documented for future correlation needs.
 
 ## Validation
 
-Run the built-in self-test:
-
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_9.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
 Invoke-ScrubSelfTest
-```
-
-Run a dry-run preview through the normal launcher:
-
-```powershell
-.\scripts\Run-UniversalScrubber_v4_9.ps1 `
-  -Path C:\logs `
-  -WorkDir C:\scrubbed-preview `
-  -SaltFromEnv SCRUB_SALT `
-  -DryRun `
-  -ExplainDetections `
-  -NonInteractive
 ```
 
 Use synthetic or approved local logs for dry-run validation. The dry run previews

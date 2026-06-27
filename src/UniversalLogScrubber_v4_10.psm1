@@ -146,6 +146,19 @@
     * Dry-run summaries include detector counts, and profile regexes compile once
       with timeouts plus keyword prefilters for expensive custom rules.
 
+  v4.10 ADDS
+  ----------
+    * New-ScrubProfileFromSample builds an editable BYOP profile from a local
+      sample log without putting raw sample values in the generated profile.
+    * -BuildProfileFromSample, -ProfileOut, -ProfileReportOut, -ProfileWizard,
+      -MaxSampleRows, -SampleFormat and -Force expose that builder in the normal
+      launcher flow.
+    * Test-ScrubProfile validates BYOP profiles without running a scrub.
+    * -SafeBundleOut creates a zip containing only scrubbed clean outputs plus a
+      safe readme, excluding maps, salts, manifests and detailed reports.
+    * Dry-run summaries now separate high-confidence detections, values to
+      review, and values preserved by allowlist/diagnostic rules.
+
   CONSISTENCY GUARANTEE
   ---------------------
   Map-build, scrub and leak-harden all share ONE salt, ONE HMAC length and ONE
@@ -916,7 +929,7 @@ function Add-AllowlistEntry {
 function Test-ScrubAllowlist {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    $v = $Value.Trim().Trim('"', "'")
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', '}', ']', ')')
     if ($script:RuntimeAllowExact -and $script:RuntimeAllowExact.ContainsKey($v.ToLowerInvariant())) { return $true }
     foreach ($rx in @($script:RuntimeAllowRegex)) {
         if ($rx.IsMatch($v)) { return $true }
@@ -988,7 +1001,7 @@ function Get-UniversalLabeledValuePrefix {
 function Test-PreserveUniversalLabeledValue {
     param($Rule, [string]$Label, [string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
-    $v = $Value.Trim().Trim('"', "'")
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', '}', ']', ')')
     if ([string]::IsNullOrWhiteSpace($v)) { return $true }
     if (Is-AlreadyToken -Value $v) { return $true }
     if (Test-ScrubAllowlist -Value $v) { return $true }
@@ -2640,6 +2653,17 @@ function Write-DryRunSummary {
                 if ($null -ne $trace) { [void]$traceItems.Add($trace) }
             }
         }
+        $highKinds = @('SECRET','APIKEY','CONNSTR','PEM','JWT','AWSKEY','ARN','IP','IP6','SID','GUID','MAC','UNMAPPED_UPN','EMAIL')
+        $high = 0; $review = 0
+        foreach ($c in $list) {
+            $kind = [string](Get-TokenKind ([string]$c.Token))
+            if ($highKinds -contains $kind) { $high++ } else { $review++ }
+        }
+        $preserved = @($traceItems.ToArray() | Where-Object { $_.Action -eq 'Preserved' }).Count
+        Write-Detail "Review guide:"
+        Write-Detail ("  High confidence tokenizations: {0}" -f $high)
+        Write-Detail ("  Review for context/readability: {0}" -f $review)
+        Write-Detail ("  Preserved by allowlist/diagnostic rules: {0}" -f $preserved)
         if ($script:ExplainDetections -and $traceItems.Count -gt 0) {
             Write-Detail "Detection decisions:"
             foreach ($d in (@($traceItems.ToArray()) | Select-Object -First 20)) {
@@ -2976,6 +3000,556 @@ function New-ScrubProfileTemplate {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
     [System.IO.File]::WriteAllText($out, $body, [System.Text.Encoding]::UTF8)
     Write-Ok "Profile template written: $out"
+    return $out
+}
+
+# =====================================================================
+# REGION: Profile validation, sample analysis, and safe upload bundles
+# =====================================================================
+function Test-ScrubProfile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Quiet
+    )
+    try {
+        $prof = Import-ScrubProfileFile -Path $Path
+        Initialize-ScrubProfileRuntime -Profile $prof
+        if (-not $Quiet) { Write-Ok "Profile is valid: $Path" }
+        return $true
+    }
+    catch {
+        if ($Quiet) { return $false }
+        Write-Fail "Profile validation failed: $($_.Exception.Message)"
+        throw
+    }
+}
+
+function Get-ProfileBuilderPrefixForName {
+    param([string]$Name)
+    $n = ([string]$Name).ToLowerInvariant()
+    if ($n -match '(api[_ -]?key|secret|password|passwd|pwd|token|credential|authorization|auth|private[_ -]?key|client[_ -]?secret)') { return 'SECRET' }
+    if ($n -match '(user|username|user_id|userid|account|principal|actor|caller|subject|identity|login|suser|duser|cs-username)') { return 'PRINCIPAL' }
+    if ($n -match '(src_ip|dst_ip|clientip|client_ip|remote_addr|ipaddress|ip_address|source.*address|destination.*address|\bc-ip\b|\bs-ip\b|\bip\b|x-forwarded-for)') { return 'IP' }
+    if ($n -match '(host|hostname|server|machine|device|node|pod|container|workstation|computer|dhost|shost|cs-host|upstream_host)') { return 'DNS' }
+    if ($n -match '(tenant|tenantid|tenant_id|org|organization|domain|realm|subscription|accountid|account_id|project)') { return 'X500' }
+    if ($n -match '(url|uri|endpoint|referer|referrer|callback|redirect)') { return 'URI' }
+    if ($n -match '(session|requestid|request_id|correlation|trace|span|transaction|ticket|case|incident)') { return 'OBJECT' }
+    return $null
+}
+
+function Get-ProfileBuilderSchemaAction {
+    param([string]$Name)
+    $n = ([string]$Name).ToLowerInvariant()
+    if ($n -match '^(date|time|timestamp|eventtime|created|updated|level|severity|status|result|method|action|operation|category|count|bytes|duration|elapsed|latency|version|protocol|port|http_method|http_status|sc-status|sc-bytes|cs-bytes|time-taken)$') { return 'PassThrough' }
+    if ($n -match '(message|msg|detail|details|description|error|exception|stack|payload|raw|body|query|command|line|text)') { return 'Scan' }
+    return $null
+}
+
+function Get-ProfileBuilderFormat {
+    param([string]$Path, [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$Requested = 'Auto')
+    if ($Requested -ne 'Auto') { return $Requested }
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($ext -in @('.csv','.tsv','.psv')) { return 'Csv' }
+    if ($ext -in @('.json','.jsonl','.ndjson')) { return 'Json' }
+    $first = ''
+    foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if (-not [string]::IsNullOrWhiteSpace($line)) { $first = $line.Trim(); break }
+    }
+    if ($first -match '^[\{\[]') { return 'Json' }
+    if (($first | Select-String -Pattern '\b[A-Za-z][A-Za-z0-9_.-]{1,40}=' -AllMatches).Matches.Count -ge 2) { return 'Kv' }
+    return 'Text'
+}
+
+function Get-ProfileBuilderDelimiter {
+    param([string]$Path)
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($ext -eq '.tsv') { return "`t" }
+    if ($ext -eq '.psv') { return '|' }
+    $header = ''
+    foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if (-not [string]::IsNullOrWhiteSpace($line)) { $header = $line; break }
+    }
+    $commas = ($header.ToCharArray() | Where-Object { $_ -eq ',' }).Count
+    $tabs = ($header.ToCharArray() | Where-Object { $_ -eq "`t" }).Count
+    $pipes = ($header.ToCharArray() | Where-Object { $_ -eq '|' }).Count
+    if ($tabs -gt $commas -and $tabs -ge $pipes) { return "`t" }
+    if ($pipes -gt $commas -and $pipes -gt $tabs) { return '|' }
+    return ','
+}
+
+function New-ProfileBuilderStats {
+    return @{
+        Columns = @{}
+        Labels = @{}
+        Shapes = @{}
+        SeedCandidates = @{}
+        AllowCandidates = @{}
+        Lines = 0
+        Rows = 0
+    }
+}
+
+function Add-ProfileBuilderExample {
+    param($Bucket, [string]$Value, [int]$Limit = 5)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $v = $Value.Trim()
+    if ($Bucket.Examples.Count -lt $Limit -and -not $Bucket.Examples.Contains($v)) { [void]$Bucket.Examples.Add($v) }
+}
+
+function Add-ProfileBuilderColumnValue {
+    param($Stats, [string]$Name, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+    $key = $Name.Trim().ToLowerInvariant()
+    if (-not $Stats.Columns.ContainsKey($key)) {
+        $Stats.Columns[$key] = [pscustomobject]@{
+            Name = $Name.Trim()
+            Count = 0
+            NonBlank = 0
+            Examples = (New-Object System.Collections.Generic.List[string])
+        }
+    }
+    $c = $Stats.Columns[$key]
+    $c.Count = [int]$c.Count + 1
+    if (-not [string]::IsNullOrWhiteSpace($Value)) {
+        $c.NonBlank = [int]$c.NonBlank + 1
+        Add-ProfileBuilderExample -Bucket $c -Value $Value
+    }
+}
+
+function Add-ProfileBuilderAllowCandidate {
+    param($Stats, [string]$Value, [string]$Reason)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $v = $Value.Trim().Trim('"', "'")
+    if ($v.Length -lt 2 -or $v.Length -gt 120) { return }
+    $isAllow = $false
+    if ($v -match '^(127\.0\.0\.1|::1|0\.0\.0\.0|localhost)$') { $isAllow = $true }
+    elseif ($v -match '^00000000-0000-0000-0000-000000000000$') { $isAllow = $true }
+    elseif ($v -match '^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)$') { $isAllow = $true }
+    elseif ($v -match '^(health|ready|live|ok|true|false|null|none|success|failed|warning|info|error)$') { $isAllow = $true }
+    elseif (Test-AllowedDomain -Value $v) { $isAllow = $true }
+    if (-not $isAllow) { return }
+    $k = $v.ToLowerInvariant()
+    if (-not $Stats.AllowCandidates.ContainsKey($k)) {
+        $Stats.AllowCandidates[$k] = [pscustomobject]@{ Value=$v; Reason=$Reason }
+    }
+}
+
+function Add-ProfileBuilderSeedCandidate {
+    param($Stats, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':')
+    if ($v.Length -lt 5 -or $v.Length -gt 60) { return }
+    if ($v -match '^\d+$|^(true|false|null|none|error|warning|info|debug|trace|status|message|request|response|success|failed)$') { return }
+    if ($v -match '@|\\|/|:|=') { return }
+    if ($v -match '^\d{4}-\d{2}-\d{2}') { return }
+    if ($v -match '^(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+$') { return }
+    if ($v -notmatch '[A-Za-z]') { return }
+    $k = $v.ToLowerInvariant()
+    if (-not $Stats.SeedCandidates.ContainsKey($k)) {
+        $Stats.SeedCandidates[$k] = [pscustomobject]@{ Value=$v; Count=0 }
+    }
+    $Stats.SeedCandidates[$k].Count = [int]$Stats.SeedCandidates[$k].Count + 1
+}
+
+function Get-ProfileBuilderShapeRegex {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim().Trim('"', "'")
+    if ($v.Length -lt 8 -or $v.Length -gt 80) { return $null }
+    if ($v -notmatch '[A-Za-z]' -or $v -notmatch '\d') { return $null }
+    if ($v -match '@|\\|/|://') { return $null }
+    if ($v -match '^\d{1,3}(\.\d{1,3}){3}$') { return $null }
+    if ($v -match '^(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+$') { return $null }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $i = 0
+    while ($i -lt $v.Length) {
+        $ch = $v[$i]
+        $start = $i
+        if ($ch -match '[A-Z]') { while ($i -lt $v.Length -and ([string]$v[$i]) -match '[A-Z]') { $i++ }; $n = $i - $start; [void]$parts.Add(("[A-Z]{{{0}}}" -f $n)); continue }
+        if ($ch -match '[a-z]') { while ($i -lt $v.Length -and ([string]$v[$i]) -match '[a-z]') { $i++ }; $n = $i - $start; [void]$parts.Add(("[a-z]{{{0}}}" -f $n)); continue }
+        if ($ch -match '[0-9]') { while ($i -lt $v.Length -and ([string]$v[$i]) -match '[0-9]') { $i++ }; $n = $i - $start; [void]$parts.Add(("[0-9]{{{0}}}" -f $n)); continue }
+        if ($ch -match '[-_.]') { [void]$parts.Add([regex]::Escape([string]$ch)); $i++; continue }
+        return $null
+    }
+    return ($parts -join '')
+}
+
+function Add-ProfileBuilderTextFacts {
+    param($Stats, [string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    foreach ($m in [regex]::Matches($Text, '(?im)(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_. -]{1,40})\s*[:=]\s*("[^"\r\n]{1,160}"|''[^''\r\n]{1,160}''|[^,\s;|]{1,160})')) {
+        $label = $m.Groups[1].Value.Trim()
+        $value = $m.Groups[2].Value.Trim().Trim('"', "'")
+        if ($label -match '^\d+$' -or $label.Length -lt 2) { continue }
+        $prefix = Get-UniversalLabeledValuePrefix -Label $label -Value $value -DefaultPrefix (Get-ProfileBuilderPrefixForName -Name $label)
+        if (-not $prefix) { $prefix = 'OBJECT' }
+        $key = ($prefix + '|' + $label.ToLowerInvariant())
+        if (-not $Stats.Labels.ContainsKey($key)) {
+            $Stats.Labels[$key] = [pscustomobject]@{ Label=$label; Prefix=$prefix; Count=0; Examples=(New-Object System.Collections.Generic.List[string]) }
+        }
+        $Stats.Labels[$key].Count = [int]$Stats.Labels[$key].Count + 1
+        Add-ProfileBuilderExample -Bucket $Stats.Labels[$key] -Value $value
+        Add-ProfileBuilderAllowCandidate -Stats $Stats -Value $value -Reason "Observed after label '$label'"
+        Add-ProfileBuilderSeedCandidate -Stats $Stats -Value $value
+        $shape = Get-ProfileBuilderShapeRegex -Value $value
+        if ($shape) {
+            if (-not $Stats.Shapes.ContainsKey($shape)) {
+                $Stats.Shapes[$shape] = [pscustomobject]@{ Regex=$shape; Count=0; Prefix='OBJECT'; Examples=(New-Object System.Collections.Generic.List[string]) }
+            }
+            $Stats.Shapes[$shape].Count = [int]$Stats.Shapes[$shape].Count + 1
+            Add-ProfileBuilderExample -Bucket $Stats.Shapes[$shape] -Value $value
+        }
+    }
+    foreach ($m in [regex]::Matches($Text, '\b[A-Za-z][A-Za-z0-9_.-]{4,80}\b')) {
+        $v = $m.Value
+        Add-ProfileBuilderAllowCandidate -Stats $Stats -Value $v -Reason 'Public diagnostic candidate'
+        Add-ProfileBuilderSeedCandidate -Stats $Stats -Value $v
+        $shape = Get-ProfileBuilderShapeRegex -Value $v
+        if ($shape) {
+            if (-not $Stats.Shapes.ContainsKey($shape)) {
+                $Stats.Shapes[$shape] = [pscustomobject]@{ Regex=$shape; Count=0; Prefix='OBJECT'; Examples=(New-Object System.Collections.Generic.List[string]) }
+            }
+            $Stats.Shapes[$shape].Count = [int]$Stats.Shapes[$shape].Count + 1
+            Add-ProfileBuilderExample -Bucket $Stats.Shapes[$shape] -Value $v
+        }
+    }
+}
+
+function Add-JsonSamplePairs {
+    param($Stats, $Node, [string]$KeyName = '')
+    if ($null -eq $Node) { return }
+    if ($Node -is [string]) {
+        Add-ProfileBuilderColumnValue -Stats $Stats -Name $KeyName -Value $Node
+        Add-ProfileBuilderTextFacts -Stats $Stats -Text $Node
+        return
+    }
+    if ($Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal]) {
+        if ($KeyName) { Add-ProfileBuilderColumnValue -Stats $Stats -Name $KeyName -Value ([string]$Node) }
+        return
+    }
+    if (($Node -is [System.Collections.IEnumerable]) -and -not ($Node -is [string])) {
+        foreach ($item in $Node) { Add-JsonSamplePairs -Stats $Stats -Node $item -KeyName $KeyName }
+        return
+    }
+    if ($Node.PSObject -and @($Node.PSObject.Properties).Count -gt 0) {
+        foreach ($p in $Node.PSObject.Properties) { Add-JsonSamplePairs -Stats $Stats -Node $p.Value -KeyName $p.Name }
+    }
+}
+
+function Invoke-SampleProfileAnalysis {
+    param(
+        [Parameter(Mandatory)][string[]]$Files,
+        [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
+        [int]$MaxSampleRows = 500
+    )
+    $stats = New-ProfileBuilderStats
+    $format = $null
+    $delimiter = ','
+    foreach ($file in $Files) {
+        $fmt = Get-ProfileBuilderFormat -Path $file -Requested $SampleFormat
+        if (-not $format) { $format = $fmt }
+        if ($fmt -eq 'Csv') {
+            $delimiter = Get-ProfileBuilderDelimiter -Path $file
+            $rn = 0
+            Import-Csv -Path $file -Delimiter $delimiter | ForEach-Object {
+                if ($stats.Rows -ge $MaxSampleRows) { return }
+                $stats.Rows = [int]$stats.Rows + 1
+                $rn++
+                foreach ($prop in $_.PSObject.Properties) {
+                    $val = [string]$prop.Value
+                    Add-ProfileBuilderColumnValue -Stats $stats -Name $prop.Name -Value $val
+                    Add-ProfileBuilderTextFacts -Stats $stats -Text $val
+                }
+            }
+        }
+        elseif ($fmt -eq 'Json') {
+            $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
+            if ($ext -in @('.jsonl','.ndjson')) {
+                foreach ($line in [System.IO.File]::ReadLines($file)) {
+                    if ($stats.Rows -ge $MaxSampleRows) { break }
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    try {
+                        $obj = $line | ConvertFrom-Json -ErrorAction Stop
+                        $stats.Rows = [int]$stats.Rows + 1
+                        Add-JsonSamplePairs -Stats $stats -Node $obj
+                    } catch { Add-ProfileBuilderTextFacts -Stats $stats -Text $line }
+                }
+            }
+            else {
+                $raw = [System.IO.File]::ReadAllText($file)
+                try {
+                    $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                    $stats.Rows = [Math]::Max(1, [int]$stats.Rows)
+                    Add-JsonSamplePairs -Stats $stats -Node $obj
+                } catch { Add-ProfileBuilderTextFacts -Stats $stats -Text $raw }
+            }
+        }
+        else {
+            foreach ($line in [System.IO.File]::ReadLines($file)) {
+                if ($stats.Rows -ge $MaxSampleRows) { break }
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $stats.Rows = [int]$stats.Rows + 1
+                $stats.Lines = [int]$stats.Lines + 1
+                Add-ProfileBuilderTextFacts -Stats $stats -Text $line
+                if ($fmt -eq 'Kv') {
+                    foreach ($m in [regex]::Matches($line, '(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_.-]{1,40})=("[^"\r\n]{0,200}"|[^,\s;|]{0,200})')) {
+                        Add-ProfileBuilderColumnValue -Stats $stats -Name $m.Groups[1].Value -Value $m.Groups[2].Value.Trim().Trim('"')
+                    }
+                }
+            }
+        }
+    }
+    if (-not $format) { $format = 'Text' }
+    return [pscustomobject]@{ Format=$format; Delimiter=$delimiter; Stats=$stats; Files=$Files; MaxSampleRows=$MaxSampleRows }
+}
+
+function ConvertTo-GeneratedProfile {
+    param($Analysis, [string]$Name, [switch]$IncludeSeeds, [switch]$IncludeAllowlist, [switch]$IncludeCustomRegex = $true)
+    $schema = New-Object System.Collections.Generic.List[object]
+    $whole = New-Object System.Collections.Generic.List[object]
+    foreach ($c in (@($Analysis.Stats.Columns.Values) | Sort-Object Name)) {
+        $action = Get-ProfileBuilderSchemaAction -Name $c.Name
+        $prefix = Get-ProfileBuilderPrefixForName -Name $c.Name
+        if ($action) {
+            [void]$schema.Add([ordered]@{ Exact=$c.Name; Action=$action; Description='Generated from sample schema.' })
+        }
+        if ($prefix) {
+            [void]$whole.Add([ordered]@{ Exact=$c.Name; Prefix=$prefix; SplitOn='[;,|]'; Description='Generated from sample schema.' })
+        }
+    }
+    foreach ($default in @(
+        @{ Wildcard='*message*'; Action='Scan'; Description='Message-like free text.' },
+        @{ Wildcard='*detail*'; Action='Scan'; Description='Detail-like free text.' },
+        @{ Wildcard='*description*'; Action='Scan'; Description='Description-like free text.' }
+    )) {
+        if (@($schema | Where-Object { $_.Wildcard -eq $default.Wildcard }).Count -eq 0) {
+            [void]$schema.Add([ordered]@{ Wildcard=$default.Wildcard; Action=$default.Action; Description=$default.Description })
+        }
+    }
+
+    $labelsByPrefix = @{}
+    foreach ($l in @($Analysis.Stats.Labels.Values)) {
+        if ($l.Count -lt 1) { continue }
+        if (-not $labelsByPrefix.ContainsKey($l.Prefix)) { $labelsByPrefix[$l.Prefix] = New-Object System.Collections.Generic.List[string] }
+        if (-not $labelsByPrefix[$l.Prefix].Contains($l.Label)) { [void]$labelsByPrefix[$l.Prefix].Add($l.Label) }
+    }
+    $labelRules = New-Object System.Collections.Generic.List[object]
+    foreach ($prefix in (@($labelsByPrefix.Keys) | Sort-Object)) {
+        $labels = @($labelsByPrefix[$prefix].ToArray() | Sort-Object | Select-Object -First 24)
+        if ($labels.Count -gt 0) {
+            [void]$labelRules.Add([ordered]@{ Name=("Generated{0}Labels" -f $prefix); Labels=$labels; Prefix=$prefix })
+        }
+    }
+
+    $custom = New-Object System.Collections.Generic.List[object]
+    if ($IncludeCustomRegex) {
+        $i = 0
+        foreach ($shape in (@($Analysis.Stats.Shapes.Values) | Where-Object { $_.Count -ge 2 } | Sort-Object Count -Descending | Select-Object -First 8)) {
+            $i++
+            [void]$custom.Add([ordered]@{
+                Name = ("GeneratedShape{0}" -f $i)
+                Regex = ("\b({0})\b" -f $shape.Regex)
+                CaptureGroup = 1
+                Prefix = $shape.Prefix
+                Keywords = @()
+                Entropy = 0
+                Description = 'Generated from repeated sample value shape; review before production.'
+            })
+        }
+    }
+
+    $profile = [ordered]@{
+        SchemaVersion = 2
+        Name = $Name
+        Description = 'Generated from a local sample. Review before production use.'
+        Format = $Analysis.Format
+        Delimiter = $Analysis.Delimiter
+        DenyByDefault = $true
+        SchemaColumns = @($schema.ToArray())
+        WholeColumnRules = @($whole.ToArray())
+        LabelRules = @($labelRules.ToArray())
+        CustomRegexRules = @($custom.ToArray())
+    }
+    if ($IncludeSeeds) { $profile.SeedFiles = @('generated-seeds.txt') }
+    if ($IncludeAllowlist) { $profile.AllowlistFile = @('generated-allowlist.txt') }
+    return $profile
+}
+
+function Write-ProfileBuilderReport {
+    param($Analysis, [string]$Path, [string]$ProfilePath)
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('# Profile Build Report - DO_NOT_UPLOAD')
+    [void]$lines.Add('')
+    [void]$lines.Add('This report may contain raw sample values. Keep it local.')
+    [void]$lines.Add('')
+    [void]$lines.Add(('Generated profile: {0}' -f $ProfilePath))
+    [void]$lines.Add(('Detected format: {0}' -f $Analysis.Format))
+    [void]$lines.Add(("Rows/lines inspected: {0}" -f $Analysis.Stats.Rows))
+    [void]$lines.Add('')
+    [void]$lines.Add('## Files')
+    foreach ($f in $Analysis.Files) { [void]$lines.Add(("- {0}" -f $f)) }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Column/Key Suggestions')
+    foreach ($c in (@($Analysis.Stats.Columns.Values) | Sort-Object Name)) {
+        $prefix = Get-ProfileBuilderPrefixForName -Name $c.Name
+        $action = Get-ProfileBuilderSchemaAction -Name $c.Name
+        $examples = (@($c.Examples.ToArray()) | Select-Object -First 3) -join ', '
+        [void]$lines.Add(("- {0}: prefix={1} action={2} examples={3}" -f $c.Name, $prefix, $action, $examples))
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Label Suggestions')
+    foreach ($l in (@($Analysis.Stats.Labels.Values) | Sort-Object Prefix,Label)) {
+        $examples = (@($l.Examples.ToArray()) | Select-Object -First 3) -join ', '
+        [void]$lines.Add(("- {0} -> {1} ({2} hit(s)); examples={3}" -f $l.Label, $l.Prefix, $l.Count, $examples))
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Repeated Shape Suggestions')
+    foreach ($s in (@($Analysis.Stats.Shapes.Values) | Sort-Object Count -Descending | Select-Object -First 20)) {
+        $examples = (@($s.Examples.ToArray()) | Select-Object -First 3) -join ', '
+        [void]$lines.Add(("- {0} ({1} hit(s)); examples={2}" -f $s.Regex, $s.Count, $examples))
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Seed Candidates')
+    foreach ($s in (@($Analysis.Stats.SeedCandidates.Values) | Sort-Object Count -Descending | Select-Object -First 40)) {
+        [void]$lines.Add(("- {0} ({1} hit(s))" -f $s.Value, $s.Count))
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Allowlist Candidates')
+    foreach ($a in (@($Analysis.Stats.AllowCandidates.Values) | Sort-Object Value | Select-Object -First 40)) {
+        [void]$lines.Add(("- {0} - {1}" -f $a.Value, $a.Reason))
+    }
+    $out = Resolve-OutPath -Path $Path
+    [System.IO.File]::WriteAllText($out, ($lines -join "`r`n"), [System.Text.Encoding]::UTF8)
+    return $out
+}
+
+function Write-ProfileBuilderOptionalFiles {
+    param($Analysis, [string]$Directory, [switch]$ProfileWizard, [switch]$NonInteractive)
+    $writeSeeds = $false
+    $writeAllow = $false
+    if ($ProfileWizard -and -not $NonInteractive) {
+        Write-Host ''
+        Write-Step 'Profile builder wizard'
+        Write-Info 'The generated profile never stores raw sample values. Seed and allowlist files may, so they are optional.'
+        if ($Analysis.Stats.SeedCandidates.Count -gt 0) {
+            Write-Detail ("Seed candidates: {0}" -f $Analysis.Stats.SeedCandidates.Count)
+            $writeSeeds = Read-YesNo -Prompt 'Write generated-seeds.txt from sample candidates' -Default $false
+        }
+        if ($Analysis.Stats.AllowCandidates.Count -gt 0) {
+            Write-Detail ("Allowlist candidates: {0}" -f $Analysis.Stats.AllowCandidates.Count)
+            $writeAllow = Read-YesNo -Prompt 'Write generated-allowlist.txt from public diagnostic candidates' -Default $false
+        }
+    }
+    $seedPath = $null
+    $allowPath = $null
+    if ($writeSeeds) {
+        $seedPath = Join-Path $Directory 'generated-seeds.txt'
+        $items = @($Analysis.Stats.SeedCandidates.Values | Sort-Object Count -Descending | Select-Object -First 100 | ForEach-Object { $_.Value })
+        [System.IO.File]::WriteAllText($seedPath, (("# Generated seed terms. Review before use.`r`n" + ($items -join "`r`n") + "`r`n")), [System.Text.Encoding]::UTF8)
+    }
+    if ($writeAllow) {
+        $allowPath = Join-Path $Directory 'generated-allowlist.txt'
+        $items = @($Analysis.Stats.AllowCandidates.Values | Sort-Object Value | ForEach-Object { $_.Value })
+        [System.IO.File]::WriteAllText($allowPath, (("# Generated allowlist. Review before use.`r`n" + ($items -join "`r`n") + "`r`n")), [System.Text.Encoding]::UTF8)
+    }
+    return [pscustomobject]@{ SeedPath=$seedPath; AllowlistPath=$allowPath; IncludeSeeds=[bool]$writeSeeds; IncludeAllowlist=[bool]$writeAllow }
+}
+
+function New-ScrubProfileFromSample {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ProfileOut,
+        [string]$ProfileReportOut,
+        [switch]$ProfileWizard,
+        [int]$MaxSampleRows = 500,
+        [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
+        [switch]$Force,
+        [switch]$NonInteractive
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Sample path not found: $Path" }
+    $files = @()
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $files = @(Get-ChildItem -LiteralPath $Path -File -ErrorAction Stop |
+            Where-Object { $_.Name -notmatch '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report)' } |
+            Sort-Object FullName | Select-Object -First 20 | ForEach-Object { $_.FullName })
+    }
+    else { $files = @((Resolve-Path -LiteralPath $Path).Path) }
+    if ($files.Count -eq 0) { throw "No sample files found: $Path" }
+    if ($MaxSampleRows -lt 1) { throw "MaxSampleRows must be at least 1." }
+
+    $outPath = if ($ProfileOut) { $ProfileOut } else { Join-Path (Get-Location).Path 'generated-profile.json' }
+    $outPath = Resolve-OutPath -Path $outPath
+    $outDir = Split-Path -Parent $outPath
+    if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    if ((Test-Path -LiteralPath $outPath) -and -not $Force) { throw "Profile output already exists: $outPath. Use -Force to overwrite." }
+    $reportPath = if ($ProfileReportOut) { $ProfileReportOut } else { Join-Path $outDir 'profile_build_report_DO_NOT_UPLOAD.md' }
+    $reportPath = Resolve-OutPath -Path $reportPath
+    if ((Test-Path -LiteralPath $reportPath) -and -not $Force) { throw "Profile report already exists: $reportPath. Use -Force to overwrite." }
+
+    Write-Work "Analyzing sample log(s) locally"
+    $analysis = Invoke-SampleProfileAnalysis -Files $files -SampleFormat $SampleFormat -MaxSampleRows $MaxSampleRows
+    if ($analysis.Stats.Rows -eq 0 -and $analysis.Stats.Columns.Count -eq 0 -and $analysis.Stats.Labels.Count -eq 0) {
+        throw "Sample appears empty or unsupported: $Path"
+    }
+    $optional = Write-ProfileBuilderOptionalFiles -Analysis $analysis -Directory $outDir -ProfileWizard:$ProfileWizard -NonInteractive:$NonInteractive
+    $name = 'GeneratedSampleProfile'
+    try { $name = ('Generated-' + [System.IO.Path]::GetFileNameWithoutExtension($files[0])) -replace '[^A-Za-z0-9_.-]', '-' } catch { }
+    $profile = ConvertTo-GeneratedProfile -Analysis $analysis -Name $name -IncludeSeeds:($optional.IncludeSeeds) -IncludeAllowlist:($optional.IncludeAllowlist)
+    $profile | ConvertTo-Json -Depth 8 | Set-Content -Path $outPath -Encoding UTF8
+    [void](Test-ScrubProfile -Path $outPath -Quiet)
+    $report = Write-ProfileBuilderReport -Analysis $analysis -Path $reportPath -ProfilePath $outPath
+    Write-Ok "Generated profile: $outPath"
+    Write-Warn "Profile build report is local-only: $report"
+    if ($optional.SeedPath) { Write-Warn "Generated seeds are local-only: $($optional.SeedPath)" }
+    if ($optional.AllowlistPath) { Write-Info "Generated allowlist: $($optional.AllowlistPath)" }
+    return [pscustomobject]@{
+        ProfilePath = $outPath
+        ReportPath = $report
+        Format = $analysis.Format
+        FilesAnalyzed = $files.Count
+        RowsAnalyzed = $analysis.Stats.Rows
+        SeedPath = $optional.SeedPath
+        AllowlistPath = $optional.AllowlistPath
+    }
+}
+
+function New-SafeScrubBundle {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Results,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [switch]$Force
+    )
+    $clean = @($Results | Where-Object { $_.Clean -and $_.Output -and (Test-Path -LiteralPath $_.Output) })
+    if ($clean.Count -eq 0) { throw "No clean scrubbed outputs are available for bundling." }
+    $out = Resolve-OutPath -Path $OutputPath
+    if ((Test-Path -LiteralPath $out) -and -not $Force) { throw "Safe bundle already exists: $out. Use -Force to overwrite." }
+    if ((Test-Path -LiteralPath $out) -and $Force) { Remove-Item -LiteralPath $out -Force }
+    $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("scrub_safe_bundle_" + ([System.IO.Path]::GetRandomFileName().Replace('.', '')))
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    try {
+        foreach ($r in $clean) {
+            $dest = Join-Path $stage ([System.IO.Path]::GetFileName($r.Output))
+            Copy-Item -LiteralPath $r.Output -Destination $dest -Force
+        }
+        $summary = @(
+            'Universal Log Scrubber safe bundle',
+            '',
+            ('GeneratedUtc: {0}' -f ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))),
+            ('ScrubPolicy: {0}' -f $script:ScrubPolicy),
+            ('CleanFiles: {0}' -f $clean.Count),
+            '',
+            'This bundle intentionally excludes token maps, salts, manifests, raw logs, and detailed detection reports.'
+        ) -join "`r`n"
+        [System.IO.File]::WriteAllText((Join-Path $stage 'SAFE_UPLOAD_README.txt'), $summary, [System.Text.Encoding]::UTF8)
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $out -Force
+    }
+    finally {
+        try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    Write-Ok "Safe upload bundle written: $out"
     return $out
 }
 
@@ -3354,7 +3928,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.9 -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.10 -- SELF-TEST" "Synthetic data only; no real logs touched."
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -3510,7 +4084,62 @@ function Invoke-ScrubSelfTest {
         try { [void](Import-ScrubProfileFile -Path $badProfilePath) } catch { $badFailed = ($_.Exception.Message -match 'custom regex rule') }
         & $assert $badFailed "BYOP invalid regex reports rule context"
 
-        # ---- 5) Streaming vs normal equivalence ----
+        # ---- 5) Sample profile builder ----
+        Write-Rule "Sample profile builder"
+        $builder = Join-Path $dir 'builder'
+        New-Item -ItemType Directory -Path $builder -Force | Out-Null
+        $builderSpecs = @(
+            [pscustomobject]@{
+                Name='csv'; Ext='csv'
+                Lines=@(
+                    'Timestamp,UserID,Server,ClientIP,APIKey,Message',
+                    '"2026-01-01T00:00:00Z","alphauser","csv01.internal.test","10.61.1.2","sk-test-csv000000000000000000000","username=bravo host: csv02.internal.test ticket id: TKT-111222"'
+                )
+                Raw=@('alphauser','csv01.internal.test','10.61.1.2','sk-test-csv','bravo','csv02.internal.test','TKT-111222')
+            },
+            [pscustomobject]@{
+                Name='json'; Ext='jsonl'
+                Lines=@('{"timestamp":"2026-01-01T00:00:00Z","username":"jsonuser","host":"json01.internal.test","src_ip":"10.62.1.2","api_key":"sk-test-json000000000000000000000","message":"tenantId=TenantBlue request id: REQ-222333"}')
+                Raw=@('jsonuser','json01.internal.test','10.62.1.2','sk-test-json','TenantBlue','REQ-222333')
+            },
+            [pscustomobject]@{
+                Name='kv'; Ext='log'
+                Lines=@('time=2026-01-01T00:00:00Z username=kvuser host=kv01.internal.test src_ip=10.63.1.2 api_key=sk-test-kv000000000000000000000 trace_id=TRC-333444')
+                Raw=@('kvuser','kv01.internal.test','10.63.1.2','sk-test-kv','TRC-333444')
+            },
+            [pscustomobject]@{
+                Name='text'; Ext='txt'
+                Lines=@('username=textuser host: text01.internal.test src_ip=10.64.1.2 API Key = local-secret-text request id: REQ-444555')
+                Raw=@('textuser','text01.internal.test','10.64.1.2','local-secret-text','REQ-444555')
+            }
+        )
+        foreach ($spec in $builderSpecs) {
+            $samplePath = Join-Path $builder ("sample_{0}.{1}" -f $spec.Name, $spec.Ext)
+            $spec.Lines | Set-Content -Path $samplePath -Encoding UTF8
+            $profileOut = Join-Path $builder ("generated_{0}.json" -f $spec.Name)
+            $reportOut = Join-Path $builder ("report_{0}_DO_NOT_UPLOAD.md" -f $spec.Name)
+            $built = New-ScrubProfileFromSample -Path $samplePath -ProfileOut $profileOut -ProfileReportOut $reportOut -MaxSampleRows 50 -Force -NonInteractive
+            & $assert ((Test-Path -LiteralPath $built.ProfilePath) -and (Test-Path -LiteralPath $built.ReportPath)) "profile builder [$($spec.Name)] writes profile and report"
+            & $assert (Test-ScrubProfile -Path $built.ProfilePath -Quiet) "profile builder [$($spec.Name)] generated profile imports"
+            $profileText = Get-Content -Path $built.ProfilePath -Raw
+            foreach ($raw in $spec.Raw) { & $assert (-not ($profileText -match [regex]::Escape($raw))) "profile builder [$($spec.Name)] profile omits raw value: $raw" }
+            & $assert (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $built.ProfilePath) 'generated-seeds.txt'))) "profile builder [$($spec.Name)] analyzer-only skips seed file"
+            & $assert (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $built.ProfilePath) 'generated-allowlist.txt'))) "profile builder [$($spec.Name)] analyzer-only skips allowlist file"
+            $runOut = Join-Path $builder ("out_{0}" -f $spec.Name)
+            $bundleOut = Join-Path $builder ("safe_{0}.zip" -f $spec.Name)
+            $scrub = Invoke-UniversalScrubber -Path $samplePath -WorkDir $runOut -ProfileFile $built.ProfilePath -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -SafeBundleOut $bundleOut -Force -NonInteractive
+            $scrubText = Get-Content -Path $scrub[0].Output -Raw
+            foreach ($raw in $spec.Raw) { & $assert (-not ($scrubText -match [regex]::Escape($raw))) "profile builder [$($spec.Name)] scrub removes: $raw" }
+            & $assert ((Test-Path -LiteralPath $bundleOut) -and ((Get-Item -LiteralPath $bundleOut).Length -gt 0)) "safe bundle [$($spec.Name)] created"
+        }
+        $missingFailed = $false
+        try { [void](New-ScrubProfileFromSample -Path (Join-Path $builder 'missing.log') -ProfileOut (Join-Path $builder 'missing.json') -NonInteractive) } catch { $missingFailed = ($_.Exception.Message -match 'Sample path not found') }
+        & $assert $missingFailed "profile builder invalid path reports clearly"
+        $overwriteFailed = $false
+        try { [void](New-ScrubProfileFromSample -Path (Join-Path $builder 'sample_csv.csv') -ProfileOut (Join-Path $builder 'generated_csv.json') -ProfileReportOut (Join-Path $builder 'report_csv_DO_NOT_UPLOAD.md') -NonInteractive) } catch { $overwriteFailed = ($_.Exception.Message -match 'already exists') }
+        & $assert $overwriteFailed "profile builder refuses overwrite without -Force"
+
+        # ---- 6) Streaming vs normal equivalence ----
         Write-Rule "Streaming equivalence"
         $script:ScrubPolicy = 'Balanced'
         & $reset
@@ -3524,7 +4153,7 @@ function Invoke-ScrubSelfTest {
         & $assert ($r1.Clean -and $r2.Clean) "stream: both modes leak-clean"
         & $assert ($hostTok -and ($t1 -match [regex]::Escape($hostTok)) -and ($t2 -match [regex]::Escape($hostTok))) "stream: identical token in both modes"
 
-        # ---- 6) Round-trip: scrub -> restore ----
+        # ---- 7) Round-trip: scrub -> restore ----
         Write-Rule "Round-trip (scrub -> restore)"
         $rtPath = Join-Path $dir 'roundtrip_restored.csv'
         [void](Restore-ScrubbedFile -InputPath $r1.Output -TokenMapCsv $smap -OutputPath $rtPath)
@@ -3768,8 +4397,8 @@ function Write-RunManifest {
         }
     }
     $manifest = [pscustomobject]@{
-        tool            = "UniversalLogScrubber_v4_9.psm1"
-        schemaVersion   = "4.9"
+        tool            = "UniversalLogScrubber_v4_10.psm1"
+        schemaVersion   = "4.10"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
         hmacLength      = $script:HmacLength
@@ -3804,6 +4433,14 @@ function Invoke-UniversalScrubber {
         [string[]]$SeedFile,
         [string[]]$AllowlistFile,
         [ValidateSet('Generic','Csv','Json','Kv','WebAccess','Cloud','App')][string]$ProfileTemplate,
+        [switch]$BuildProfileFromSample,
+        [string]$ProfileOut,
+        [string]$ProfileReportOut,
+        [switch]$ProfileWizard,
+        [int]$MaxSampleRows = 500,
+        [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
+        [string]$SafeBundleOut,
+        [switch]$Force,
         [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
         [ValidateSet('Fast','CountFirst')][string]$EvtxProgressMode = 'Fast',
         [switch]$ExplainDetections,
@@ -3840,7 +4477,7 @@ function Invoke-UniversalScrubber {
     }
     if ($Salt) { $script:Salt = $Salt }
 
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.9" "Token-map first, then scrub. Nothing leaves until it's clean."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.10" "Token-map first, then scrub. Nothing leaves until it's clean."
     if ($DryRun) { Write-Info "DRY RUN mode -- nothing will be written." }
     if ($Stream) { Write-Info "STREAM mode -- bounded memory for very large files." }
     Write-Info "Scrub policy: $script:ScrubPolicy"
@@ -3859,6 +4496,18 @@ function Invoke-UniversalScrubber {
         $written = New-ScrubProfileTemplate -Template $ProfileTemplate -OutputPath $templatePath
         Write-Info "Edit this template, then run with -ProfileFile $written."
         return [pscustomobject]@{ ProfileTemplate = $ProfileTemplate; OutputPath = $written }
+    }
+
+    if ($BuildProfileFromSample) {
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            if ($NonInteractive) { throw "Path is required with -BuildProfileFromSample in -NonInteractive mode." }
+            Write-Host ""
+            Write-Step "What sample should be analyzed?"
+            $Path = Read-DefaultString -Prompt "Path to a sample log file OR folder"
+        }
+        if ([string]::IsNullOrWhiteSpace($ProfileOut)) { $ProfileOut = Join-Path $WorkDir 'generated-profile.json' }
+        if ([string]::IsNullOrWhiteSpace($ProfileReportOut)) { $ProfileReportOut = Join-Path $WorkDir 'profile_build_report_DO_NOT_UPLOAD.md' }
+        return New-ScrubProfileFromSample -Path $Path -ProfileOut $ProfileOut -ProfileReportOut $ProfileReportOut -ProfileWizard:$ProfileWizard -MaxSampleRows $MaxSampleRows -SampleFormat $SampleFormat -Force:$Force -NonInteractive:$NonInteractive
     }
 
     # --- Input file(s) ---
@@ -4149,6 +4798,10 @@ function Invoke-UniversalScrubber {
     Write-Host ""
     if ($badCount -eq 0) { Write-Ok "$okCount file(s) scrubbed and verified clean." }
     else { Write-Warn "$okCount clean, $badCount need review before upload." }
+    if ($SafeBundleOut) {
+        try { [void](New-SafeScrubBundle -Results $results -OutputPath $SafeBundleOut -Force:$Force) }
+        catch { Write-Warn "Safe bundle was not created: $($_.Exception.Message)" }
+    }
     Write-Host ""
     Write-Warn "NEVER upload: $TokenMapCsv"
     Write-Ok  "Safe to upload: the *_scrubbed.* files in $WorkDir"
@@ -4160,4 +4813,5 @@ Export-ModuleMember -Function `
     Invoke-UniversalScrubber, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
-    Import-ScrubProfileFile, New-ScrubProfileTemplate, Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
+    Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
+    Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
