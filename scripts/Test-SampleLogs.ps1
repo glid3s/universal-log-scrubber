@@ -16,7 +16,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
-$modulePath = Join-Path $repoRoot 'src\UniversalLogScrubber_v4_10.psm1'
+$modulePath = Join-Path $repoRoot 'src\UniversalLogScrubber_v4_11.psm1'
 Import-Module $modulePath -Force
 
 $env:SCRUB_SAMPLE_SALT = $Salt

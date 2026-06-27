@@ -9,21 +9,24 @@
   anything still required is prompted for.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_10.ps1
+  .\Run-UniversalScrubber_v4_11.ps1
   # Fully interactive.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_10.ps1 -Path C:\winlogs\Security.evtx
+  .\Run-UniversalScrubber_v4_11.ps1 -Path C:\winlogs\Security.evtx
   # Auto-converts the .evtx to CSV, then scrubs it.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_10.ps1 -Path C:\logs -DryRun -ExplainDetections
+  .\Run-UniversalScrubber_v4_11.ps1 -Path C:\logs -DryRun -ExplainDetections
   # Preview what WOULD be tokenized -- writes nothing.
 #>
 [CmdletBinding()]
 param(
     [string]$Path,
     [string]$WorkDir,
+    [switch]$RecommendOnly,
+    [switch]$SafeFirstRun,
+    [switch]$AutoProfile,
     [string]$Salt,
     [int]$HmacLength = 24,
     [string]$Profile,
@@ -64,7 +67,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Derive the module name from THIS launcher's own name:
-#   Run-UniversalScrubber_v4_10.ps1  ->  UniversalLogScrubber_v4_10.psm1
+#   Run-UniversalScrubber_v4_11.ps1  ->  UniversalLogScrubber_v4_11.psm1
 $myBase = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
 $suffix = ''
 if ($myBase -match '^Run-UniversalScrubber(.*)$') { $suffix = $matches[1] }
@@ -98,3 +101,4 @@ Import-Module $modulePath -Force
 $forward = @{}
 foreach ($k in $PSBoundParameters.Keys) { $forward[$k] = $PSBoundParameters[$k] }
 Invoke-UniversalScrubber @forward
+

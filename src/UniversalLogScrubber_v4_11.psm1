@@ -159,6 +159,15 @@
     * Dry-run summaries now separate high-confidence detections, values to
       review, and values preserved by allowlist/diagnostic rules.
 
+  v4.11 ADDS
+  ----------
+    * Test-LogFormat locally samples candidate log files and recommends existing
+      scrub profiles before any salt, token map or scrubbed output is needed.
+    * -RecommendOnly and -SafeFirstRun show local-only recommendations and exit
+      before scrubbing.
+    * -AutoProfile can choose one high-confidence profile for uniform inputs and
+      refuses mixed/low-confidence folders in noninteractive mode.
+
   CONSISTENCY GUARANTEE
   ---------------------
   Map-build, scrub and leak-harden all share ONE salt, ONE HMAC length and ONE
@@ -2168,6 +2177,323 @@ function Get-ScrubProfile {
 }
 
 # =====================================================================
+# REGION: Local log format recommendations (no salt, no scrubbing)
+# =====================================================================
+function Test-GeneratedScrubArtifactName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|scrub_run_manifest)') { return $true }
+    if ([System.IO.Path]::GetExtension($Name) -ieq '.zip') { return $true }
+    return $false
+}
+
+function Resolve-LogRecommendationTargets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Recurse,
+        [string[]]$Include,
+        [string[]]$Exclude
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "Path is required." }
+    $targets = @()
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $targets = @(Get-ChildItem -LiteralPath $Path -File -Recurse:$Recurse -ErrorAction SilentlyContinue)
+    }
+    elseif (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $targets = @(Get-Item -LiteralPath $Path)
+    }
+    else { throw "Path not found: $Path" }
+
+    $targets = @($targets | Where-Object { -not (Test-GeneratedScrubArtifactName -Name $_.Name) })
+    if ($Include -and $Include.Count -gt 0) {
+        $targets = @($targets | Where-Object {
+            $ok = $false
+            foreach ($pat in $Include) { if ($_.Name -like $pat) { $ok = $true; break } }
+            $ok
+        })
+    }
+    if ($Exclude -and $Exclude.Count -gt 0) {
+        $targets = @($targets | Where-Object {
+            $skip = $false
+            foreach ($pat in $Exclude) { if ($_.Name -like $pat) { $skip = $true; break } }
+            -not $skip
+        })
+    }
+    return @($targets | Sort-Object FullName)
+}
+
+function Get-ReadableFileSample {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$File,
+        [int]$SampleLines = 50
+    )
+
+    if ($SampleLines -lt 1) { $SampleLines = 1 }
+    $warnings = @()
+    $ext = ([string]$File.Extension).ToLowerInvariant()
+    if ($ext -in @('.evtx','.xlsx','.zip')) {
+        $warnings += "File type is not sampled as plain text."
+        return [pscustomobject]@{ Lines = @(); Text = ''; Warnings = $warnings }
+    }
+
+    $lines = @()
+    try {
+        $lines = @(Get-Content -LiteralPath $File.FullName -TotalCount $SampleLines -ErrorAction Stop)
+    }
+    catch {
+        $warnings += "Could not read sample: $($_.Exception.Message)"
+    }
+
+    $text = if ($lines.Count -gt 0) { [string]::Join("`n", @($lines | ForEach-Object { [string]$_ })) } else { '' }
+    if ($text -match "`0") { $warnings += "Sample contains NUL bytes and may be binary." }
+    return [pscustomobject]@{ Lines = $lines; Text = $text; Warnings = $warnings }
+}
+
+function Get-LogHeaderColumns {
+    param([string]$Header, [string]$Delimiter)
+    if ([string]::IsNullOrWhiteSpace($Header)) { return @() }
+    $parts = @($Header -split [regex]::Escape($Delimiter))
+    return @($parts | ForEach-Object {
+        $c = ([string]$_).Trim()
+        $c = $c.Trim([char]34).Trim([char]39)
+        $c.Trim()
+    } | Where-Object { $_ })
+}
+
+function Get-LogColumnHitCount {
+    param([string[]]$Columns, [string[]]$Patterns)
+    $hits = 0
+    foreach ($pat in $Patterns) {
+        foreach ($col in @($Columns)) {
+            if ($col -match $pat) { $hits++; break }
+        }
+    }
+    return $hits
+}
+
+function Test-JsonText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    try {
+        [void]($Text | ConvertFrom-Json -ErrorAction Stop)
+        return $true
+    }
+    catch { return $false }
+}
+
+function Test-JsonLines {
+    param([string[]]$Lines)
+    $checked = 0
+    $ok = 0
+    foreach ($line in @($Lines)) {
+        $t = ([string]$line).Trim()
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        $checked++
+        try {
+            [void]($t | ConvertFrom-Json -ErrorAction Stop)
+            $ok++
+        }
+        catch { }
+        if ($checked -ge 10) { break }
+    }
+    if ($checked -le 1) { return $false }
+    return ($ok -ge [Math]::Ceiling($checked * 0.8))
+}
+
+function New-RecommendedScrubCommand {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Profile,
+        [switch]$UseAutoProfile
+    )
+    $quotedPath = "'" + ($Path -replace "'", "''") + "'"
+    $profilePart = if ($UseAutoProfile) { "-AutoProfile" } else { "-Profile $Profile" }
+    return "Invoke-UniversalScrubber -Path $quotedPath $profilePart -DryRun -Salt `"preview-only`" -MapSource Discover -NonInteractive"
+}
+
+function New-LogFormatRecommendationObject {
+    param(
+        [Parameter(Mandatory)]$File,
+        [Parameter(Mandatory)][string]$DetectedFormat,
+        [Parameter(Mandatory)][string]$SuggestedProfile,
+        [Parameter(Mandatory)][int]$Confidence,
+        [string[]]$Reasons,
+        [string[]]$Warnings
+    )
+
+    if (-not (Get-ScrubProfile -Name $SuggestedProfile)) {
+        $Warnings += "Profile '$SuggestedProfile' is not built in; using Generic."
+        $SuggestedProfile = 'Generic'
+    }
+    if ($Confidence -lt 0) { $Confidence = 0 }
+    if ($Confidence -gt 100) { $Confidence = 100 }
+    return [pscustomobject]@{
+        Path               = $File.FullName
+        Name               = $File.Name
+        Extension          = $File.Extension
+        DetectedFormat     = $DetectedFormat
+        SuggestedProfile   = $SuggestedProfile
+        Confidence         = $Confidence
+        Reasons            = @($Reasons)
+        Warnings           = @($Warnings)
+        RecommendedCommand = (New-RecommendedScrubCommand -Path $File.FullName -Profile $SuggestedProfile)
+    }
+}
+
+function Get-LogFormatRecommendation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$File,
+        [int]$SampleLines = 50
+    )
+
+    $sample = Get-ReadableFileSample -File $File -SampleLines $SampleLines
+    $warnings = @($sample.Warnings)
+    $lines = @($sample.Lines)
+    $text = [string]$sample.Text
+    $ext = ([string]$File.Extension).ToLowerInvariant()
+    $first = @($lines | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -First 1)
+    $firstLine = if ($first.Count -gt 0) { [string]$first[0] } else { '' }
+
+    if ($ext -eq '.evtx') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'EVTX' -SuggestedProfile 'WindowsEventCsv' -Confidence 95 `
+            -Reasons @('The .evtx extension identifies a Windows Event Log file.') `
+            -Warnings @('EVTX is binary; the scrubber converts it to CSV before scrubbing.')
+    }
+    if ($ext -eq '.xlsx') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'XLSX' -SuggestedProfile 'Generic' -Confidence 90 `
+            -Reasons @('The .xlsx extension identifies an Excel workbook.') `
+            -Warnings @('Workbook conversion happens locally before scrubbing.')
+    }
+
+    if (@($lines | Where-Object { ([string]$_) -match '^#Fields:' }).Count -gt 0) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'W3C/IIS' -SuggestedProfile 'IIS' -Confidence 98 `
+            -Reasons @('A #Fields: header was found.') -Warnings $warnings
+    }
+    if ($text -match '(?m)^\s*CEF:\d+\|') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'CEF' -SuggestedProfile 'Cef' -Confidence 96 `
+            -Reasons @('A CEF prefix was found.') -Warnings $warnings
+    }
+    if ($text -match '(?m)^\s*LEEF:\d+(?:\.\d+)?\|') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'LEEF' -SuggestedProfile 'Cef' -Confidence 94 `
+            -Reasons @('A LEEF prefix was found; the built-in CEF profile handles key=value SIEM extensions.') -Warnings $warnings
+    }
+
+    $jsonLinesOk = Test-JsonLines -Lines $lines
+    $jsonLineExtensionOk = $jsonLinesOk
+    if (-not $jsonLineExtensionOk -and $ext -in @('.jsonl','.ndjson') -and -not [string]::IsNullOrWhiteSpace($firstLine)) {
+        $jsonLineExtensionOk = Test-JsonText -Text $firstLine
+    }
+    if ($jsonLinesOk -or $jsonLineExtensionOk) {
+        $profile = 'Generic'
+        if ($text -match '(?i)"(eventSource|eventName|awsRegion|userIdentity|tenantId|operationName|operation|principal|resource|sourceIPAddress)"') { $profile = 'CloudAudit' }
+        elseif ($text -match '(?i)"(message|level|trace|span|api_key|client_secret|username|host)"') { $profile = 'AppJson' }
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'JSON Lines / NDJSON' -SuggestedProfile $profile -Confidence 92 `
+            -Reasons @('Multiple sampled lines parse as standalone JSON objects.') -Warnings $warnings
+    }
+    if ((Test-JsonText -Text $text) -or ($ext -eq '.json' -and (Test-JsonText -Text $text))) {
+        $profile = 'Generic'
+        if ($text -match '(?i)"(eventSource|eventName|awsRegion|userIdentity|tenantId|operationName|operation|principal|resource|sourceIPAddress)"') { $profile = 'CloudAudit' }
+        elseif ($text -match '(?i)"(message|level|trace|span|api_key|client_secret|username|host)"') { $profile = 'AppJson' }
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'JSON' -SuggestedProfile $profile -Confidence 90 `
+            -Reasons @('The sampled content parses as JSON.') -Warnings $warnings
+    }
+
+    $jsonish = ($firstLine -match '^\s*[\{\[]')
+    if (-not $jsonish -and ($ext -eq '.tsv' -or ($firstLine -match "`t" -and @($firstLine.ToCharArray() | Where-Object { $_ -eq "`t" }).Count -ge 1))) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'TSV' -SuggestedProfile 'Tsv' -Confidence 88 `
+            -Reasons @('The sample appears tab-delimited.') -Warnings $warnings
+    }
+    if (-not $jsonish -and ($ext -eq '.psv' -or (($firstLine -split '\|').Count -ge 3 -and $firstLine -notmatch '^\s*(CEF|LEEF):'))) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'PSV' -SuggestedProfile 'Psv' -Confidence 86 `
+            -Reasons @('The sample appears pipe-delimited.') -Warnings $warnings
+    }
+
+    if (-not $jsonish -and ($ext -eq '.csv' -or (($firstLine -split ',').Count -ge 3))) {
+        $columns = Get-LogHeaderColumns -Header $firstLine -Delimiter ','
+        $adHits = Get-LogColumnHitCount -Columns $columns -Patterns @('(?i)^RequestID$','(?i)^CertificateTemplate$','(?i)^CertSubject$','(?i)^CertIssuer$','(?i)^ESC\d*','(?i)^PkiObjectType$')
+        $eventHits = Get-LogColumnHitCount -Columns $columns -Patterns @('(?i)^ProviderName$','(?i)^LevelDisplayName$','(?i)^RecordId$','(?i)^MachineName$','(?i)^TimeCreated$','(?i)^Message$')
+        if ($adHits -ge 2) {
+            return New-LogFormatRecommendationObject -File $File -DetectedFormat 'CSV' -SuggestedProfile 'CA' -Confidence 96 `
+                -Reasons @('CSV header contains AD CS certificate/audit columns.') -Warnings $warnings
+        }
+        if ($eventHits -ge 3) {
+            return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Windows Event CSV' -SuggestedProfile 'WindowsEventCsv' -Confidence 96 `
+                -Reasons @('CSV header contains Windows Event export columns.') -Warnings $warnings
+        }
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'CSV' -SuggestedProfile 'Generic' -Confidence 82 `
+            -Reasons @('The sample appears comma-delimited.') -Warnings $warnings
+    }
+
+    if ($text -match '(?m)^\S+\s+\S+\s+\S+\s+\[[^\]]+\]\s+"[A-Z]+ [^"]+ HTTP/[0-9.]+"\s+\d{3}\s+') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Apache/Nginx access log' -SuggestedProfile 'Apache' -Confidence 86 `
+            -Reasons @('The sample matches common/combined web access log shape.') -Warnings $warnings
+    }
+    $kvMatches = [regex]::Matches($text, '(?<!\S)[A-Za-z_][A-Za-z0-9_.-]*=("[^"]*"|''[^'']*''|\S+)')
+    if ($kvMatches.Count -ge 2) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'logfmt / key=value' -SuggestedProfile 'Logfmt' -Confidence 88 `
+            -Reasons @('Multiple key=value pairs were found in the sample.') -Warnings $warnings
+    }
+    if ($text -match '(?m)^(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+\S+\s+') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Syslog-like text' -SuggestedProfile 'Syslog' -Confidence 82 `
+            -Reasons @('The sample starts with a syslog-like timestamp and host prefix.') -Warnings $warnings
+    }
+
+    return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Generic text' -SuggestedProfile 'Text' -Confidence 50 `
+        -Reasons @('No stronger structured format was detected from the local sample.') -Warnings $warnings
+}
+
+function Write-LogFormatRecommendationSummary {
+    [CmdletBinding()]
+    param(
+        [object[]]$Recommendations,
+        [switch]$SafeFirstRun,
+        [string]$Title = 'Log format recommendations'
+    )
+
+    $items = @($Recommendations)
+    Write-Rule $Title
+    Write-Info "Local-only sample analysis. No salt, token map, report, bundle or scrubbed output is created."
+    if ($items.Count -eq 0) {
+        Write-Warn "No candidate log files were found."
+        return
+    }
+    foreach ($rec in $items) {
+        Write-Ok ("{0}: {1} -> {2} ({3}% confidence)" -f $rec.Name, $rec.DetectedFormat, $rec.SuggestedProfile, $rec.Confidence)
+        foreach ($reason in @($rec.Reasons | Select-Object -First 3)) { Write-Detail $reason }
+        foreach ($warn in @($rec.Warnings)) { Write-Warn ("{0}: {1}" -f $rec.Name, $warn) }
+        Write-Detail ("Suggested: {0}" -f $rec.RecommendedCommand)
+    }
+    if ($SafeFirstRun) {
+        Write-Host ""
+        Write-Step "Suggested dry-run command(s)"
+        foreach ($cmd in @($items | ForEach-Object { $_.RecommendedCommand } | Select-Object -Unique)) { Write-Detail $cmd }
+    }
+}
+
+function Test-LogFormat {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Recurse,
+        [string[]]$Include,
+        [string[]]$Exclude,
+        [int]$SampleLines = 50,
+        [switch]$Quiet
+    )
+
+    $targets = Resolve-LogRecommendationTargets -Path $Path -Recurse:$Recurse -Include $Include -Exclude $Exclude
+    if ($targets.Count -eq 0) { throw "No candidate log files found: $Path" }
+    $recs = @()
+    foreach ($t in $targets) { $recs += Get-LogFormatRecommendation -File $t -SampleLines $SampleLines }
+    if (-not $Quiet) { Write-LogFormatRecommendationSummary -Recommendations $recs }
+    return $recs
+}
+
+# =====================================================================
 # REGION: Field scrubbing (profile-aware)
 # =====================================================================
 function Get-FallbackPrefix {
@@ -3990,7 +4316,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.10 -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.11 -- SELF-TEST" "Synthetic data only; no real logs touched."
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -4002,6 +4328,49 @@ function Invoke-ScrubSelfTest {
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("scrubtest_" + ([System.IO.Path]::GetRandomFileName().Replace('.', '')))
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     try {
+        # ---- 1) Local recommendation mode (no salt required) ----
+        Write-Rule "Log format recommendations"
+        $recDir = Join-Path $dir 'recommendations'
+        New-Item -ItemType Directory -Path $recDir -Force | Out-Null
+        $recSpecs = @(
+            [pscustomobject]@{ Name='adcs'; Ext='csv'; ExpectedFormat='CSV'; ExpectedProfile='CA'; Lines=@('RequestID,CertificateTemplate,CertSubject,CertIssuer,ESC1Candidate','1,UserTemplate,"CN=Alice","CN=Corp-CA",true') },
+            [pscustomobject]@{ Name='windows-event'; Ext='csv'; ExpectedFormat='Windows Event CSV'; ExpectedProfile='WindowsEventCsv'; Lines=@('ProviderName,LevelDisplayName,RecordId,MachineName,TimeCreated,Message','Microsoft-Windows-Security-Auditing,Information,1001,host01,2026-01-01T00:00:00Z,user alice logged on') },
+            [pscustomobject]@{ Name='table'; Ext='tsv'; ExpectedFormat='TSV'; ExpectedProfile='Tsv'; Lines=@("time`tuser`thost","2026-01-01`talice`tapp01") },
+            [pscustomobject]@{ Name='pipe'; Ext='psv'; ExpectedFormat='PSV'; ExpectedProfile='Psv'; Lines=@('time|user|host','2026-01-01|alice|app01') },
+            [pscustomobject]@{ Name='object'; Ext='json'; ExpectedFormat='JSON'; ExpectedProfile='Generic'; Lines=@('{"ok":true,"count":1}') },
+            [pscustomobject]@{ Name='stream'; Ext='jsonl'; ExpectedFormat='JSON Lines / NDJSON'; ExpectedProfile='Generic'; Lines=@('{"ok":true,"count":1}','{"ok":false,"count":2}') },
+            [pscustomobject]@{ Name='iis'; Ext='log'; ExpectedFormat='W3C/IIS'; ExpectedProfile='IIS'; Lines=@('#Software: Microsoft Internet Information Services 10.0','#Fields: date time c-ip cs-username cs-host cs-uri-stem sc-status','2026-01-01 00:00:00 10.0.0.1 CORP\alice intranet.corp.local /home 200') },
+            [pscustomobject]@{ Name='cef'; Ext='log'; ExpectedFormat='CEF'; ExpectedProfile='Cef'; Lines=@('CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1 suser=alice shost=app01') },
+            [pscustomobject]@{ Name='kv'; Ext='log'; ExpectedFormat='logfmt / key=value'; ExpectedProfile='Logfmt'; Lines=@('time=2026-01-01T00:00:00Z level=info user=alice host=app01') },
+            [pscustomobject]@{ Name='apache'; Ext='log'; ExpectedFormat='Apache/Nginx access log'; ExpectedProfile='Apache'; Lines=@('10.0.0.1 - alice [01/Jan/2026:00:00:00 +0000] "GET / HTTP/1.1" 200 123 "-" "curl/8.0"') },
+            [pscustomobject]@{ Name='plain'; Ext='txt'; ExpectedFormat='Generic text'; ExpectedProfile='Text'; Lines=@('plain diagnostic text with no structured delimiter') }
+        )
+        $recSalt = $script:Salt
+        $script:Salt = $null
+        try {
+            foreach ($spec in $recSpecs) {
+                $recPath = Join-Path $recDir ("{0}.{1}" -f $spec.Name, $spec.Ext)
+                $spec.Lines | Set-Content -Path $recPath -Encoding UTF8
+                $rec = @(Test-LogFormat -Path $recPath -Quiet | Select-Object -First 1)
+                & $assert ($rec.Count -eq 1) "Test-LogFormat [$($spec.Name)] returns one object"
+                if ($rec.Count -eq 1) {
+                    & $assert ($rec[0].DetectedFormat -eq $spec.ExpectedFormat) "Test-LogFormat [$($spec.Name)] detects $($spec.ExpectedFormat)"
+                    & $assert ($rec[0].SuggestedProfile -eq $spec.ExpectedProfile) "Test-LogFormat [$($spec.Name)] suggests $($spec.ExpectedProfile)"
+                    & $assert (-not [string]::IsNullOrWhiteSpace($rec[0].RecommendedCommand)) "Test-LogFormat [$($spec.Name)] includes command"
+                }
+            }
+            'Generated artifact placeholder' | Set-Content -Path (Join-Path $recDir 'old_scrubbed.log') -Encoding UTF8
+            'Generated artifact placeholder' | Set-Content -Path (Join-Path $recDir 'scrub_token_map_DO_NOT_UPLOAD.csv') -Encoding UTF8
+            'Generated artifact placeholder' | Set-Content -Path (Join-Path $recDir 'safe-upload.zip') -Encoding UTF8
+            $allRecs = @(Test-LogFormat -Path $recDir -Recurse -Quiet)
+            & $assert ($allRecs.Count -eq $recSpecs.Count) "Test-LogFormat folder scan works without salt and skips generated artifacts"
+            $recommend = @(Invoke-UniversalScrubber -Path $recDir -Recurse -RecommendOnly -NonInteractive)
+            & $assert ($recommend.Count -eq $recSpecs.Count) "RecommendOnly exits before salt is required"
+            $safeFirst = @(Invoke-UniversalScrubber -Path $recDir -Recurse -SafeFirstRun -NonInteractive)
+            & $assert ($safeFirst.Count -eq $recSpecs.Count) "SafeFirstRun exits before salt is required"
+        }
+        finally { $script:Salt = $recSalt }
+
         # ---- 1) One planted fixture per profile ----
         Write-Rule "Per-profile fixtures"
         foreach ($pol in @('Balanced','Strict')) {
@@ -4459,8 +4828,8 @@ function Write-RunManifest {
         }
     }
     $manifest = [pscustomobject]@{
-        tool            = "UniversalLogScrubber_v4_10.psm1"
-        schemaVersion   = "4.10"
+        tool            = "UniversalLogScrubber_v4_11.psm1"
+        schemaVersion   = "4.11"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
         hmacLength      = $script:HmacLength
@@ -4479,10 +4848,13 @@ function Write-RunManifest {
 # REGION: Interactive driver
 # =====================================================================
 function Invoke-UniversalScrubber {
-    [CmdletBinding()]
+        [CmdletBinding()]
     param(
         [string]$Path,
         [string]$WorkDir,
+        [switch]$RecommendOnly,
+        [switch]$SafeFirstRun,
+        [switch]$AutoProfile,
         [string]$Salt,
         [int]$HmacLength = 24,
         [string]$Profile,
@@ -4529,6 +4901,27 @@ function Invoke-UniversalScrubber {
     $script:DetectionSummaryReport = $DetectionSummaryReport
     $script:DetectionTrace = New-Object System.Collections.Generic.List[object]
     $script:DetectionCounts = @{}
+
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.11" "Token-map first, then scrub. Nothing leaves until it's clean."
+    if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
+    if ($SafeFirstRun) { Write-Info "SAFE FIRST RUN mode -- local sample analysis only." }
+    if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
+    if ($DryRun) { Write-Info "DRY RUN mode -- nothing will be written." }
+    if ($Stream) { Write-Info "STREAM mode -- bounded memory for very large files." }
+    Write-Info "Scrub policy: $script:ScrubPolicy"
+
+    if ($RecommendOnly -or $SafeFirstRun) {
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            if ($NonInteractive) { throw "Path is required in -NonInteractive recommendation mode." }
+            Write-Host ""
+            Write-Step "What log file or folder should be analyzed?"
+            $Path = Read-DefaultString -Prompt "Path to a log file OR a folder of logs"
+        }
+        $recs = Test-LogFormat -Path $Path -Recurse:$Recurse -Include $Include -Exclude $Exclude -Quiet
+        Write-LogFormatRecommendationSummary -Recommendations $recs -SafeFirstRun:$SafeFirstRun -Title 'Recommendation summary'
+        return $recs
+    }
+
     if ($SaltFile) {
         if (-not (Test-Path $SaltFile)) { throw "Salt file not found: $SaltFile" }
         $Salt = ([System.IO.File]::ReadAllText((Resolve-Path -Path $SaltFile).Path)).Trim()
@@ -4538,11 +4931,6 @@ function Invoke-UniversalScrubber {
         if ([string]::IsNullOrWhiteSpace($Salt)) { throw "Environment variable '$SaltFromEnv' is empty or not set." }
     }
     if ($Salt) { $script:Salt = $Salt }
-
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.10" "Token-map first, then scrub. Nothing leaves until it's clean."
-    if ($DryRun) { Write-Info "DRY RUN mode -- nothing will be written." }
-    if ($Stream) { Write-Info "STREAM mode -- bounded memory for very large files." }
-    Write-Info "Scrub policy: $script:ScrubPolicy"
 
     # --- Working directory ---
     if ([string]::IsNullOrWhiteSpace($WorkDir)) {
@@ -4607,6 +4995,24 @@ function Invoke-UniversalScrubber {
         Write-Ok "Target: $($targets[0].Name)"
     }
     else { throw "Path not found: $Path" }
+
+    if ($AutoProfile -and -not $Profile -and -not $ProfileFile) {
+        $autoRecs = @()
+        foreach ($t in $targets) { $autoRecs += Get-LogFormatRecommendation -File $t -SampleLines 50 }
+        $confident = @($autoRecs | Where-Object { $_.Confidence -ge 80 -and (Get-ScrubProfile -Name $_.SuggestedProfile) })
+        $profiles = @($confident | Select-Object -ExpandProperty SuggestedProfile -Unique)
+        if ($autoRecs.Count -gt 0 -and $confident.Count -eq $autoRecs.Count -and $profiles.Count -eq 1) {
+            $Profile = [string]$profiles[0]
+            Write-Ok "AutoProfile selected: $Profile"
+        }
+        else {
+            Write-LogFormatRecommendationSummary -Recommendations $autoRecs -Title 'AutoProfile recommendations'
+            if ($NonInteractive) {
+                throw "AutoProfile could not choose one high-confidence profile for all selected files. Pass -Profile explicitly or split files by type."
+            }
+            Write-Warn "AutoProfile could not choose one profile; falling back to the interactive profile picker."
+        }
+    }
 
     # --- Pre-convert special inputs (EVTX / XLSX / W3C-IIS) to CSV ---
     $evtxConverted = $false
@@ -4872,7 +5278,7 @@ function Invoke-UniversalScrubber {
 }
 
 Export-ModuleMember -Function `
-    Invoke-UniversalScrubber, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
+    Invoke-UniversalScrubber, Test-LogFormat, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
     Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `

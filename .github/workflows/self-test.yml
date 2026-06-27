@@ -16,7 +16,7 @@ jobs:
       - name: Run synthetic self-test
         shell: pwsh
         run: |
-          Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+          Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
           try {
             $ok = Invoke-ScrubSelfTest
             if (-not $ok) { throw "Invoke-ScrubSelfTest returned $ok" }
@@ -50,7 +50,7 @@ jobs:
       - name: Validate example profiles
         shell: pwsh
         run: |
-          Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+          Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
           Get-ChildItem .\docs\profiles\*.json | ForEach-Object {
             if (-not (Test-ScrubProfile -Path $_.FullName -Quiet)) {
               throw "Profile failed validation: $($_.FullName)"

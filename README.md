@@ -7,9 +7,9 @@ events can still be correlated without exposing the original identifiers.
 
 It works offline against Windows Event exports, EVTX files, CSV/TSV/PSV,
 JSON/NDJSON, IIS/W3C, web access/proxy logs, key=value/logfmt/CEF-style logs,
-syslog, and mixed diagnostic text. Version 4.10 adds a local sample-log profile
-builder, safer upload bundling, profile validation, and more non-technical
-guidance for profile-driven scrubbing.
+syslog, and mixed diagnostic text. Version 4.11 adds local log-format
+recommendations, safer first-run guidance, and optional automatic profile
+selection for uniform folders.
 
 ## Safety First
 
@@ -32,10 +32,10 @@ Private artifacts include:
 Open PowerShell in the repository root:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+.\scripts\Run-UniversalScrubber_v4_11.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
@@ -48,6 +48,32 @@ Invoke-ScrubSelfTest
 For noninteractive use, provide one of `-Salt`, `-SaltFromEnv`, or `-SaltFile`.
 Prefer `-SaltFromEnv` or `-SaltFile` so the salt is not left in command history.
 
+## Local Recommendations
+
+Use recommendations when you are not sure which profile fits a folder. These
+modes read only small local samples. They do not require a salt, scrub files,
+create token maps, write reports, or build upload bundles.
+
+```powershell
+Test-LogFormat -Path .\logs -Recurse
+
+Invoke-UniversalScrubber -Path .\logs -RecommendOnly
+
+Invoke-UniversalScrubber -Path .\logs -SafeFirstRun
+
+Invoke-UniversalScrubber `
+  -Path .\some.jsonl `
+  -AutoProfile `
+  -DryRun `
+  -Salt "preview-only" `
+  -MapSource Discover `
+  -NonInteractive
+```
+
+`-AutoProfile` chooses a profile only when every selected file confidently
+recommends the same built-in profile. Mixed folders should be split by type or
+run with `-Profile` explicitly.
+
 ## Build A Profile From A Sample
 
 When the built-in profiles are not specific enough, point the tool at a local
@@ -55,7 +81,7 @@ sample. It will create an editable BYOP profile without storing raw sample
 values in the profile.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+.\scripts\Run-UniversalScrubber_v4_11.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -67,7 +93,7 @@ values in the profile.
 Then preview with the generated profile:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+.\scripts\Run-UniversalScrubber_v4_11.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -ProfileFile C:\profiles\generated-profile.json `
@@ -100,8 +126,13 @@ domains, and common built-in Windows accounts are preserved where that is safer
 and more readable. You can add your own allowlist values in a profile or
 `-AllowlistFile`.
 
-## v4.10 Highlights
+## v4.11 Highlights
 
+- `Test-LogFormat` recommends existing profiles from small local file samples.
+- `-RecommendOnly` and `-SafeFirstRun` show recommendations and exit before salt,
+  token-map, report, bundle, or scrubbed-output work begins.
+- `-AutoProfile` can select one high-confidence built-in profile for uniform
+  inputs and refuses mixed folders in noninteractive mode.
 - `New-ScrubProfileFromSample` and `-BuildProfileFromSample` generate schema v2
   BYOP profiles from local sample logs.
 - Optional `-ProfileWizard` can write sample-derived seed and allowlist files
@@ -127,10 +158,13 @@ docs/profiles/  BYOP handbook and ready-to-edit profile examples
 ## Validation
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Test-LogFormat -Path .\samples\logs -Recurse
+Invoke-UniversalScrubber -Path .\samples\logs -Recurse -RecommendOnly -NonInteractive
+Invoke-UniversalScrubber -Path .\samples\logs -Recurse -SafeFirstRun -NonInteractive
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_10.ps1 `
+.\scripts\Run-UniversalScrubber_v4_11.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `

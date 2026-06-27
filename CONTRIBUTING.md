@@ -22,7 +22,7 @@ This project handles security-sensitive workflows. The most important contributi
 5. Confirm that no raw customer/client data is present.
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
 Invoke-ScrubSelfTest
 
 .\scripts\Test-SampleLogs.ps1

@@ -1,5 +1,17 @@
 # Changelog
 
+## v4.11
+
+- Added `Test-LogFormat` for local-only log format and profile recommendations.
+- Added `-RecommendOnly` and `-SafeFirstRun` to show recommendations before salt,
+  token-map, report, bundle, or scrubbed-output work begins.
+- Added `-AutoProfile` for uniform, high-confidence inputs, with a clear
+  noninteractive stop for mixed or low-confidence folders.
+- Added recommendation coverage for CSV, TSV, PSV, JSON, JSONL/NDJSON, W3C/IIS,
+  CEF, LEEF, logfmt, Apache/Nginx-like access logs, syslog-like logs, EVTX,
+  XLSX, Windows Event CSV, AD CS CSV, and generic text fallback.
+- Bumped the versioned module and launcher names to v4.11.
+
 ## v4.10
 
 - Added `New-ScrubProfileFromSample` and launcher support via
