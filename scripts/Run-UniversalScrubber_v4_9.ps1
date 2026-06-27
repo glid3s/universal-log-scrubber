@@ -9,15 +9,15 @@
   anything still required is prompted for.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_8.ps1
+  .\Run-UniversalScrubber_v4_9.ps1
   # Fully interactive.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_8.ps1 -Path C:\winlogs\Security.evtx
+  .\Run-UniversalScrubber_v4_9.ps1 -Path C:\winlogs\Security.evtx
   # Auto-converts the .evtx to CSV, then scrubs it.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_8.ps1 -Path C:\logs -DryRun -ExplainDetections
+  .\Run-UniversalScrubber_v4_9.ps1 -Path C:\logs -DryRun -ExplainDetections
   # Preview what WOULD be tokenized -- writes nothing.
 #>
 [CmdletBinding()]
@@ -32,6 +32,10 @@ param(
     [ValidateSet('Discover','ExistingMap','AD')][string]$MapSource,
     [ValidateSet('Merge','Replace')][string]$TokenMapMode = 'Merge',
     [string[]]$SensitiveTerms,
+    [Alias('SeedTermsFile')][string[]]$SensitiveTermsFile,
+    [string[]]$SeedFile,
+    [string[]]$AllowlistFile,
+    [ValidateSet('Generic','Csv','Json','Kv','WebAccess','Cloud','App')][string]$ProfileTemplate,
     [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
     [ValidateSet('Fast','CountFirst')][string]$EvtxProgressMode = 'Fast',
     [switch]$ExplainDetections,
@@ -52,7 +56,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Derive the module name from THIS launcher's own name:
-#   Run-UniversalScrubber_v4_8.ps1  ->  UniversalLogScrubber_v4_8.psm1
+#   Run-UniversalScrubber_v4_9.ps1  ->  UniversalLogScrubber_v4_9.psm1
 $myBase = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
 $suffix = ''
 if ($myBase -match '^Run-UniversalScrubber(.*)$') { $suffix = $matches[1] }

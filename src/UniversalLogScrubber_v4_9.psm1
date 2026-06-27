@@ -133,6 +133,19 @@
     * A safe counts-only -DetectionSummaryReport complements the local-only detailed
       false-positive report.
 
+  v4.9 ADDS
+  ---------
+    * Universal label-aware detection now applies beyond Windows Event logs to
+      CSV cells, JSON values, key=value/logfmt/CEF-style text and free-form logs.
+    * BYOP profile schema v2 adds SchemaColumns, WholeColumnRules, LabelRules,
+      CustomRegexRules, Allowlist/AllowlistFile and SeedTerms/SeedFiles.
+    * CLI seed files are first-class via -SeedFile and -SensitiveTermsFile, with
+      -AllowlistFile for public diagnostic values that should stay readable.
+    * Built-in non-Windows presets cover web access/proxy, cloud audit, firewall,
+      VPN, app JSON, database, container/Kubernetes and identity-provider logs.
+    * Dry-run summaries include detector counts, and profile regexes compile once
+      with timeouts plus keyword prefilters for expensive custom rules.
+
   CONSISTENCY GUARANTEE
   ---------------------
   Map-build, scrub and leak-harden all share ONE salt, ONE HMAC length and ONE
@@ -179,6 +192,18 @@ $script:DetectionSummaryReport = $null
 $script:CurrentTokenMapCsv = $null
 $script:TokenMapMode = 'Merge'
 $script:EvtxProgressMode = 'Fast'
+$script:RegexTimeout = [TimeSpan]::FromMilliseconds(250)
+$script:CurrentProfile = $null
+$script:RuntimeLabelRules = @()
+$script:RuntimeCustomRegexRules = @()
+$script:RuntimeAllowExact = @{}
+$script:RuntimeAllowRegex = @()
+$script:KnownTokenPrefixes = @(
+    'PRINCIPAL','UNMAPPED_PRINCIPAL','UNMAPPED_UPN','COMPUTER','GROUP',
+    'OBJECT','SID','DNS','UPN','EMAIL','CERT','TEMPLATE','CA','X500',
+    'GUID','IP','IP6','HOST','URL','URI','MAC','JWT','ARN','AWSKEY',
+    'INSTANCE','BLOB','SECRET','APIKEY','CONNSTR','PEM'
+)
 
 # =====================================================================
 # REGION: Pretty console UI
@@ -709,6 +734,7 @@ function Test-PreserveDetectedValue {
         [int]$Length = 0
     )
     if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if (Test-ScrubAllowlist -Value $Value) { return $true }
     if ($script:ScrubPolicy -eq 'Strict') { return $false }
     $v = $Value.Trim()
     if (Is-AlreadyToken -Value $v) { return $true }
@@ -728,6 +754,366 @@ function Test-PreserveDetectedValue {
     return $false
 }
 
+function New-ScrubRegex {
+    param(
+        [Parameter(Mandatory)][string]$Pattern,
+        [string]$Context = 'regex',
+        [System.Text.RegularExpressions.RegexOptions]$Options = ([System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Multiline)
+    )
+    try {
+        return [regex]::new($Pattern, $Options, $script:RegexTimeout)
+    }
+    catch {
+        throw "Invalid $Context '$Pattern': $($_.Exception.Message)"
+    }
+}
+
+function Resolve-ProfileTokenPrefix {
+    param([Parameter(Mandatory)][string]$Prefix, [string]$Context = 'profile rule')
+    $p = $Prefix.Trim().ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($p)) { throw "$Context has an empty Prefix." }
+    if (@($script:KnownTokenPrefixes | Where-Object { $_ -ieq $p }).Count -eq 0) {
+        throw "$Context has invalid Prefix '$Prefix'. Expected one of: $($script:KnownTokenPrefixes -join ', ')."
+    }
+    return $p
+}
+
+function Get-ShannonEntropy {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return 0.0 }
+    $counts = @{}
+    foreach ($ch in $Value.ToCharArray()) {
+        $k = [string]$ch
+        if (-not $counts.ContainsKey($k)) { $counts[$k] = 0 }
+        $counts[$k] = [int]$counts[$k] + 1
+    }
+    $entropy = 0.0
+    foreach ($k in $counts.Keys) {
+        $p = [double]$counts[$k] / [double]$Value.Length
+        if ($p -gt 0) { $entropy -= $p * ([Math]::Log($p, 2)) }
+    }
+    return $entropy
+}
+
+function ConvertTo-ColumnRuleRegex {
+    param([string]$Exact, [string]$Wildcard, [string]$Regex, [string]$Context)
+    if (-not [string]::IsNullOrWhiteSpace($Regex)) { return (New-ScrubRegex -Pattern $Regex -Context $Context) }
+    if (-not [string]::IsNullOrWhiteSpace($Wildcard)) {
+        $pat = '^' + ([regex]::Escape($Wildcard) -replace '\\\*', '.*' -replace '\\\?', '.') + '$'
+        return (New-ScrubRegex -Pattern $pat -Context $Context)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Exact)) {
+        return (New-ScrubRegex -Pattern ('^' + [regex]::Escape($Exact) + '$') -Context $Context)
+    }
+    throw "$Context requires Exact, Wildcard, or Regex."
+}
+
+function ConvertTo-ProfileColumnRules {
+    param($Rules, [string]$DefaultAction = 'Scan', [string]$DefaultPrefix = 'OBJECT', [string]$Context = 'profile column rule')
+    $out = New-Object System.Collections.Generic.List[object]
+    $defaultPrefixResolved = Resolve-ProfileTokenPrefix -Prefix $DefaultPrefix -Context $Context
+    foreach ($r in @($Rules)) {
+        if ($null -eq $r) { continue }
+        if ($r -is [string]) {
+            $rx = ConvertTo-ColumnRuleRegex -Exact $r -Context $Context
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$DefaultAction; Prefix=$defaultPrefixResolved; SplitOn=$null; Description='' })
+            continue
+        }
+        $actionRaw = if ($r.Action) { [string]$r.Action } else { $DefaultAction }
+        $actionMatch = @('Scrub','Scan','PassThrough') | Where-Object { $_ -ieq $actionRaw } | Select-Object -First 1
+        if (-not $actionMatch) { throw "$Context has invalid Action '$actionRaw'. Expected Scrub, Scan, or PassThrough." }
+        $action = [string]$actionMatch
+        $prefixRaw = if ($r.Prefix) { [string]$r.Prefix } else { $defaultPrefixResolved }
+        $prefix = Resolve-ProfileTokenPrefix -Prefix $prefixRaw -Context $Context
+        $exactValues = @()
+        if ($r.Exact) { $exactValues += @($r.Exact) }
+        if ($r.Column) { $exactValues += @($r.Column) }
+        if ($r.Columns) { $exactValues += @($r.Columns) }
+        if ($r.Name) { $exactValues += @($r.Name) }
+        $wildcards = @()
+        if ($r.Wildcard) { $wildcards += @($r.Wildcard) }
+        if ($r.Pattern -and -not $r.Regex) { $wildcards += @($r.Pattern) }
+        $regexes = @()
+        if ($r.Regex) { $regexes += @($r.Regex) }
+        if ($r.Match -eq 'Regex' -and $r.Pattern) { $regexes += @($r.Pattern) }
+        foreach ($ex in $exactValues) {
+            if ([string]::IsNullOrWhiteSpace([string]$ex)) { continue }
+            $rx = ConvertTo-ColumnRuleRegex -Exact ([string]$ex) -Context $Context
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+        }
+        foreach ($wc in $wildcards) {
+            if ([string]::IsNullOrWhiteSpace([string]$wc)) { continue }
+            $rx = ConvertTo-ColumnRuleRegex -Wildcard ([string]$wc) -Context $Context
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+        }
+        foreach ($re in $regexes) {
+            if ([string]::IsNullOrWhiteSpace([string]$re)) { continue }
+            $rx = ConvertTo-ColumnRuleRegex -Regex ([string]$re) -Context $Context
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+        }
+    }
+    return @($out.ToArray())
+}
+
+function Read-ScrubListFile {
+    param([Parameter(Mandatory)][string]$Path, [string]$BasePath)
+    $p = $Path
+    if (-not [System.IO.Path]::IsPathRooted($p) -and $BasePath) { $p = Join-Path $BasePath $p }
+    if (-not (Test-Path -LiteralPath $p)) { throw "List file not found: $Path" }
+    $items = New-Object System.Collections.Generic.List[string]
+    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path -LiteralPath $p).Path)) {
+        $t = ([string]$line).Trim()
+        if ([string]::IsNullOrWhiteSpace($t) -or $t.StartsWith('#')) { continue }
+        [void]$items.Add($t)
+    }
+    return @($items.ToArray())
+}
+
+function Merge-ScrubTerms {
+    param([string[]]$Terms = @(), [string[]]$Files = @(), [string]$BasePath)
+    $seen = @{}
+    foreach ($term in @($Terms)) {
+        $t = ([string]$term).Trim()
+        if ($t.Length -lt 3) { continue }
+        $k = $t.ToLowerInvariant()
+        if (-not $seen.ContainsKey($k)) { $seen[$k] = $t }
+    }
+    foreach ($file in @($Files)) {
+        if ([string]::IsNullOrWhiteSpace($file)) { continue }
+        foreach ($term in (Read-ScrubListFile -Path $file -BasePath $BasePath)) {
+            $t = ([string]$term).Trim()
+            if ($t.Length -lt 3) { continue }
+            $k = $t.ToLowerInvariant()
+            if (-not $seen.ContainsKey($k)) { $seen[$k] = $t }
+        }
+    }
+    return @($seen.Values | Sort-Object)
+}
+
+function Add-AllowlistEntry {
+    param($Entry, [string]$BasePath)
+    if ($null -eq $Entry) { return }
+    if ($Entry -is [string]) {
+        $t = $Entry.Trim()
+        if ([string]::IsNullOrWhiteSpace($t)) { return }
+        if ($t -match '(?i)^regex:(.+)$') {
+            $script:RuntimeAllowRegex += (New-ScrubRegex -Pattern $matches[1].Trim() -Context 'allowlist regex')
+        }
+        elseif ($t -match '(?i)^domain:(.+)$') {
+            $script:AllowedDomains += @($matches[1].Trim())
+        }
+        else {
+            $script:RuntimeAllowExact[$t.ToLowerInvariant()] = $true
+        }
+        return
+    }
+    if ($Entry.Domain) { $script:AllowedDomains += @([string]$Entry.Domain) }
+    if ($Entry.Regex) { $script:RuntimeAllowRegex += (New-ScrubRegex -Pattern ([string]$Entry.Regex) -Context 'allowlist regex') }
+    if ($Entry.Value) { $script:RuntimeAllowExact[([string]$Entry.Value).Trim().ToLowerInvariant()] = $true }
+    if ($Entry.Exact) { foreach ($v in @($Entry.Exact)) { if ($v) { $script:RuntimeAllowExact[([string]$v).Trim().ToLowerInvariant()] = $true } } }
+}
+
+function Test-ScrubAllowlist {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = $Value.Trim().Trim('"', "'")
+    if ($script:RuntimeAllowExact -and $script:RuntimeAllowExact.ContainsKey($v.ToLowerInvariant())) { return $true }
+    foreach ($rx in @($script:RuntimeAllowRegex)) {
+        if ($rx.IsMatch($v)) { return $true }
+    }
+    if (Test-AllowedDomain -Value $v) { return $true }
+    return $false
+}
+
+function Get-DefaultUniversalLabelRules {
+    return @(
+        [pscustomobject]@{ Name='SecretLabels'; Labels=@('api key','api_key','apikey','access token','access_token','refresh token','refresh_token','client secret','client_secret','secret','password','passwd','pwd','authorization','auth token','bearer token'); Prefix='SECRET'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex='(?i)^(redacted|masked|null|none|\*+|x+)$' },
+        [pscustomobject]@{ Name='PrincipalLabels'; Labels=@('account name','account','user name','username','user','principal','subject','actor','caller','login','identity','client user'); Prefix='PRINCIPAL'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex=$null },
+        [pscustomobject]@{ Name='DomainTenantLabels'; Labels=@('account domain','domain','tenant','tenant id','tenantid','organization','org','realm'); Prefix='X500'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex=$null },
+        [pscustomobject]@{ Name='HostLabels'; Labels=@('host','hostname','server','server name','machine','machine name','computer','computer name','device','workstation','workstation name','client name','target server name','pod','container','node','instance'); Prefix='DNS'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex=$null },
+        [pscustomobject]@{ Name='AddressLabels'; Labels=@('ip','ip address','src_ip','dst_ip','source ip','destination ip','source address','destination address','source network address','client address','remote addr','remote_addr','x-forwarded-for'); Prefix='IP'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex=$null },
+        [pscustomobject]@{ Name='UrlLabels'; Labels=@('url','uri','endpoint','callback','redirect_uri','redirect uri'); Prefix='URI'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex=$null },
+        [pscustomobject]@{ Name='ObjectIdLabels'; Labels=@('session','session id','sessionid','request id','requestid','correlation id','correlationid','trace id','traceid','span id','spanid','transaction id','transactionid'); Prefix='OBJECT'; SeparatorRegex='[:=]'; ValueRegex=$null; PreserveRegex=$null }
+    )
+}
+
+function ConvertTo-UniversalLabelRule {
+    param($Rule, [string]$Context = 'label rule')
+    $name = if ($Rule.Name) { [string]$Rule.Name } else { $Context }
+    $prefixRaw = if ($Rule.Prefix) { [string]$Rule.Prefix } else { 'OBJECT' }
+    $prefix = Resolve-ProfileTokenPrefix -Prefix $prefixRaw -Context "$Context '$name'"
+    $sep = if ($Rule.SeparatorRegex) { [string]$Rule.SeparatorRegex } else { '[:=]' }
+    $valueRx = if ($Rule.ValueRegex) { [string]$Rule.ValueRegex } else { '(?:"[^"\r\n]{1,512}"|''[^''\r\n]{1,512}''|LOCAL SERVICE|NETWORK SERVICE|ANONYMOUS LOGON|NT AUTHORITY|Window Manager|Font Driver Host|[^,\s;|]{1,512})' }
+    $labelRx = $null
+    if ($Rule.LabelRegex) { $labelRx = [string]$Rule.LabelRegex }
+    else {
+        $labels = @()
+        if ($Rule.Labels) { $labels += @($Rule.Labels) }
+        if ($Rule.Label) { $labels += @($Rule.Label) }
+        if ($labels.Count -eq 0) { throw "$Context '$name' requires Labels or LabelRegex." }
+        $labelRx = (($labels | ForEach-Object { [regex]::Escape(([string]$_).Trim()) }) -join '|')
+    }
+    $full = "(?im)((?<![A-Za-z0-9_])(?:$labelRx)(?![A-Za-z0-9_])\s*(?:$sep)\s*)($valueRx)"
+    $preserve = if ($Rule.PreserveRegex) { New-ScrubRegex -Pattern ([string]$Rule.PreserveRegex) -Context "$Context preserve regex" } else { $null }
+    $allow = @{}
+    if ($Rule.Preserve) { foreach ($p in @($Rule.Preserve)) { if ($p) { $allow[([string]$p).Trim().ToLowerInvariant()] = $true } } }
+    return [pscustomobject]@{
+        Name = $name
+        Prefix = $prefix
+        RegexObject = (New-ScrubRegex -Pattern $full -Context "$Context '$name'")
+        PreserveRegex = $preserve
+        PreserveExact = $allow
+    }
+}
+
+function Get-UniversalLabeledValuePrefix {
+    param([string]$Label, [string]$Value, [string]$DefaultPrefix)
+    $v = ([string]$Value).Trim().Trim('"', "'")
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    if ($DefaultPrefix -match '^(SECRET|APIKEY|CONNSTR|PEM)$') { return $DefaultPrefix }
+    if ($Label -match '(?i)(key|secret|token|password|passwd|pwd|auth)') { return 'SECRET' }
+    if ($Label -match '(?i)(address|addr|ip|x-forwarded)') {
+        if ($v -match '^\d{1,3}(\.\d{1,3}){3}$') { return 'IP' }
+        if ($v -match ':') { return 'IP6' }
+        return 'DNS'
+    }
+    if ($Label -match '(?i)(url|uri|endpoint|callback|redirect)') { return 'URI' }
+    if ($Label -match '(?i)(host|server|machine|computer|device|workstation|node|pod|container|instance|client name)') { return 'DNS' }
+    if ($Label -match '(?i)(domain|tenant|organization|org|realm)') { return 'X500' }
+    if ($v -match '\$$') { return 'COMPUTER' }
+    if ($DefaultPrefix) { return $DefaultPrefix }
+    return 'OBJECT'
+}
+
+function Test-PreserveUniversalLabeledValue {
+    param($Rule, [string]$Label, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    $v = $Value.Trim().Trim('"', "'")
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+    if (Is-AlreadyToken -Value $v) { return $true }
+    if (Test-ScrubAllowlist -Value $v) { return $true }
+    if ($Rule.PreserveExact -and $Rule.PreserveExact.ContainsKey($v.ToLowerInvariant())) { return $true }
+    if ($Rule.PreserveRegex -and $Rule.PreserveRegex.IsMatch($v)) { return $true }
+    if ($v -match '^(?:-|N/A|NULL|\(null\))$') { return $true }
+    if ($v -match '(?i)^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE|ANONYMOUS LOGON|Guest|DefaultAccount|WDAGUtilityAccount|DWM-\d+|UMFD-\d+)$') { return $true }
+    if ($v -match '(?i)^(WORKGROUP|NT AUTHORITY|BUILTIN|Window Manager|Font Driver Host)$') { return $true }
+    if (($Label -match '(?i)(Address|IP|addr)') -and (Test-PreserveIpAddress -Value $v)) { return $true }
+    return $false
+}
+
+function Find-UniversalLabeledIdentifiers {
+    param([Parameter(Mandatory)][string]$Text)
+    $found = @{}
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    foreach ($rule in @($script:RuntimeLabelRules)) {
+        foreach ($m in $rule.RegexObject.Matches($Text)) {
+            $label = ($m.Groups[1].Value -replace '\s*(?:[:=])\s*$', '').Trim()
+            $raw = $m.Groups[2].Value.Trim().Trim('"', "'")
+            if (Test-PreserveUniversalLabeledValue -Rule $rule -Label $label -Value $raw) { continue }
+            $prefix = Get-UniversalLabeledValuePrefix -Label $label -Value $raw -DefaultPrefix $rule.Prefix
+            if (-not $prefix) { continue }
+            $norm = Normalize-TokenKey -Value $raw
+            if ($norm -and -not $found.ContainsKey($norm)) {
+                $found[$norm] = [pscustomobject]@{ Raw = $raw; Prefix = $prefix; Rule = $rule.Name }
+            }
+        }
+    }
+    return @($found.Values)
+}
+
+function Find-UniversalLabeledLeaks {
+    param([Parameter(Mandatory)][string]$Text)
+    $leaks = @()
+    foreach ($id in (Find-UniversalLabeledIdentifiers -Text $Text)) {
+        if (-not (Is-AlreadyToken -Value $id.Raw)) { $leaks += ("{0}: {1}" -f $id.Rule, $id.Raw) }
+    }
+    return @($leaks | Select-Object -Unique)
+}
+
+function Invoke-UniversalLabelHardening {
+    param([Parameter(Mandatory)][string]$Text, [string]$ColumnName)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    $out = $Text
+    foreach ($rule in @($script:RuntimeLabelRules)) {
+        $out = $rule.RegexObject.Replace($out, {
+            param($m)
+            $prefixText = $m.Groups[1].Value
+            $label = ($prefixText -replace '\s*(?:[:=])\s*$', '').Trim()
+            $raw = $m.Groups[2].Value.Trim().Trim('"', "'")
+            if (Test-PreserveUniversalLabeledValue -Rule $rule -Label $label -Value $raw) { return $m.Value }
+            $prefix = Get-UniversalLabeledValuePrefix -Label $label -Value $raw -DefaultPrefix $rule.Prefix
+            if (-not $prefix) { return $m.Value }
+            $tok = Get-Token -Value $raw -Prefix $prefix
+            Add-DetectionTrace -Detector 'UniversalLabel' -Action 'Tokenized' -Value $raw -Token $tok -Reason $rule.Name -ColumnName $ColumnName -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
+            return $prefixText + $tok
+        })
+    }
+    return $out
+}
+
+function Test-RuleAllowlistedSecret {
+    param($Rule, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    $v = $Value.Trim().Trim('"', "'")
+    if (Test-ScrubAllowlist -Value $v) { return $true }
+    if ($Rule.AllowExact -and $Rule.AllowExact.ContainsKey($v.ToLowerInvariant())) { return $true }
+    foreach ($rx in @($Rule.AllowRegex)) { if ($rx.IsMatch($v)) { return $true } }
+    if ($Rule.Entropy -and ((Get-ShannonEntropy -Value $v) -lt [double]$Rule.Entropy)) { return $true }
+    return $false
+}
+
+function Find-CustomRegexIdentifiers {
+    param([Parameter(Mandatory)][string]$Text)
+    $found = @{}
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    foreach ($rule in @($script:RuntimeCustomRegexRules)) {
+        if ($rule.Keywords -and $rule.Keywords.Count -gt 0) {
+            $hasKeyword = $false
+            foreach ($kw in @($rule.Keywords)) { if ($Text.IndexOf([string]$kw, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $hasKeyword = $true; break } }
+            if (-not $hasKeyword) { continue }
+        }
+        foreach ($m in $rule.RegexObject.Matches($Text)) {
+            $group = [int]$rule.CaptureGroup
+            if ($group -ge $m.Groups.Count -or -not $m.Groups[$group].Success) { continue }
+            $raw = $m.Groups[$group].Value.Trim().Trim('"', "'")
+            if (Test-RuleAllowlistedSecret -Rule $rule -Value $raw) { continue }
+            if (Is-AlreadyToken -Value $raw) { continue }
+            $norm = Normalize-TokenKey -Value $raw
+            if ($norm -and -not $found.ContainsKey($norm)) {
+                $found[$norm] = [pscustomobject]@{ Raw = $raw; Prefix = $rule.Prefix; Rule = $rule.Name }
+            }
+        }
+    }
+    return @($found.Values)
+}
+
+function Invoke-CustomRegexHardening {
+    param([Parameter(Mandatory)][string]$Text, [string]$ColumnName)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    $out = $Text
+    foreach ($rule in @($script:RuntimeCustomRegexRules)) {
+        if ($rule.Keywords -and $rule.Keywords.Count -gt 0) {
+            $hasKeyword = $false
+            foreach ($kw in @($rule.Keywords)) { if ($out.IndexOf([string]$kw, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $hasKeyword = $true; break } }
+            if (-not $hasKeyword) { continue }
+        }
+        $out = $rule.RegexObject.Replace($out, {
+            param($m)
+            $group = [int]$rule.CaptureGroup
+            if ($group -ge $m.Groups.Count -or -not $m.Groups[$group].Success) { return $m.Value }
+            $raw = $m.Groups[$group].Value.Trim().Trim('"', "'")
+            if (Test-RuleAllowlistedSecret -Rule $rule -Value $raw) { return $m.Value }
+            if (Is-AlreadyToken -Value $raw) { return $m.Value }
+            $tok = Get-Token -Value $raw -Prefix $rule.Prefix
+            Add-DetectionTrace -Detector 'CustomRegex' -Action 'Tokenized' -Value $raw -Token $tok -Reason $rule.Name -ColumnName $ColumnName -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
+            if ($group -eq 0) { return $tok }
+            $rel = $m.Groups[$group].Index - $m.Index
+            return $m.Value.Substring(0, $rel) + $tok + $m.Value.Substring($rel + $m.Groups[$group].Length)
+        })
+    }
+    return $out
+}
+
 function Invoke-WindowsPathUserHardening {
     param([Parameter(Mandatory)][string]$Text)
     return [regex]::Replace($Text, '(?i)((?:\\\\\?\\)?[A-Za-z]:\\Users\\)([^\\/"'',;:]+)', {
@@ -739,86 +1125,33 @@ function Invoke-WindowsPathUserHardening {
 }
 
 function Get-WindowsEventLabelRegex {
-    $valueLabels = 'Account Name|Account Domain|User Name|Target User Name|Subject User Name|Service Name|Workstation Name|Source Network Address|Client Address|Client Name|Computer Name|Machine Name|Target Server Name'
-    $multiWordBuiltins = 'LOCAL SERVICE|NETWORK SERVICE|ANONYMOUS LOGON|NT AUTHORITY|Window Manager|Font Driver Host'
-    return "(?im)(\b(?:$valueLabels)\s*:\s*)((?:$multiWordBuiltins)|[^\s\t\r\n]+)"
+    return '(?im)(Account Name|Account Domain|User Name|Target User Name|Subject User Name|Service Name|Workstation Name|Source Network Address|Client Address|Client Name|Computer Name|Machine Name|Target Server Name)\s*:\s*(\S+)'
 }
 
 function Test-PreserveWindowsLabeledValue {
     param([string]$Label, [string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
-    $v = $Value.Trim()
-    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
-    if (Is-AlreadyToken -Value $v) { return $true }
-    if ($v -match '^(?:-|N/A|NULL|\(null\))$') { return $true }
-    if ($v -match '(?i)^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE|ANONYMOUS LOGON|Guest|DefaultAccount|WDAGUtilityAccount|DWM-\d+|UMFD-\d+)$') { return $true }
-    if ($v -match '(?i)^(WORKGROUP|NT AUTHORITY|BUILTIN|Window Manager|Font Driver Host)$') { return $true }
-    if (($Label -match '(?i)Address') -and (Test-PreserveIpAddress -Value $v)) { return $true }
-    return $false
+    $rule = [pscustomobject]@{ PreserveExact=@{}; PreserveRegex=$null }
+    return (Test-PreserveUniversalLabeledValue -Rule $rule -Label $Label -Value $Value)
 }
 
 function Get-WindowsLabeledValuePrefix {
     param([string]$Label, [string]$Value)
-    $v = ([string]$Value).Trim()
-    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
-    if ($Label -match '(?i)Address') {
-        if ($v -match '^\d{1,3}(\.\d{1,3}){3}$') { return 'IP' }
-        if ($v -match ':') { return 'IP6' }
-        return 'DNS'
-    }
-    if ($Label -match '(?i)Domain') { return 'X500' }
-    if ($Label -match '(?i)Workstation|Computer|Machine|Server|Client Name') { return 'DNS' }
-    if ($v -match '\$$') { return 'COMPUTER' }
-    return 'PRINCIPAL'
+    return (Get-UniversalLabeledValuePrefix -Label $Label -Value $Value -DefaultPrefix 'PRINCIPAL')
 }
 
 function Find-WindowsLabeledIdentifiers {
     param([Parameter(Mandatory)][string]$Text)
-    $found = @{}
-    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
-    foreach ($m in [regex]::Matches($Text, (Get-WindowsEventLabelRegex))) {
-        $label = $m.Groups[1].Value -replace ':\s*$', ''
-        $raw = $m.Groups[2].Value.Trim()
-        if (Test-PreserveWindowsLabeledValue -Label $label -Value $raw) { continue }
-        $prefix = Get-WindowsLabeledValuePrefix -Label $label -Value $raw
-        if (-not $prefix) { continue }
-        $norm = Normalize-TokenKey -Value $raw
-        if ($norm -and -not $found.ContainsKey($norm)) {
-            $found[$norm] = [pscustomobject]@{ Raw = $raw; Prefix = $prefix }
-        }
-    }
-    return @($found.Values)
+    return Find-UniversalLabeledIdentifiers -Text $Text
 }
 
 function Find-WindowsLabeledLeaks {
     param([Parameter(Mandatory)][string]$Text)
-    $leaks = @()
-    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
-    foreach ($m in [regex]::Matches($Text, (Get-WindowsEventLabelRegex))) {
-        $label = $m.Groups[1].Value -replace ':\s*$', ''
-        $raw = $m.Groups[2].Value.Trim()
-        if (Test-PreserveWindowsLabeledValue -Label $label -Value $raw) { continue }
-        if (Is-AlreadyToken -Value $raw) { continue }
-        $leaks += ("{0}: {1}" -f $label.Trim(), $raw)
-    }
-    return @($leaks | Select-Object -Unique)
+    return Find-UniversalLabeledLeaks -Text $Text
 }
 
 function Invoke-WindowsEventLabelHardening {
     param([Parameter(Mandatory)][string]$Text, [string]$ColumnName)
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
-    return [regex]::Replace($Text, (Get-WindowsEventLabelRegex), {
-        param($m)
-        $prefixText = $m.Groups[1].Value
-        $label = $prefixText -replace ':\s*$', ''
-        $raw = $m.Groups[2].Value.Trim()
-        if (Test-PreserveWindowsLabeledValue -Label $label -Value $raw) { return $m.Value }
-        $prefix = Get-WindowsLabeledValuePrefix -Label $label -Value $raw
-        if (-not $prefix) { return $m.Value }
-        $tok = Get-Token -Value $raw -Prefix $prefix
-        Add-DetectionTrace -Detector 'WindowsEventLabel' -Action 'Tokenized' -Value $raw -Token $tok -Reason $label -ColumnName $ColumnName -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
-        return $prefixText + $tok
-    })
+    return Invoke-UniversalLabelHardening -Text $Text -ColumnName $ColumnName
 }
 
 function Test-PreserveSecretCandidate {
@@ -1079,7 +1412,13 @@ function Find-Identifiers {
     param([Parameter(Mandatory)][string]$Text)
     $found = @{}   # normalizedKey -> @{ Raw; Prefix }
     if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
-    foreach ($id in (Find-WindowsLabeledIdentifiers -Text $Text)) {
+    foreach ($id in (Find-UniversalLabeledIdentifiers -Text $Text)) {
+        $norm = Normalize-TokenKey -Value $id.Raw
+        if ($norm -and -not $found.ContainsKey($norm)) {
+            $found[$norm] = [pscustomobject]@{ Raw = $id.Raw; Prefix = $id.Prefix }
+        }
+    }
+    foreach ($id in (Find-CustomRegexIdentifiers -Text $Text)) {
         $norm = Normalize-TokenKey -Value $id.Raw
         if ($norm -and -not $found.ContainsKey($norm)) {
             $found[$norm] = [pscustomobject]@{ Raw = $id.Raw; Prefix = $id.Prefix }
@@ -1697,8 +2036,117 @@ function Get-ScrubProfile {
         PassThroughRegex=$null; ColumnPrefix=@(); FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
     }
 
+    $webAccess = [pscustomobject]@{
+        Name='WebAccess'; Description='Web access logs from reverse proxies, Nginx, Apache, CDNs, and load balancers.'; Format='Text'; Delimiter=','
+        PassThroughRegex=$null; ColumnPrefix=@(); FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $cloudAudit = [pscustomobject]@{
+        Name='CloudAudit'; Description='Cloud audit/activity logs with principals, tenants, resources, source IPs, and request IDs.'; Format='Json'; Delimiter=','
+        PassThroughRegex='^(eventTime|eventType|eventName|eventSource|awsRegion|status|result|severity|level|operation|category)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|principal|actor|caller|identity|assumedrole|arn'; Prefix='PRINCIPAL'; DollarComputer=$true },
+            @{ Pattern='tenant|account|subscription|project|organization|org'; Prefix='X500' },
+            @{ Pattern='source|client|remote|ip|address'; Prefix='IP' },
+            @{ Pattern='host|resource|instance|node|cluster'; Prefix='DNS' },
+            @{ Pattern='request|correlation|trace|session|eventid'; Prefix='OBJECT' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $firewall = [pscustomobject]@{
+        Name='Firewall'; Description='Firewall and network security logs with source/destination addresses, users, devices, and rules.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(action|allow|deny|protocol|proto|port|src_port|dst_port|bytes|packets|rule|policy|severity|time|date|timestamp)$'
+        ColumnPrefix=@(
+            @{ Pattern='src|dst|source|destination|client|remote|ip|addr|address'; Prefix='IP' },
+            @{ Pattern='user|account|principal|identity'; Prefix='PRINCIPAL' },
+            @{ Pattern='host|device|gateway|server|clientname'; Prefix='DNS' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $vpn = [pscustomobject]@{
+        Name='Vpn'; Description='VPN, remote access, and authentication gateway logs.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(action|status|result|duration|bytes|port|protocol|time|date|timestamp|reason)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|account|principal|identity|login'; Prefix='PRINCIPAL' },
+            @{ Pattern='client|remote|assigned|source|ip|address'; Prefix='IP' },
+            @{ Pattern='host|gateway|server|device'; Prefix='DNS' },
+            @{ Pattern='session|correlation|request'; Prefix='OBJECT' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $proxy = [pscustomobject]@{
+        Name='Proxy'; Description='Proxy, SWG, and web filtering logs.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(action|status|category|method|http_method|response_code|bytes|time|date|timestamp|mime|user_agent)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|account|principal'; Prefix='PRINCIPAL' },
+            @{ Pattern='client|source|remote|ip|address'; Prefix='IP' },
+            @{ Pattern='url|uri|referer|referrer|request'; Prefix='URI' },
+            @{ Pattern='host|domain|fqdn|server'; Prefix='DNS' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $appJson = [pscustomobject]@{
+        Name='AppJson'; Description='Application JSON/NDJSON logs with user, host, tenant, request, trace, and secret fields.'; Format='Json'; Delimiter=','
+        PassThroughRegex='^(timestamp|time|level|severity|messageTemplate|event|eventId|status|duration|elapsed|count)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|account|principal|actor|subject'; Prefix='PRINCIPAL' },
+            @{ Pattern='host|server|machine|node|pod|container|service'; Prefix='DNS' },
+            @{ Pattern='ip|address|client|remote|source'; Prefix='IP' },
+            @{ Pattern='tenant|org|organization|domain'; Prefix='X500' },
+            @{ Pattern='request|correlation|trace|span|session|transaction'; Prefix='OBJECT' },
+            @{ Pattern='token|secret|password|key|authorization'; Prefix='SECRET' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $database = [pscustomobject]@{
+        Name='Database'; Description='Database audit/query logs with users, clients, hosts, SQL text, and connection strings.'; Format='Text'; Delimiter=','
+        PassThroughRegex=$null
+        ColumnPrefix=@(
+            @{ Pattern='user|login|principal|account|owner|schema'; Prefix='PRINCIPAL' },
+            @{ Pattern='host|server|database|db|instance|client'; Prefix='DNS' },
+            @{ Pattern='ip|address|client'; Prefix='IP' },
+            @{ Pattern='password|secret|connection|string|conn'; Prefix='SECRET' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $container = [pscustomobject]@{
+        Name='Container'; Description='Container runtime, Docker, and orchestrator logs.'; Format='Json'; Delimiter=','
+        PassThroughRegex='^(time|timestamp|level|severity|stream|exitCode|restartCount|status)$'
+        ColumnPrefix=@(
+            @{ Pattern='container|pod|node|host|image|service|namespace|cluster'; Prefix='DNS' },
+            @{ Pattern='user|account|principal|serviceaccount'; Prefix='PRINCIPAL' },
+            @{ Pattern='ip|address'; Prefix='IP' },
+            @{ Pattern='secret|token|key|password'; Prefix='SECRET' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $kubernetes = [pscustomobject]@{
+        Name='Kubernetes'; Description='Kubernetes audit and workload logs.'; Format='Json'; Delimiter=','
+        PassThroughRegex='^(kind|apiVersion|verb|stage|level|timestamp|code|reason|namespace)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|groups|serviceaccount|impersonated'; Prefix='PRINCIPAL' },
+            @{ Pattern='pod|node|container|host|cluster|object|resource|namespace'; Prefix='DNS' },
+            @{ Pattern='source|ip|address'; Prefix='IP' },
+            @{ Pattern='token|secret|authorization'; Prefix='SECRET' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $identityProvider = [pscustomobject]@{
+        Name='IdentityProvider'; Description='Identity provider, SSO, MFA, and directory sign-in logs.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(time|date|timestamp|result|status|success|failure|risk|mfa|method|app|application|event|eventid)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|upn|email|account|principal|actor|target'; Prefix='UNMAPPED_UPN' },
+            @{ Pattern='tenant|domain|realm|org|organization|directory'; Prefix='X500' },
+            @{ Pattern='ip|address|client|source|remote'; Prefix='IP' },
+            @{ Pattern='device|host|machine|computer'; Prefix='DNS' },
+            @{ Pattern='session|correlation|request|token|jti'; Prefix='OBJECT' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+
     $all = [ordered]@{ Generic=$generic; CA=$ca; WindowsEventCsv=$win; Text=$text;
-                       Tsv=$tsv; Psv=$psv; IIS=$iis; Syslog=$syslog; Apache=$apache; Cef=$cef; Logfmt=$logfmt }
+                       Tsv=$tsv; Psv=$psv; IIS=$iis; Syslog=$syslog; Apache=$apache; Cef=$cef; Logfmt=$logfmt;
+                       WebAccess=$webAccess; CloudAudit=$cloudAudit; Firewall=$firewall; Vpn=$vpn; Proxy=$proxy;
+                       AppJson=$appJson; Database=$database; Container=$container; Kubernetes=$kubernetes; IdentityProvider=$identityProvider }
     if ($Name) {
         foreach ($k in $all.Keys) { if ($k -ieq $Name) { return $all[$k] } }
         return $null
@@ -1735,6 +2183,7 @@ function Get-TokenForAtomicValue {
     $clean = if ($ColumnName -match 'SAN|UPN|Email') { Normalize-SANValue -Value $Value } else { $Value.Trim() }
     if ([string]::IsNullOrWhiteSpace($clean)) { return $Value }
     if (Is-AlreadyToken -Value $clean) { return $clean }
+    if (Test-ScrubAllowlist -Value $clean) { return $clean }
     $norm = Normalize-TokenKey -Value $clean
     if ($norm -and $script:TokenByNorm.ContainsKey($norm)) { return $script:TokenByNorm[$norm] }
     $known = Get-CanonicalKnownLabelByValue -Value $clean
@@ -1752,6 +2201,42 @@ function Get-TokenForAtomicValue {
     return $clean
 }
 
+function Get-MatchingProfileColumnRule {
+    param($Profile, [string]$ColumnName, [string]$RuleSet)
+    if (-not $Profile -or [string]::IsNullOrWhiteSpace($ColumnName)) { return $null }
+    $rules = @()
+    try { if ($Profile.$RuleSet) { $rules = @($Profile.$RuleSet) } } catch { }
+    foreach ($rule in $rules) {
+        if ($null -eq $rule -or $null -eq $rule.RegexObject) { continue }
+        if ($rule.RegexObject.IsMatch($ColumnName)) { return $rule }
+    }
+    return $null
+}
+
+function Invoke-TokenizeWholeValue {
+    param([string]$ColumnName, [string]$Value, [string]$Prefix = 'OBJECT', [string]$SplitOn)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    $text = [string]$Value
+    if (-not [string]::IsNullOrWhiteSpace($SplitOn) -and $text -match $SplitOn) {
+        $parts = [regex]::Split($text, "($SplitOn)")
+        $rebuilt = foreach ($part in $parts) {
+            if ($part -match "^($SplitOn)$") { $part }
+            else {
+                $p = $part.Trim()
+                if ([string]::IsNullOrWhiteSpace($p)) { $part }
+                elseif (Is-AlreadyToken -Value $p) { $p }
+                elseif (Test-ScrubAllowlist -Value $p) { $p }
+                else { Get-Token -Value $p -Prefix $Prefix }
+            }
+        }
+        return [string]::Concat($rebuilt)
+    }
+    $clean = $text.Trim()
+    if (Is-AlreadyToken -Value $clean) { return $clean }
+    if (Test-ScrubAllowlist -Value $clean) { return $clean }
+    return (Get-Token -Value $clean -Prefix $Prefix)
+}
+
 # Per-field free-text hardening (the fuller set; safe because it runs on ONE cell,
 # not across the whole CSV). Every match routes through Get-Token.
 function Invoke-FreeTextHardening {
@@ -1759,8 +2244,9 @@ function Invoke-FreeTextHardening {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
     $out = $Value
     $out = Invoke-SecretHardening -Text $out -ColumnName $ColumnName
+    $out = Invoke-CustomRegexHardening -Text $out -ColumnName $ColumnName
     $out = Invoke-CommonDetectors -Text $out
-    $out = Invoke-WindowsEventLabelHardening -Text $out -ColumnName $ColumnName
+    $out = Invoke-UniversalLabelHardening -Text $out -ColumnName $ColumnName
     $out = [regex]::Replace($out, 'S-1-\d+(?:-\d+)+', { param($m) Get-Token -Value $m.Value -Prefix "SID" })
     $out = [regex]::Replace($out, '(?im)(\bCertificateTemplate\s*:\s*)([A-Za-z0-9_.\-]+)', {
         param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "TEMPLATE") } })
@@ -1825,13 +2311,25 @@ function Scrub-Field {
     if ([string]::IsNullOrWhiteSpace($text)) { return $text }
 
     try {
+        $wholeRule = Get-MatchingProfileColumnRule -Profile $Profile -ColumnName $ColumnName -RuleSet 'WholeColumnRules'
+        if ($wholeRule) {
+            return [string](Invoke-TokenizeWholeValue -ColumnName $ColumnName -Value $text -Prefix $wholeRule.Prefix -SplitOn $wholeRule.SplitOn)
+        }
+
+        $schemaRule = Get-MatchingProfileColumnRule -Profile $Profile -ColumnName $ColumnName -RuleSet 'SchemaColumns'
+        if ($schemaRule -and $schemaRule.Action -eq 'Scrub') {
+            return [string](Invoke-TokenizeWholeValue -ColumnName $ColumnName -Value $text -Prefix $schemaRule.Prefix -SplitOn $schemaRule.SplitOn)
+        }
+        if ($schemaRule -and $schemaRule.Action -eq 'PassThrough') { return $text }
+
         # Profile pass-through columns (analytical / non-identifying) survive intact.
         if ($Profile.PassThroughRegex -and ($ColumnName -match $Profile.PassThroughRegex)) { return $text }
 
         # Multi-valued cells: split on ; or | and tokenize EACH element on its own, so
         # a principal list never collapses to a single token.
-        if ($text -match ';|\|') {
-            $delimiter = if ($text -match ';') { ';' } else { '|' }
+        $multiSplit = if ($schemaRule -and $schemaRule.SplitOn) { [string]$schemaRule.SplitOn } else { ';|\|' }
+        if ($text -match $multiSplit) {
+            $delimiter = if ($text -match ';') { ';' } elseif ($text -match '\|') { '|' } else { $matches[0] }
             $parts = $text -split [regex]::Escape($delimiter)
             $scrubbedParts = foreach ($part in $parts) {
                 $p = $part.Trim()
@@ -1846,7 +2344,7 @@ function Scrub-Field {
 
         # Free-text fallback: deny-by-default profiles harden every column; others use
         # the profile's free-text column regex.
-        if ($Profile.DenyByDefault -or ($Profile.FreeTextRegex -and $ColumnName -match $Profile.FreeTextRegex)) {
+        if (($schemaRule -and $schemaRule.Action -eq 'Scan') -or $Profile.DenyByDefault -or ($Profile.FreeTextRegex -and $ColumnName -match $Profile.FreeTextRegex)) {
             return [string](Invoke-FreeTextHardening -ColumnName $ColumnName -Value $text)
         }
         return $text
@@ -1875,8 +2373,9 @@ function Invoke-LeakHardeningText {
     param([Parameter(Mandatory)][string]$Text)
     $out = $Text
     $out = Invoke-SecretHardening -Text $out
+    $out = Invoke-CustomRegexHardening -Text $out
     $out = Invoke-CommonDetectors -Text $out
-    $out = Invoke-WindowsEventLabelHardening -Text $out
+    $out = Invoke-UniversalLabelHardening -Text $out
     $out = [regex]::Replace($out, '(?im)(\bCertificateTemplate\s*:\s*)([A-Za-z0-9_.\-]+)', {
         param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "TEMPLATE") } })
     $out = [regex]::Replace($out, '(?im)(\b(?:cdc|rmd|ccm)\s*:\s*)([A-Za-z0-9_.\-]+)', {
@@ -1947,9 +2446,13 @@ function Test-ScrubbedForLeaks {
         $count = ([regex]::Matches($text, [regex]::Escape($term.Trim()), 'IgnoreCase')).Count
         if ($count -gt 0) { $findings.Add([pscustomobject]@{ Type = "SensitiveTerm '$($term.Trim())'"; Count = $count; Samples = "" }) }
     }
-    $labeledLeaks = @(Find-WindowsLabeledLeaks -Text $text)
+    $labeledLeaks = @(Find-UniversalLabeledLeaks -Text $text)
     if ($labeledLeaks.Count -gt 0) {
-        $findings.Add([pscustomobject]@{ Type = "Windows labeled account"; Count = $labeledLeaks.Count; Samples = (($labeledLeaks | Select-Object -First 5) -join ", ") })
+        $findings.Add([pscustomobject]@{ Type = "Universal labeled value"; Count = $labeledLeaks.Count; Samples = (($labeledLeaks | Select-Object -First 5) -join ", ") })
+    }
+    $customLeaks = @(Find-CustomRegexIdentifiers -Text $text | ForEach-Object { $_.Raw } | Select-Object -Unique)
+    if ($customLeaks.Count -gt 0) {
+        $findings.Add([pscustomobject]@{ Type = "Custom regex value"; Count = $customLeaks.Count; Samples = (($customLeaks | Select-Object -First 5) -join ", ") })
     }
     $secretLeaks = @(Find-SecretIdentifiers -Text $text | ForEach-Object { $_.Raw } | Select-Object -Unique)
     if ($secretLeaks.Count -gt 0) {
@@ -2146,6 +2649,12 @@ function Write-DryRunSummary {
             }
             if ($traceItems.Count -gt 20) { Write-Detail ("  ... and {0} more detection decisions" -f ($traceItems.Count - 20)) }
         }
+        if ($script:DetectionCounts -and $script:DetectionCounts.Count -gt 0) {
+            Write-Detail "Detector counts:"
+            foreach ($k in ($script:DetectionCounts.Keys | Sort-Object)) {
+                Write-Detail ("  {0,-42} {1}" -f $k, $script:DetectionCounts[$k])
+            }
+        }
     }
     catch {
         Write-Detail "(preview summary detail unavailable: $($_.Exception.Message))"
@@ -2293,6 +2802,71 @@ function ConvertFrom-EvtxToCsv {
 # =====================================================================
 # REGION: Bring-your-own profile (JSON / PSD1)
 # =====================================================================
+function ConvertTo-CustomRegexRules {
+    param($Rules)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($Rules)) {
+        if ($null -eq $r) { continue }
+        $name = if ($r.Name) { [string]$r.Name } elseif ($r.Id) { [string]$r.Id } else { 'CustomRegex' }
+        $pat = if ($r.Regex) { [string]$r.Regex } elseif ($r.Pattern) { [string]$r.Pattern } else { $null }
+        if ([string]::IsNullOrWhiteSpace($pat)) { throw "CustomRegexRules '$name' requires Regex." }
+        $prefixRaw = if ($r.Prefix) { [string]$r.Prefix } else { 'SECRET' }
+        $prefix = Resolve-ProfileTokenPrefix -Prefix $prefixRaw -Context "CustomRegexRules '$name'"
+        $group = 0
+        if ($r.CaptureGroup) { $group = [int]$r.CaptureGroup }
+        elseif ($r.SecretGroup) { $group = [int]$r.SecretGroup }
+        $allowExact = @{}
+        if ($r.Allowlist) { foreach ($a in @($r.Allowlist)) { if ($a) { $allowExact[([string]$a).Trim().ToLowerInvariant()] = $true } } }
+        if ($r.Stopwords) { foreach ($a in @($r.Stopwords)) { if ($a) { $allowExact[([string]$a).Trim().ToLowerInvariant()] = $true } } }
+        $allowRegex = @()
+        if ($r.AllowlistRegex) { foreach ($a in @($r.AllowlistRegex)) { if ($a) { $allowRegex += (New-ScrubRegex -Pattern ([string]$a) -Context "custom regex allowlist '$name'") } } }
+        [void]$out.Add([pscustomobject]@{
+            Name = $name
+            Prefix = $prefix
+            Regex = $pat
+            RegexObject = (New-ScrubRegex -Pattern $pat -Context "custom regex rule '$name'")
+            CaptureGroup = $group
+            Keywords = if ($r.Keywords) { @($r.Keywords) } else { @() }
+            Entropy = if ($r.Entropy) { [double]$r.Entropy } else { $null }
+            AllowExact = $allowExact
+            AllowRegex = @($allowRegex)
+            Description = if ($r.Description) { [string]$r.Description } else { '' }
+        })
+    }
+    return @($out.ToArray())
+}
+
+function Initialize-ScrubProfileRuntime {
+    param($Profile, [string[]]$AllowlistFiles = @())
+    if (-not $Profile) { return }
+    $script:CurrentProfile = $Profile
+    $extraAllowed = @()
+    try { if ($Profile.AllowedDomains) { $extraAllowed = @($Profile.AllowedDomains) } } catch { }
+    $script:AllowedDomains = @($script:AllowedDomainsDefault + $extraAllowed)
+    $script:RuntimeAllowExact = @{}
+    $script:RuntimeAllowRegex = @()
+    foreach ($entry in @($Profile.Allowlist)) { Add-AllowlistEntry -Entry $entry -BasePath $Profile.ProfileRoot }
+    $profileAllowFiles = @()
+    try { if ($Profile.AllowlistFile) { $profileAllowFiles += @($Profile.AllowlistFile) } } catch { }
+    try { if ($Profile.AllowlistFiles) { $profileAllowFiles += @($Profile.AllowlistFiles) } } catch { }
+    foreach ($file in @($profileAllowFiles + $AllowlistFiles)) {
+        if ([string]::IsNullOrWhiteSpace($file)) { continue }
+        foreach ($entry in (Read-ScrubListFile -Path $file -BasePath $Profile.ProfileRoot)) { Add-AllowlistEntry -Entry $entry -BasePath $Profile.ProfileRoot }
+    }
+    $labelRules = New-Object System.Collections.Generic.List[object]
+    foreach ($rule in (Get-DefaultUniversalLabelRules)) { [void]$labelRules.Add((ConvertTo-UniversalLabelRule -Rule $rule -Context 'default label rule')) }
+    foreach ($rule in @($Profile.LabelRules)) {
+        if ($null -eq $rule) { continue }
+        [void]$labelRules.Add((ConvertTo-UniversalLabelRule -Rule $rule -Context 'profile LabelRules'))
+    }
+    foreach ($label in @($script:AdditionalBroadLabels)) {
+        if ([string]::IsNullOrWhiteSpace($label)) { continue }
+        [void]$labelRules.Add((ConvertTo-UniversalLabelRule -Rule ([pscustomobject]@{ Name="Additional:$label"; Labels=@($label); Prefix='OBJECT' }) -Context 'additional label'))
+    }
+    $script:RuntimeLabelRules = @($labelRules.ToArray())
+    $script:RuntimeCustomRegexRules = if ($Profile.CustomRegexRules) { @($Profile.CustomRegexRules) } else { @() }
+}
+
 function Import-ScrubProfileFile {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path $Path)) { throw "Profile file not found: $Path" }
@@ -2301,7 +2875,6 @@ function Import-ScrubProfileFile {
     if (-not $raw) { throw "Profile file is empty or invalid: $Path" }
     $name = if ($raw.Name) { [string]$raw.Name } else { [System.IO.Path]::GetFileNameWithoutExtension($Path) }
     $validFormats = @('Auto','Csv','Tsv','Psv','Text','Json','Kv')
-    $validPrefixes = @('PRINCIPAL','UNMAPPED_PRINCIPAL','UNMAPPED_UPN','COMPUTER','GROUP','OBJECT','SID','DNS','UPN','EMAIL','CERT','TEMPLATE','CA','X500','GUID','IP','IP6','HOST','URL','URI','MAC','JWT','ARN','AWSKEY','INSTANCE','BLOB','SECRET','APIKEY','CONNSTR','PEM')
     $fmt = if ($raw.Format) { [string]$raw.Format } else { 'Auto' }
     if (@($validFormats | Where-Object { $_ -ieq $fmt }).Count -eq 0) { throw "Invalid profile Format '$fmt'. Expected one of: $($validFormats -join ', ')." }
     $cp = @()
@@ -2311,15 +2884,19 @@ function Import-ScrubProfileFile {
             $pre = [string]$r.Prefix
             if ([string]::IsNullOrWhiteSpace($pat)) { throw "Invalid profile ColumnPrefix entry: Pattern is required." }
             try { [void][regex]::new($pat) } catch { throw "Invalid profile ColumnPrefix regex '$pat': $($_.Exception.Message)" }
-            if (@($validPrefixes | Where-Object { $_ -ieq $pre }).Count -eq 0) { throw "Invalid profile token Prefix '$pre'. Expected one of: $($validPrefixes -join ', ')." }
+            $pre = Resolve-ProfileTokenPrefix -Prefix $pre -Context 'ColumnPrefix'
             $cp += @{ Pattern = $pat; Prefix = $pre; NotOid = [bool]$r.NotOid; DollarComputer = [bool]$r.DollarComputer }
         }
     }
-    if ($raw.PassThroughRegex) { try { [void][regex]::new([string]$raw.PassThroughRegex) } catch { throw "Invalid PassThroughRegex: $($_.Exception.Message)" } }
-    if ($raw.FreeTextRegex) { try { [void][regex]::new([string]$raw.FreeTextRegex) } catch { throw "Invalid FreeTextRegex: $($_.Exception.Message)" } }
+    if ($raw.PassThroughRegex) { [void](New-ScrubRegex -Pattern ([string]$raw.PassThroughRegex) -Context 'PassThroughRegex') }
+    if ($raw.FreeTextRegex) { [void](New-ScrubRegex -Pattern ([string]$raw.FreeTextRegex) -Context 'FreeTextRegex') }
+    $schemaColumns = ConvertTo-ProfileColumnRules -Rules $raw.SchemaColumns -DefaultAction 'Scan' -DefaultPrefix 'OBJECT' -Context 'SchemaColumns'
+    $wholeColumnRules = ConvertTo-ProfileColumnRules -Rules $raw.WholeColumnRules -DefaultAction 'Scrub' -DefaultPrefix 'OBJECT' -Context 'WholeColumnRules'
+    $customRegexRules = ConvertTo-CustomRegexRules -Rules $raw.CustomRegexRules
     $prof = [pscustomobject]@{
         Name             = $name
         Description      = if ($raw.Description) { [string]$raw.Description } else { "Custom profile ($name)" }
+        SchemaVersion    = if ($raw.SchemaVersion) { [int]$raw.SchemaVersion } else { 1 }
         Format           = $fmt
         Delimiter        = if ($raw.Delimiter) { [string]$raw.Delimiter } else { ',' }
         PassThroughRegex = if ($raw.PassThroughRegex) { [string]$raw.PassThroughRegex } else { $null }
@@ -2327,9 +2904,79 @@ function Import-ScrubProfileFile {
         FreeTextRegex    = if ($raw.FreeTextRegex) { [string]$raw.FreeTextRegex } else { '.*' }
         DenyByDefault    = if ($null -ne $raw.DenyByDefault) { [bool]$raw.DenyByDefault } else { $true }
         AllowedDomains   = if ($raw.AllowedDomains) { @($raw.AllowedDomains) } else { @() }
+        SchemaColumns    = @($schemaColumns)
+        WholeColumnRules = @($wholeColumnRules)
+        LabelRules       = if ($raw.LabelRules) { @($raw.LabelRules) } else { @() }
+        CustomRegexRules = @($customRegexRules)
+        Allowlist        = if ($raw.Allowlist) { @($raw.Allowlist) } else { @() }
+        AllowlistFile    = if ($raw.AllowlistFile) { @($raw.AllowlistFile) } else { @() }
+        AllowlistFiles   = if ($raw.AllowlistFiles) { @($raw.AllowlistFiles) } else { @() }
+        SeedTerms        = if ($raw.SeedTerms) { @($raw.SeedTerms) } else { @() }
+        SeedFiles        = if ($raw.SeedFiles) { @($raw.SeedFiles) } else { @() }
+        ProfileRoot      = Split-Path -Parent (Resolve-Path -LiteralPath $Path).Path
     }
     Write-Ok "Loaded custom profile '$($prof.Name)' from $([System.IO.Path]::GetFileName($Path))"
     return $prof
+}
+
+function New-ScrubProfileTemplate {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Generic','Csv','Json','Kv','WebAccess','Cloud','App')][string]$Template,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+    $format = switch ($Template) {
+        'Csv' { 'Csv' }
+        'Json' { 'Json' }
+        'Kv' { 'Kv' }
+        'Cloud' { 'Json' }
+        'App' { 'Json' }
+        default { 'Auto' }
+    }
+    $body = @"
+{
+  "SchemaVersion": 2,
+  "Name": "$Template-Custom",
+  "Description": "Custom $Template profile for Universal Log Scrubber.",
+  "Format": "$format",
+  "Delimiter": ",",
+  "DenyByDefault": true,
+  "AllowedDomains": [
+    "example.com"
+  ],
+  "SchemaColumns": [
+    { "Exact": "timestamp", "Action": "PassThrough", "Description": "Analytical timestamp" },
+    { "Wildcard": "*message*", "Action": "Scan", "Description": "Free-text message field" }
+  ],
+  "WholeColumnRules": [
+    { "Regex": "(?i)^(user(id|name)?|account|principal)$", "Prefix": "PRINCIPAL", "SplitOn": "[;,|]" },
+    { "Regex": "(?i)^(host|server|machine|device)$", "Prefix": "DNS", "SplitOn": "[;,|]" },
+    { "Regex": "(?i)^(ip|clientip|src_ip|dst_ip|address)$", "Prefix": "IP", "SplitOn": "[;,|]" },
+    { "Regex": "(?i)(api[_ -]?key|token|secret|password)", "Prefix": "SECRET" }
+  ],
+  "LabelRules": [
+    { "Name": "LocalApiKey", "Labels": [ "API Key", "api_key", "client_secret" ], "Prefix": "SECRET" },
+    { "Name": "LocalHostLabels", "Labels": [ "host", "server", "node" ], "Prefix": "DNS" }
+  ],
+  "CustomRegexRules": [
+    {
+      "Name": "CompanyProjectId",
+      "Regex": "(?i)\\b(project[_ -]?id\\s*[:=]\\s*)(PROJ-[0-9]{4}-[A-Z]{3})\\b",
+      "CaptureGroup": 2,
+      "Prefix": "OBJECT",
+      "Keywords": [ "project", "PROJ-" ],
+      "Entropy": 0
+    }
+  ],
+  "SeedFiles": [ "seeds.txt" ],
+  "AllowlistFile": [ "allowlist.txt" ]
+}
+"@
+    $out = Resolve-OutPath -Path $OutputPath
+    $dir = Split-Path -Parent $out
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    [System.IO.File]::WriteAllText($out, $body, [System.Text.Encoding]::UTF8)
+    Write-Ok "Profile template written: $out"
+    return $out
 }
 
 # =====================================================================
@@ -2475,10 +3122,15 @@ function Invoke-ScrubFileStreaming {
     )
     $updateLeaks = {
         param([string]$line)
-        foreach ($v in (Find-WindowsLabeledLeaks -Text $line)) {
-            $leakCounts['Windows labeled account'] = ([int]$leakCounts['Windows labeled account']) + 1
-            if (-not $leakSamples.ContainsKey('Windows labeled account')) { $leakSamples['Windows labeled account'] = New-Object System.Collections.Generic.List[string] }
-            if ($leakSamples['Windows labeled account'].Count -lt 5 -and -not $leakSamples['Windows labeled account'].Contains($v)) { [void]$leakSamples['Windows labeled account'].Add($v) }
+        foreach ($v in (Find-UniversalLabeledLeaks -Text $line)) {
+            $leakCounts['Universal labeled value'] = ([int]$leakCounts['Universal labeled value']) + 1
+            if (-not $leakSamples.ContainsKey('Universal labeled value')) { $leakSamples['Universal labeled value'] = New-Object System.Collections.Generic.List[string] }
+            if ($leakSamples['Universal labeled value'].Count -lt 5 -and -not $leakSamples['Universal labeled value'].Contains($v)) { [void]$leakSamples['Universal labeled value'].Add($v) }
+        }
+        foreach ($v in (Find-CustomRegexIdentifiers -Text $line | ForEach-Object { $_.Raw })) {
+            $leakCounts['Custom regex value'] = ([int]$leakCounts['Custom regex value']) + 1
+            if (-not $leakSamples.ContainsKey('Custom regex value')) { $leakSamples['Custom regex value'] = New-Object System.Collections.Generic.List[string] }
+            if ($leakSamples['Custom regex value'].Count -lt 5 -and -not $leakSamples['Custom regex value'].Contains($v)) { [void]$leakSamples['Custom regex value'].Add($v) }
         }
         foreach ($v in (Find-SecretIdentifiers -Text $line | ForEach-Object { $_.Raw })) {
             $leakCounts['Secret-like value'] = ([int]$leakCounts['Secret-like value']) + 1
@@ -2702,7 +3354,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.8 -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.9 -- SELF-TEST" "Synthetic data only; no real logs touched."
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -2787,7 +3439,78 @@ function Invoke-ScrubSelfTest {
         }
         & $assert ($wh -match '\\\?\\C:\\WINDOWS\\LiveKernelReports\\WHEA\\') "WindowsEvent path separators preserved"
 
-        # ---- 4) Streaming vs normal equivalence ----
+        # ---- 4) BYOP schema v2 and universal detection ----
+        Write-Rule "BYOP schema v2 and universal detection"
+        $script:ScrubPolicy = 'Balanced'
+        & $reset
+        $byop = Join-Path $dir 'byop'
+        $byopOut = Join-Path $byop 'out'
+        New-Item -ItemType Directory -Path $byop -Force | Out-Null
+        $seedPath = Join-Path $byop 'seeds.txt'
+        $allowPath = Join-Path $byop 'allowlist.txt'
+        [System.IO.File]::WriteAllText($seedPath, "# synthetic seed terms`r`nOrchidLabs`r`nORCHIDLABS`r`n", [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($allowPath, "# public diagnostic values`r`npublic.example.com`r`nregex:^build-[0-9]+$`r`n", [System.Text.Encoding]::UTF8)
+        $profilePath = Join-Path $byop 'profile.json'
+        $profileJson = @'
+{
+  "SchemaVersion": 2,
+  "Name": "SelfTestBYOP",
+  "Format": "Csv",
+  "DenyByDefault": true,
+  "SeedFiles": [ "seeds.txt" ],
+  "AllowlistFile": [ "allowlist.txt" ],
+  "SchemaColumns": [
+    { "Exact": "Timestamp", "Action": "PassThrough" },
+    { "Exact": "Message", "Action": "Scan" }
+  ],
+  "WholeColumnRules": [
+    { "Exact": "UserID", "Prefix": "PRINCIPAL" },
+    { "Exact": "Server", "Prefix": "DNS" },
+    { "Exact": "ClientIP", "Prefix": "IP" },
+    { "Exact": "APIKey", "Prefix": "SECRET" }
+  ],
+  "LabelRules": [
+    { "Name": "SelfTestLabels", "Labels": [ "username", "host", "API Key", "tenantId", "src_ip" ], "Prefix": "OBJECT" }
+  ],
+  "CustomRegexRules": [
+    {
+      "Name": "ProjectId",
+      "Regex": "(?i)\\b(project[_ -]?id\\s*[:=]\\s*)(PROJ-[0-9]{4}-[A-Z]{3})\\b",
+      "CaptureGroup": 2,
+      "Prefix": "OBJECT",
+      "Keywords": [ "project", "PROJ-" ],
+      "Entropy": 0
+    }
+  ]
+}
+'@
+        [System.IO.File]::WriteAllText($profilePath, $profileJson, [System.Text.Encoding]::UTF8)
+        $byopCsv = Join-Path $byop 'byop.csv'
+        @(
+            'Timestamp,UserID,Server,ClientIP,APIKey,Message,PublicHost',
+            '"2026-01-01T00:00:00Z","alice","app01.internal.test","10.91.1.2","sk-test-synthetic000000000000000000000000","username=bob host: db01.internal.test API Key = local-secret-value tenantId=TenantBlue src_ip=10.91.1.3 project id: PROJ-1234-ABC org OrchidLabs public.example.com build-123","public.example.com"'
+        ) | Set-Content -Path $byopCsv -Encoding UTF8
+        $byopResults = Invoke-UniversalScrubber -Path $byopCsv -WorkDir $byopOut -ProfileFile $profilePath -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -NonInteractive
+        $byopText = Get-Content -Path $byopResults[0].Output -Raw
+        foreach ($gone in @('alice','app01.internal.test','10.91.1.2','sk-test-synthetic','bob','db01.internal.test','local-secret-value','TenantBlue','10.91.1.3','PROJ-1234-ABC','OrchidLabs')) {
+            & $assert (-not ($byopText -match [regex]::Escape($gone))) "BYOP removed: $gone"
+        }
+        foreach ($keep in @('public.example.com','build-123','2026-01-01T00:00:00Z')) {
+            & $assert ($byopText -match [regex]::Escape($keep)) "BYOP preserved: $keep"
+        }
+        $dry = Invoke-UniversalScrubber -Path $byopCsv -WorkDir (Join-Path $byop 'dryrun') -ProfileFile $profilePath -SeedFile $seedPath -AllowlistFile $allowPath -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -DryRun -NonInteractive
+        & $assert ((@($dry) | Select-Object -First 1).DryRun -and ((@($dry) | Select-Object -First 1).ChangeCount -gt 0)) "BYOP dry-run uses profile and seed files"
+        $oldProfilePath = Join-Path $byop 'profile-v48.json'
+        [System.IO.File]::WriteAllText($oldProfilePath, '{"Name":"Compat48","Format":"Csv","ColumnPrefix":[{"Pattern":"(?i)^User$","Prefix":"PRINCIPAL"}],"FreeTextRegex":".*"}', [System.Text.Encoding]::UTF8)
+        $oldProfile = Import-ScrubProfileFile -Path $oldProfilePath
+        & $assert ($oldProfile.Name -eq 'Compat48' -and $oldProfile.SchemaVersion -eq 1) "BYOP imports v4.8-style profiles"
+        $badProfilePath = Join-Path $byop 'profile-bad.json'
+        [System.IO.File]::WriteAllText($badProfilePath, '{"Name":"BadProfile","Format":"Csv","CustomRegexRules":[{"Name":"Broken","Regex":"(","Prefix":"OBJECT"}]}', [System.Text.Encoding]::UTF8)
+        $badFailed = $false
+        try { [void](Import-ScrubProfileFile -Path $badProfilePath) } catch { $badFailed = ($_.Exception.Message -match 'custom regex rule') }
+        & $assert $badFailed "BYOP invalid regex reports rule context"
+
+        # ---- 5) Streaming vs normal equivalence ----
         Write-Rule "Streaming equivalence"
         $script:ScrubPolicy = 'Balanced'
         & $reset
@@ -2801,7 +3524,7 @@ function Invoke-ScrubSelfTest {
         & $assert ($r1.Clean -and $r2.Clean) "stream: both modes leak-clean"
         & $assert ($hostTok -and ($t1 -match [regex]::Escape($hostTok)) -and ($t2 -match [regex]::Escape($hostTok))) "stream: identical token in both modes"
 
-        # ---- 5) Round-trip: scrub -> restore ----
+        # ---- 6) Round-trip: scrub -> restore ----
         Write-Rule "Round-trip (scrub -> restore)"
         $rtPath = Join-Path $dir 'roundtrip_restored.csv'
         [void](Restore-ScrubbedFile -InputPath $r1.Output -TokenMapCsv $smap -OutputPath $rtPath)
@@ -2841,6 +3564,7 @@ function Invoke-ScrubFile {
         [Parameter(Mandatory)]$Profile,
         [string[]]$SensitiveTerms = @(),
         [string[]]$AdditionalBroadLabels = @(),
+        [string[]]$AllowlistFile = @(),
         [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
         [switch]$ExplainDetections,
         [string]$FalsePositiveReport,
@@ -2852,9 +3576,7 @@ function Invoke-ScrubFile {
     $script:ScrubPolicy = $ScrubPolicy
     if ($ExplainDetections) { $script:ExplainDetections = $true }
     if ($FalsePositiveReport) { $script:FalsePositiveReport = $FalsePositiveReport }
-    # Merge this profile's extra allowed (public) domains over the defaults.
-    $extraAllowed = @(); try { if ($Profile.AllowedDomains) { $extraAllowed = @($Profile.AllowedDomains) } } catch { }
-    $script:AllowedDomains = @($script:AllowedDomainsDefault + $extraAllowed)
+    Initialize-ScrubProfileRuntime -Profile $Profile -AllowlistFiles $AllowlistFile
     [void](Get-SessionSalt)
     $script:__scrubFallback = 0; $script:__scrubFallbackCol = ''
 
@@ -2885,15 +3607,17 @@ function Invoke-ScrubFile {
     if ($DryRun) {
         $changes = New-Object System.Collections.Generic.List[object]
         if ($format -eq 'Csv' -or $format -eq 'Tsv' -or $format -eq 'Psv') {
-            $raw = @(Import-Csv $InputPath -Delimiter $delim); $total = $raw.Count; $rn = 0; $seenPairs = @{}
-            foreach ($row in $raw) {
+            $rn = 0; $seenPairs = @{}
+            Import-Csv -Path $InputPath -Delimiter $delim | ForEach-Object {
+                $row = $_
                 $rn++
-                if ($rn % 250 -eq 0) { Write-Progress -Activity "Dry-run scan $name" -Status "Row $rn of $total" -PercentComplete ([int](($rn / [Math]::Max($total,1)) * 100)) }
+                if ($rn % 250 -eq 0) { Write-Progress -Activity "Dry-run scan $name" -Status "Row $rn" -PercentComplete -1 }
                 foreach ($prop in $row.PSObject.Properties) {
                     $cell = [string]$prop.Value
                     if ([string]::IsNullOrWhiteSpace($cell)) { continue }
                     try {
                         $s = [string](Scrub-Field -ColumnName $prop.Name -Value $cell -Profile $Profile)
+                        $s = [string](Protect-SensitiveTerms -Text $s -SensitiveTerms $SensitiveTerms)
                         if (-not [string]::Equals($s, $cell)) {
                             $k = ([string]$prop.Name) + '|' + $cell
                             if (-not $seenPairs.ContainsKey($k)) { $seenPairs[$k] = $true; [void]$changes.Add([pscustomobject]@{ Field = [string]$prop.Name; Original = $cell; Token = $s }) }
@@ -2909,13 +3633,28 @@ function Invoke-ScrubFile {
         }
         elseif ($format -eq 'Json') {
             $raw = [System.IO.File]::ReadAllText($InputPath)
-            [void](Invoke-ScrubJsonText -Text $raw -IsNdjson:($ext -ne '.json') -Profile $Profile -Changes $changes)
+            $jsonPreview = Invoke-ScrubJsonText -Text $raw -IsNdjson:($ext -ne '.json') -Profile $Profile -Changes $changes
+            $jsonPreview = Protect-SensitiveTerms -Text $jsonPreview -SensitiveTerms $SensitiveTerms
+            foreach ($term in $SensitiveTerms) {
+                $t = ([string]$term).Trim()
+                if ($t.Length -ge 3 -and $raw.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $seedPrefix = if ($t -match '^(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+$') { 'DNS' } else { 'X500' }
+                    [void]$changes.Add([pscustomobject]@{ Field='(seed)'; Original=$t; Token=(Get-Token -Value $t -Prefix $seedPrefix) })
+                }
+            }
         }
         else {
             $text = [System.IO.File]::ReadAllText($InputPath)
             $seenPairs = @{}
             foreach ($id in (Find-Identifiers -Text $text)) {
                 if (-not $seenPairs.ContainsKey($id.Raw)) { $seenPairs[$id.Raw] = $true; [void]$changes.Add([pscustomobject]@{ Field = '(text)'; Original = $id.Raw; Token = (Get-Token -Value $id.Raw -Prefix $id.Prefix) }) }
+            }
+            foreach ($term in $SensitiveTerms) {
+                $t = ([string]$term).Trim()
+                if ($t.Length -ge 3 -and $text.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and -not $seenPairs.ContainsKey($t)) {
+                    $seedPrefix = if ($t -match '^(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+$') { 'DNS' } else { 'X500' }
+                    [void]$changes.Add([pscustomobject]@{ Field = '(seed)'; Original = $t; Token = (Get-Token -Value $t -Prefix $seedPrefix) })
+                }
             }
         }
         Write-DryRunSummary -Name $name -Changes $changes
@@ -3029,8 +3768,8 @@ function Write-RunManifest {
         }
     }
     $manifest = [pscustomobject]@{
-        tool            = "UniversalLogScrubber_v4_8.psm1"
-        schemaVersion   = "4.8"
+        tool            = "UniversalLogScrubber_v4_9.psm1"
+        schemaVersion   = "4.9"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
         hmacLength      = $script:HmacLength
@@ -3061,6 +3800,10 @@ function Invoke-UniversalScrubber {
         [ValidateSet('Discover','ExistingMap','AD')][string]$MapSource,
         [ValidateSet('Merge','Replace')][string]$TokenMapMode = 'Merge',
         [string[]]$SensitiveTerms,
+        [Alias('SeedTermsFile')][string[]]$SensitiveTermsFile,
+        [string[]]$SeedFile,
+        [string[]]$AllowlistFile,
+        [ValidateSet('Generic','Csv','Json','Kv','WebAccess','Cloud','App')][string]$ProfileTemplate,
         [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
         [ValidateSet('Fast','CountFirst')][string]$EvtxProgressMode = 'Fast',
         [switch]$ExplainDetections,
@@ -3097,7 +3840,7 @@ function Invoke-UniversalScrubber {
     }
     if ($Salt) { $script:Salt = $Salt }
 
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.8" "Token-map first, then scrub. Nothing leaves until it's clean."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.9" "Token-map first, then scrub. Nothing leaves until it's clean."
     if ($DryRun) { Write-Info "DRY RUN mode -- nothing will be written." }
     if ($Stream) { Write-Info "STREAM mode -- bounded memory for very large files." }
     Write-Info "Scrub policy: $script:ScrubPolicy"
@@ -3110,6 +3853,13 @@ function Invoke-UniversalScrubber {
     $WorkDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir)
     if (-not (Test-Path $WorkDir)) { New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null }
     Write-Info "Working folder: $WorkDir"
+
+    if ($ProfileTemplate) {
+        $templatePath = Join-Path $WorkDir ("profile-template-{0}.json" -f $ProfileTemplate.ToLowerInvariant())
+        $written = New-ScrubProfileTemplate -Template $ProfileTemplate -OutputPath $templatePath
+        Write-Info "Edit this template, then run with -ProfileFile $written."
+        return [pscustomobject]@{ ProfileTemplate = $ProfileTemplate; OutputPath = $written }
+    }
 
     # --- Input file(s) ---
     if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -3257,9 +4007,6 @@ function Invoke-UniversalScrubber {
     }
     if (-not $prof) { throw "No profile resolved." }
     Write-Ok "Profile: $($prof.Name) -- $($prof.Description)"
-    $extraAllowed = @()
-    try { if ($prof.AllowedDomains) { $extraAllowed = @($prof.AllowedDomains) } } catch { }
-    $script:AllowedDomains = @($script:AllowedDomainsDefault + $extraAllowed)
 
     # --- Sensitive seed terms ---
     if (-not $PSBoundParameters.ContainsKey('SensitiveTerms')) {
@@ -3274,7 +4021,15 @@ function Invoke-UniversalScrubber {
             if (-not [string]::IsNullOrWhiteSpace($raw)) { $SensitiveTerms = @($raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         }
     }
+    $profileSeedTerms = @()
+    try { if ($prof.SeedTerms) { $profileSeedTerms += @($prof.SeedTerms) } } catch { }
+    $seedFilesCombined = @()
+    if ($SensitiveTermsFile) { $seedFilesCombined += @($SensitiveTermsFile) }
+    if ($SeedFile) { $seedFilesCombined += @($SeedFile) }
+    try { if ($prof.SeedFiles) { $seedFilesCombined += @($prof.SeedFiles) } } catch { }
+    $SensitiveTerms = Merge-ScrubTerms -Terms (@($SensitiveTerms) + $profileSeedTerms) -Files $seedFilesCombined -BasePath $prof.ProfileRoot
     if ($SensitiveTerms.Count -gt 0) { Write-Ok "$($SensitiveTerms.Count) sensitive term(s) will be redacted." }
+    Initialize-ScrubProfileRuntime -Profile $prof -AllowlistFiles $AllowlistFile
 
     # --- Map source ---
     Write-Host ""
@@ -3350,7 +4105,7 @@ function Invoke-UniversalScrubber {
             else { $useStream = Read-YesNo -Prompt ("  $($t.Name) is $([int]($t.Length / 1MB)) MB. Stream it (lower memory)") -Default $true }
         }
         try {
-            $results += Invoke-ScrubFile -InputPath $t.FullName -OutputPath $outPath -Profile $prof -SensitiveTerms $SensitiveTerms -ScrubPolicy $script:ScrubPolicy -ExplainDetections:$ExplainDetections -DryRun:$DryRun -Stream:$useStream
+            $results += Invoke-ScrubFile -InputPath $t.FullName -OutputPath $outPath -Profile $prof -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -ScrubPolicy $script:ScrubPolicy -ExplainDetections:$ExplainDetections -DryRun:$DryRun -Stream:$useStream
         }
         catch {
             Write-Fail "Failed on $($t.Name): $($_.Exception.Message)"
@@ -3405,4 +4160,4 @@ Export-ModuleMember -Function `
     Invoke-UniversalScrubber, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
-    Import-ScrubProfileFile, Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
+    Import-ScrubProfileFile, New-ScrubProfileTemplate, Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
