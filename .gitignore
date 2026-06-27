@@ -1,0 +1,38 @@
+# Private scrubber artifacts
+*DO_NOT_UPLOAD*
+scrub_token_map*.csv
+scrub_run_manifest.json
+*detection_review*.csv
+*false_positive*.csv
+*salt*
+
+# Raw or generated logs
+*.evtx
+*.etl
+*.log
+*.w3c
+*.xlsx
+*_scrubbed.csv
+*.evtx.csv
+output/
+outputs/
+scrubbed/
+converted/
+
+# PowerShell / local tooling
+*.ps1xml
+*.pssc
+*.psrc
+*.psd1.bak
+*.tmp
+*.bak
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Codex/local workspace state
+.agents/
+.codex/
