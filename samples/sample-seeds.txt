@@ -1,0 +1,10 @@
+# Synthetic sensitive terms for sample testing.
+# These are fictional terms that do not have a reliable shape.
+Northstar Research Group
+Project Marigold
+Orchid Relay
+Blue Lantern
+Keystone Tenant
+HarborBridge
+AsterOps
+Riverglass Pilot

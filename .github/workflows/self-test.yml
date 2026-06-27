@@ -17,8 +17,35 @@ jobs:
         shell: pwsh
         run: |
           Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
-          $ok = Invoke-ScrubSelfTest
-          if (-not $ok) { throw "Invoke-ScrubSelfTest failed." }
+          try {
+            $ok = Invoke-ScrubSelfTest
+            if (-not $ok) { throw "Invoke-ScrubSelfTest returned $ok" }
+          } catch {
+            $err = $_
+            $err | Out-File -FilePath scrubber-error.txt -Encoding UTF8
+            "`nException.ToString():" | Out-File -FilePath scrubber-error.txt -Append
+            $err.Exception.ToString() | Out-File -FilePath scrubber-error.txt -Append
+            "`nPS Call Stack:`n" | Out-File -FilePath scrubber-error.txt -Append
+            (Get-PSCallStack | Out-String) | Out-File -FilePath scrubber-error.txt -Append
+            if ($err.InvocationInfo) {
+              "`nInvocationInfo:`n" | Out-File -FilePath scrubber-error.txt -Append
+              $err.InvocationInfo.PositionMessage | Out-File -FilePath scrubber-error.txt -Append
+            }
+            Get-ChildItem -Recurse -Filter 'sample_json.jsonl' -ErrorAction SilentlyContinue |
+              Select-Object -First 1 |
+              ForEach-Object { Copy-Item $_.FullName -Destination sample_json.jsonl.copy -Force }
+            throw
+          }
+
+      - name: Upload self-test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrubber-self-test-diagnostics
+          path: |
+            scrubber-error.txt
+            sample_json.jsonl.copy
+          if-no-files-found: ignore
 
       - name: Validate example profiles
         shell: pwsh
@@ -29,3 +56,8 @@ jobs:
               throw "Profile failed validation: $($_.FullName)"
             }
           }
+
+      - name: Run sample log smoke tests
+        shell: pwsh
+        run: |
+          .\scripts\Test-SampleLogs.ps1

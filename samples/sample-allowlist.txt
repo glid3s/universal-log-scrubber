@@ -1,0 +1,11 @@
+# Synthetic/public-ish values to preserve for readability during sample tests.
+127.0.0.1
+::1
+domain:example.com
+domain:example.net
+domain:example.org
+regex:^(GET|POST|PUT|DELETE|PATCH|HEAD)$
+regex:^(INFO|WARN|ERROR|DEBUG|TRACE)$
+regex:^(health|ready|live|startup|shutdown)$
+regex:^HTTP/[0-9.]+$
+regex:^build-[0-9]+$

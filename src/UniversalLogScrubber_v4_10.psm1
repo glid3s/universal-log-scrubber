@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Universal, deterministic log scrubber. Builds a token map first, then scrubs
   one or many log files so they can leave a secure environment for analysis.
@@ -2546,33 +2546,89 @@ function Test-ScrubbedForLeaks {
 #   Scrub-Field path as CSV cells (so the JSON key acts as the column hint).
 #   Numbers / booleans / nulls and all keys pass through unchanged.
 # =====================================================================
+function Get-JsonNodeIdentity {
+    param($Node)
+    if ($null -eq $Node) { return $null }
+    if ($Node -is [string] -or $Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal] -or $Node -is [datetime] -or $Node -is [guid]) { return $null }
+    try { return [string][System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Node) } catch { return $null }
+}
+
 function Invoke-JsonNodeScrub {
-    param($Node, $Profile, [string]$KeyName = '', $Changes)
+    param(
+        $Node,
+        $Profile,
+        [string]$KeyName = '',
+        $Changes,
+        [int]$Depth = 0,
+        [int]$MaxDepth = 80,
+        $Seen
+    )
+    if ($null -eq $Seen) { $Seen = @{} }
+    if ($Depth -ge $MaxDepth) {
+        $marker = '[SCRUB_JSON_MAX_DEPTH_EXCEEDED]'
+        if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = '(json depth limit)'; Token = $marker }) }
+        return $marker
+    }
     if ($null -eq $Node) { return $null }
     if ($Node -is [string]) {
         $s = Scrub-Field -ColumnName $KeyName -Value $Node -Profile $Profile
         if ($Changes -and ($s -ne $Node)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $Node; Token = $s }) }
         return $s
     }
-    if ($Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal]) { return $Node }
-    if (($Node -is [System.Collections.IEnumerable]) -and -not ($Node -is [string])) {
-        $arr = @()
-        foreach ($item in $Node) { $arr += ,(Invoke-JsonNodeScrub -Node $item -Profile $Profile -KeyName $KeyName -Changes $Changes) }
-        return ,$arr
+    if ($Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal] -or $Node -is [datetime] -or $Node -is [guid]) { return $Node }
+
+    $id = Get-JsonNodeIdentity -Node $Node
+    if ($id -and $Seen.ContainsKey($id)) {
+        $marker = '[SCRUB_JSON_CYCLIC_REFERENCE]'
+        if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = '(json cycle)'; Token = $marker }) }
+        return $marker
     }
-    if ($Node.PSObject -and @($Node.PSObject.Properties).Count -gt 0) {
-        $new = [ordered]@{}
-        foreach ($p in $Node.PSObject.Properties) {
-            $new[$p.Name] = Invoke-JsonNodeScrub -Node $p.Value -Profile $Profile -KeyName $p.Name -Changes $Changes
+    if ($id) { $Seen[$id] = $true }
+
+    try {
+        if ($Node -is [System.Collections.IDictionary]) {
+            $newMap = [ordered]@{}
+            foreach ($k in @($Node.Keys)) {
+                $childKey = [string]$k
+                $newMap[$childKey] = Invoke-JsonNodeScrub -Node $Node[$k] -Profile $Profile -KeyName $childKey -Changes $Changes -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen
+            }
+            return [pscustomobject]$newMap
         }
-        return [pscustomobject]$new
+
+        if (($Node -is [System.Collections.IEnumerable]) -and -not ($Node -is [string])) {
+            $arr = New-Object System.Collections.Generic.List[object]
+            foreach ($item in $Node) {
+                [void]$arr.Add((Invoke-JsonNodeScrub -Node $item -Profile $Profile -KeyName $KeyName -Changes $Changes -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen))
+            }
+            return ,@($arr.ToArray())
+        }
+
+        $props = @()
+        if ($Node.PSObject) { $props = @($Node.PSObject.Properties | Where-Object { $_.MemberType -eq 'NoteProperty' }) }
+        if ($props.Count -gt 0) {
+            $new = [ordered]@{}
+            foreach ($p in $props) {
+                $new[$p.Name] = Invoke-JsonNodeScrub -Node $p.Value -Profile $Profile -KeyName $p.Name -Changes $Changes -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen
+            }
+            return [pscustomobject]$new
+        }
+        return $Node
     }
-    return $Node
+    finally {
+        if ($id) { [void]$Seen.Remove($id) }
+    }
 }
 
 function Invoke-ScrubJsonText {
-    param([Parameter(Mandatory)][string]$Text, [switch]$IsNdjson, [Parameter(Mandatory)]$Profile, $Changes)
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [switch]$IsNdjson,
+        [Parameter(Mandatory)]$Profile,
+        $Changes,
+        [int]$MaxDepth = 80
+    )
     if (-not $Changes) { $Changes = New-Object System.Collections.Generic.List[object] }
+    $jsonDepth = [Math]::Min([Math]::Max($MaxDepth, 2), 100)
     if ($IsNdjson) {
         # One JSON object per line (NDJSON / JSON Lines).
         $sb = New-Object System.Text.StringBuilder
@@ -2581,8 +2637,8 @@ function Invoke-ScrubJsonText {
             if ($trim -eq '') { continue }
             try {
                 $obj = $trim | ConvertFrom-Json -ErrorAction Stop
-                $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $Changes
-                [void]$sb.AppendLine(($scrubbed | ConvertTo-Json -Depth 100 -Compress))
+                $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $Changes -MaxDepth $MaxDepth -Seen @{}
+                [void]$sb.AppendLine(($scrubbed | ConvertTo-Json -Depth $jsonDepth -Compress))
             }
             catch { [void]$sb.AppendLine((Invoke-LeakHardeningText -Text $line)) }
         }
@@ -2590,11 +2646,11 @@ function Invoke-ScrubJsonText {
     }
     try {
         $obj = $Text | ConvertFrom-Json -ErrorAction Stop
-        $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $Changes
-        return ($scrubbed | ConvertTo-Json -Depth 100)
+        $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $Changes -MaxDepth $MaxDepth -Seen @{}
+        return ($scrubbed | ConvertTo-Json -Depth $jsonDepth)
     }
     catch {
-        Write-Warn "Not valid JSON; falling back to whole-text hardening."
+        Write-Warn "Not valid JSON or JSON scrub failed; falling back to whole-text hardening. $($_.Exception.Message)"
         return (Invoke-LeakHardeningText -Text $Text)
     }
 }

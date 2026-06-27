@@ -1,12 +1,18 @@
 # Private scrubber artifacts
+
 *DO_NOT_UPLOAD*
 scrub_token_map*.csv
 scrub_run_manifest.json
 *detection_review*.csv
+*detection_report*.csv
+*detection_summary*.csv
 *false_positive*.csv
+scrubber-error.txt
+sample_json.jsonl.copy
 *salt*
 
 # Raw or generated logs
+
 *.evtx
 *.etl
 *.log
@@ -19,20 +25,38 @@ outputs/
 scrubbed/
 converted/
 
+# Keep intentional sample logs tracked
+
+!samples/logs/*.log
+
+# Sample/test output
+
+samples/out/
+
+# Downloaded helper packages / temporary overlay folders
+
+repo-improvements/
+wiki-pages*/
+universal-log-scrubber-*.zip
+
 # PowerShell / local tooling
+
 *.ps1xml
 *.pssc
 *.psrc
 *.psd1.bak
 *.tmp
 *.bak
+*.bak-json-depth-*
 
 # Editor and OS noise
+
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 
 # Codex/local workspace state
+
 .agents/
 .codex/
