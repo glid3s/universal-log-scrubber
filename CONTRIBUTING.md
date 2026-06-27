@@ -22,7 +22,7 @@ This project handles security-sensitive workflows. The most important contributi
 5. Confirm that no raw customer/client data is present.
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 Invoke-ScrubSelfTest
 
 .\scripts\Test-SampleLogs.ps1
@@ -76,3 +76,4 @@ A good PR should explain:
 - Preserve diagnostic readability unless a value is sensitive.
 - Treat token maps, salts, detailed reports, and profile-build evidence as local-only.
 - Add comments when code exists to prevent a leak, false positive, or dangerous upload path.
+

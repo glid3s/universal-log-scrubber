@@ -32,6 +32,8 @@ converted/
 # Sample/test output
 
 samples/out/
+samples/external-corpora/
+external-corpus-results/
 
 # Downloaded helper packages / temporary overlay folders
 

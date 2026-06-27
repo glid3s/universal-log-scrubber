@@ -1,5 +1,18 @@
 # Changelog
 
+## v4.12
+
+- Added a curated external corpus catalog via `Get-LogCorpusCatalog` and
+  `Search-LogCorpusCatalog`.
+- Added `Save-LogCorpusSample` for explicit-risk, opt-in public sample downloads
+  and manual-download instruction manifests.
+- Added `Invoke-ExternalCorpusSmokeTest` for optional local recommendation and
+  dry-run checks over externally downloaded corpus folders.
+- Added `scripts\Get-SampleLogs.ps1` as a friendly catalog/search/save wrapper.
+- Ignored `samples/external-corpora/` and `external-corpus-results/` so public
+  corpora and smoke-test outputs do not get committed.
+- Bumped the versioned module and launcher names to v4.12.
+
 ## v4.11
 
 - Added `Test-LogFormat` for local-only log format and profile recommendations.
@@ -64,3 +77,4 @@
   strings, private keys, and common provider token shapes.
 - Added counts-only detection summary reports.
 - Raised default HMAC token length for new runs to 24 hex characters.
+

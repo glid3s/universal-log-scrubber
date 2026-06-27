@@ -7,9 +7,8 @@ events can still be correlated without exposing the original identifiers.
 
 It works offline against Windows Event exports, EVTX files, CSV/TSV/PSV,
 JSON/NDJSON, IIS/W3C, web access/proxy logs, key=value/logfmt/CEF-style logs,
-syslog, and mixed diagnostic text. Version 4.11 adds local log-format
-recommendations, safer first-run guidance, and optional automatic profile
-selection for uniform folders.
+syslog, and mixed diagnostic text. Version 4.12 adds optional public corpus
+testing on top of the v4.11 local recommendation workflow.
 
 ## Safety First
 
@@ -32,10 +31,10 @@ Private artifacts include:
 Open PowerShell in the repository root:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
@@ -74,6 +73,34 @@ Invoke-UniversalScrubber `
 recommends the same built-in profile. Mixed folders should be split by type or
 run with `-Profile` explicitly.
 
+## External Corpus Testing
+
+v4.12 includes an optional catalog for public log corpora. Downloads never run
+automatically, public corpora are not committed to the repo, and GitHub Actions
+does not depend on external network access. Treat public corpora as raw,
+unsanitized, realistic, possibly offensive, and license-restricted.
+
+```powershell
+Get-LogCorpusCatalog
+
+Search-LogCorpusCatalog -Query apache
+
+.\scripts\Get-SampleLogs.ps1 -Name Loghub-Apache -AcceptRisk
+
+Invoke-ExternalCorpusSmokeTest `
+  -CorpusRoot .\samples\external-corpora `
+  -Recurse `
+  -UseRecommendations `
+  -DryRunOnly `
+  -Salt "preview-only" `
+  -NonInteractive
+```
+
+External samples default to `.\samples\external-corpora`, which is ignored by
+git. Use `-Destination` when you want to keep corpora elsewhere. v4.12 smoke
+tests only support recommendation checks and dry-run scrubs; they do not perform
+real external-corpus scrubbing.
+
 ## Build A Profile From A Sample
 
 When the built-in profiles are not specific enough, point the tool at a local
@@ -81,7 +108,7 @@ sample. It will create an editable BYOP profile without storing raw sample
 values in the profile.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -93,7 +120,7 @@ values in the profile.
 Then preview with the generated profile:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -ProfileFile C:\profiles\generated-profile.json `
@@ -126,13 +153,17 @@ domains, and common built-in Windows accounts are preserved where that is safer
 and more readable. You can add your own allowlist values in a profile or
 `-AllowlistFile`.
 
-## v4.11 Highlights
+## v4.12 Highlights
 
-- `Test-LogFormat` recommends existing profiles from small local file samples.
-- `-RecommendOnly` and `-SafeFirstRun` show recommendations and exit before salt,
-  token-map, report, bundle, or scrubbed-output work begins.
-- `-AutoProfile` can select one high-confidence built-in profile for uniform
-  inputs and refuses mixed folders in noninteractive mode.
+- `Get-LogCorpusCatalog` and `Search-LogCorpusCatalog` describe curated public
+  corpus sources without network access.
+- `Save-LogCorpusSample` downloads only direct samples and only after
+  `-AcceptRisk`; manual sources write instruction manifests instead.
+- `Invoke-ExternalCorpusSmokeTest` runs optional local recommendation/dry-run
+  passes and writes CSV/JSON/Markdown summaries.
+- `scripts\Get-SampleLogs.ps1` is a friendly catalog/search/save wrapper.
+- v4.11 recommendations remain: `Test-LogFormat`, `-RecommendOnly`,
+  `-SafeFirstRun`, and `-AutoProfile`.
 - `New-ScrubProfileFromSample` and `-BuildProfileFromSample` generate schema v2
   BYOP profiles from local sample logs.
 - Optional `-ProfileWizard` can write sample-derived seed and allowlist files
@@ -158,13 +189,15 @@ docs/profiles/  BYOP handbook and ready-to-edit profile examples
 ## Validation
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 Test-LogFormat -Path .\samples\logs -Recurse
 Invoke-UniversalScrubber -Path .\samples\logs -Recurse -RecommendOnly -NonInteractive
 Invoke-UniversalScrubber -Path .\samples\logs -Recurse -SafeFirstRun -NonInteractive
+Get-LogCorpusCatalog
+Search-LogCorpusCatalog -Query apache
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
@@ -181,3 +214,4 @@ detections without writing scrubbed output files.
 See [USAGE.md](USAGE.md) for step-by-step workflows, profile generation,
 profile authoring, seed and allowlist file formats, policy modes, token map
 handling, EVTX conversion guidance, and safe-upload checklists.
+

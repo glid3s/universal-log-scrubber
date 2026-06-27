@@ -16,7 +16,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
-$modulePath = Join-Path $repoRoot 'src\UniversalLogScrubber_v4_11.psm1'
+$modulePath = Join-Path $repoRoot 'src\UniversalLogScrubber_v4_12.psm1'
 Import-Module $modulePath -Force
 
 $env:SCRUB_SAMPLE_SALT = $Salt
@@ -103,3 +103,4 @@ if ($failures.Count -gt 0) {
 
 Write-Host ""
 Write-Host "Sample log smoke test passed." -ForegroundColor Green
+

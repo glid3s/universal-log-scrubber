@@ -10,6 +10,11 @@ These files are synthetic. They are safe to commit and safe to use for demos.
 
 Do not replace them with real client logs. If you need a new fixture, fictionalize it first.
 
+External public corpora downloaded through v4.12 tools belong in
+`samples/external-corpora/` by default. That folder is ignored by git because
+public corpora may be raw, unsanitized, realistic, offensive, or
+license-restricted.
+
 ## Quick sample smoke test
 
 From the repository root:
@@ -20,13 +25,39 @@ From the repository root:
 
 The script runs dry-run and real scrub passes against the sample files and verifies that each real scrub reports clean output.
 
+## Optional external corpus catalog
+
+List curated public corpus entries:
+
+```powershell
+.\scripts\Get-SampleLogs.ps1
+```
+
+Save a small direct-download corpus sample after reviewing source warnings:
+
+```powershell
+.\scripts\Get-SampleLogs.ps1 -Name Loghub-Apache -AcceptRisk
+```
+
+Run local recommendation and dry-run smoke tests over downloaded corpora:
+
+```powershell
+Invoke-ExternalCorpusSmokeTest `
+  -CorpusRoot .\samples\external-corpora `
+  -Recurse `
+  -UseRecommendations `
+  -DryRunOnly `
+  -Salt "preview-only" `
+  -NonInteractive
+```
+
 ## Manual examples
 
 Dry-run an NDJSON app log:
 
 ```powershell
 $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path .\samples\logs\app-auth.ndjson `
   -WorkDir .\samples\out\app-auth-preview `
   -Profile AppJson `
@@ -41,7 +72,7 @@ $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
 Build a profile from the gateway sample:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -BuildProfileFromSample `
   -Path .\samples\logs\gateway-kv.log `
   -WorkDir .\samples\generated-profile `
@@ -55,7 +86,7 @@ Create a safe upload bundle from a sample run:
 
 ```powershell
 $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path .\samples\logs\web-access.log `
   -WorkDir .\samples\out\web-access `
   -Profile WebAccess `
@@ -79,3 +110,4 @@ $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
 | `logs/windows-event-sample.csv` | Windows event CSV-style rows with providers, SIDs, users, hosts, and messages. |
 | `sample-seeds.txt` | Fictional shapeless terms that should be scrubbed. |
 | `sample-allowlist.txt` | Public/diagnostic values that should stay readable. |
+

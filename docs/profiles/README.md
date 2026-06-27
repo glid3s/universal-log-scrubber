@@ -31,7 +31,7 @@ map, but review it before sharing because schema names can still reveal context.
 The easiest workflow is to generate a starter profile from a local sample.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -47,7 +47,7 @@ does include raw examples and is marked `DO_NOT_UPLOAD`.
 Run a dry run with the generated profile:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -ProfileFile C:\profiles\generated-profile.json `
@@ -61,7 +61,7 @@ Use wizard mode when you want the tool to ask whether to write seed and allowlis
 files from the sample evidence:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -329,3 +329,4 @@ This folder includes ready-to-edit examples:
 - `webaccess-profile.json`
 - `seed.example.txt`
 - `allowlist.example.txt`
+

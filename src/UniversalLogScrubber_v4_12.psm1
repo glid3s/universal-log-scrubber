@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Universal, deterministic log scrubber. Builds a token map first, then scrubs
   one or many log files so they can leave a secure environment for analysis.
@@ -167,6 +167,15 @@
       before scrubbing.
     * -AutoProfile can choose one high-confidence profile for uniform inputs and
       refuses mixed/low-confidence folders in noninteractive mode.
+
+  v4.12 ADDS
+  ----------
+    * External corpus catalog commands help operators find and optionally fetch
+      curated public log samples without committing downloaded corpora.
+    * Save-LogCorpusSample requires explicit risk acceptance before direct
+      downloads and writes local manifests with source and hash evidence.
+    * Invoke-ExternalCorpusSmokeTest runs optional recommendation/dry-run checks
+      over local corpus folders and writes local CSV/JSON/Markdown summaries.
 
   CONSISTENCY GUARANTEE
   ---------------------
@@ -2182,7 +2191,7 @@ function Get-ScrubProfile {
 function Test-GeneratedScrubArtifactName {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
-    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|scrub_run_manifest)') { return $true }
+    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|scrub_run_manifest|corpus-manifest|external-corpus-summary)') { return $true }
     if ([System.IO.Path]::GetExtension($Name) -ieq '.zip') { return $true }
     return $false
 }
@@ -2491,6 +2500,451 @@ function Test-LogFormat {
     foreach ($t in $targets) { $recs += Get-LogFormatRecommendation -File $t -SampleLines $SampleLines }
     if (-not $Quiet) { Write-LogFormatRecommendationSummary -Recommendations $recs }
     return $recs
+}
+
+# =====================================================================
+# REGION: External public corpus catalog and optional smoke tests
+# =====================================================================
+function Get-DefaultExternalCorpusRoot {
+    return (Join-Path (Get-Location).Path 'samples\external-corpora')
+}
+
+function Get-DefaultExternalCorpusWorkDir {
+    return (Join-Path (Get-Location).Path 'external-corpus-results')
+}
+
+function Get-SafeCorpusName {
+    param([Parameter(Mandatory)][string]$Name)
+    $safe = $Name -replace '[^A-Za-z0-9_.-]', '-'
+    if ([string]::IsNullOrWhiteSpace($safe)) { return 'corpus-sample' }
+    return $safe
+}
+
+function New-LogCorpusCatalogEntry {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string]$Homepage,
+        [string]$DownloadUrl,
+        [string]$InstructionsUrl,
+        [Parameter(Mandatory)][string]$FormatHint,
+        [Parameter(Mandatory)][string]$SuggestedProfile,
+        [string[]]$ExpectedFileTypes,
+        [string]$ApproxSize,
+        [string]$LicenseNote,
+        [string]$SafetyWarning,
+        [bool]$RequiresManualDownload,
+        [bool]$CanDownloadDirectly,
+        [string]$Notes
+    )
+
+    [pscustomobject]@{
+        Name                   = $Name
+        Source                 = $Source
+        Description            = $Description
+        Homepage               = $Homepage
+        DownloadUrl            = $DownloadUrl
+        InstructionsUrl        = $InstructionsUrl
+        FormatHint             = $FormatHint
+        SuggestedProfile       = $SuggestedProfile
+        ExpectedFileTypes      = @($ExpectedFileTypes)
+        ApproxSize             = $ApproxSize
+        LicenseNote            = $LicenseNote
+        SafetyWarning          = $SafetyWarning
+        RequiresManualDownload = [bool]$RequiresManualDownload
+        CanDownloadDirectly    = [bool]$CanDownloadDirectly
+        Notes                  = $Notes
+    }
+}
+
+function Get-LogCorpusCatalog {
+    [CmdletBinding()]
+    param()
+
+    $rawWarning = 'Public corpora may contain raw, unsanitized, offensive, realistic, or operational artifacts. Review source terms and run only in an approved local workspace.'
+    return @(
+        New-LogCorpusCatalogEntry `
+            -Name 'Loghub-Apache' `
+            -Source 'Loghub' `
+            -Description 'Small Apache access-log sample from the Loghub public log collection.' `
+            -Homepage 'https://github.com/logpai/loghub' `
+            -DownloadUrl 'https://raw.githubusercontent.com/logpai/loghub/master/Apache/Apache_2k.log' `
+            -InstructionsUrl 'https://github.com/logpai/loghub/tree/master/Apache' `
+            -FormatHint 'Apache/Nginx access log' `
+            -SuggestedProfile 'Apache' `
+            -ExpectedFileTypes @('.log') `
+            -ApproxSize 'Small; about 2,000 log lines.' `
+            -LicenseNote 'Review the Loghub repository license and dataset notes before use.' `
+            -SafetyWarning $rawWarning `
+            -RequiresManualDownload:$false `
+            -CanDownloadDirectly:$true `
+            -Notes 'Direct download is a small single-file raw GitHub sample.'
+
+        New-LogCorpusCatalogEntry `
+            -Name 'Loghub-OpenSSH' `
+            -Source 'Loghub' `
+            -Description 'Small OpenSSH authentication log sample from Loghub.' `
+            -Homepage 'https://github.com/logpai/loghub' `
+            -DownloadUrl 'https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log' `
+            -InstructionsUrl 'https://github.com/logpai/loghub/tree/master/OpenSSH' `
+            -FormatHint 'Syslog-like text' `
+            -SuggestedProfile 'Syslog' `
+            -ExpectedFileTypes @('.log') `
+            -ApproxSize 'Small; about 2,000 log lines.' `
+            -LicenseNote 'Review the Loghub repository license and dataset notes before use.' `
+            -SafetyWarning $rawWarning `
+            -RequiresManualDownload:$false `
+            -CanDownloadDirectly:$true `
+            -Notes 'Useful for auth/syslog-style smoke testing.'
+
+        New-LogCorpusCatalogEntry `
+            -Name 'Loghub2-Zenodo' `
+            -Source 'Loghub 2.0' `
+            -Description 'Expanded Loghub 2.0 collection with many log types packaged through public release/download pages.' `
+            -Homepage 'https://github.com/logpai/loghub-2.0' `
+            -InstructionsUrl 'https://github.com/logpai/loghub-2.0' `
+            -FormatHint 'Mixed' `
+            -SuggestedProfile 'Generic' `
+            -ExpectedFileTypes @('.log','.csv','.json','.txt') `
+            -ApproxSize 'Large; varies by package.' `
+            -LicenseNote 'Review Loghub 2.0 source and Zenodo/package license notes before use.' `
+            -SafetyWarning $rawWarning `
+            -RequiresManualDownload:$true `
+            -CanDownloadDirectly:$false `
+            -Notes 'Manual download is safer because packages can be large and versioned externally.'
+
+        New-LogCorpusCatalogEntry `
+            -Name 'OTRF-Security-Datasets-Mordor' `
+            -Source 'OTRF Security-Datasets / Mordor' `
+            -Description 'Security telemetry datasets for adversary emulation and detection engineering practice.' `
+            -Homepage 'https://github.com/OTRF/Security-Datasets' `
+            -InstructionsUrl 'https://github.com/OTRF/Security-Datasets' `
+            -FormatHint 'Security telemetry / mixed' `
+            -SuggestedProfile 'WindowsEventCsv' `
+            -ExpectedFileTypes @('.json','.evtx','.csv') `
+            -ApproxSize 'Varies; many datasets are large.' `
+            -LicenseNote 'Review OTRF repository license and individual dataset notes before use.' `
+            -SafetyWarning $rawWarning `
+            -RequiresManualDownload:$true `
+            -CanDownloadDirectly:$false `
+            -Notes 'Manual download avoids surprising large pulls and lets users choose exact datasets.'
+
+        New-LogCorpusCatalogEntry `
+            -Name 'EVTX-ATTACK-SAMPLES' `
+            -Source 'EVTX-ATTACK-SAMPLES' `
+            -Description 'Public EVTX samples for attack technique and Windows event workflow testing.' `
+            -Homepage 'https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES' `
+            -InstructionsUrl 'https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES' `
+            -FormatHint 'EVTX' `
+            -SuggestedProfile 'WindowsEventCsv' `
+            -ExpectedFileTypes @('.evtx') `
+            -ApproxSize 'Varies by sample folder.' `
+            -LicenseNote 'Review repository license and sample provenance before use.' `
+            -SafetyWarning $rawWarning `
+            -RequiresManualDownload:$true `
+            -CanDownloadDirectly:$false `
+            -Notes 'EVTX conversion is local; download samples manually to avoid large or unexpected pulls.'
+
+        New-LogCorpusCatalogEntry `
+            -Name 'Splunk-BOTS-v3' `
+            -Source 'Splunk Boss of the SOC / BOTS v3' `
+            -Description 'Boss of the SOC v3 security dataset for Splunk-oriented investigation practice.' `
+            -Homepage 'https://www.splunk.com/en_us/blog/security/botsv3-dataset-released.html' `
+            -InstructionsUrl 'https://www.splunk.com/en_us/blog/security/botsv3-dataset-released.html' `
+            -FormatHint 'Splunk indexed security dataset' `
+            -SuggestedProfile 'Generic' `
+            -ExpectedFileTypes @('.tgz','.json','.csv','.log') `
+            -ApproxSize 'Large; approximately hundreds of MB.' `
+            -LicenseNote 'Review Splunk dataset terms and blog instructions before use.' `
+            -SafetyWarning $rawWarning `
+            -RequiresManualDownload:$true `
+            -CanDownloadDirectly:$false `
+            -Notes 'Manual download only; the dataset is large and may require Splunk-specific handling.'
+    )
+}
+
+function Search-LogCorpusCatalog {
+    [CmdletBinding()]
+    param(
+        [string]$Query,
+        [string]$Source,
+        [string]$Format,
+        [string]$Profile
+    )
+
+    $items = @(Get-LogCorpusCatalog)
+    if (-not [string]::IsNullOrWhiteSpace($Query)) {
+        $q = [regex]::Escape($Query)
+        $items = @($items | Where-Object {
+            (@($_.Name,$_.Source,$_.Description,$_.FormatHint,$_.SuggestedProfile,$_.Notes) -join ' ') -match "(?i)$q"
+        })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Source)) {
+        $items = @($items | Where-Object { $_.Source -like "*$Source*" })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Format)) {
+        $items = @($items | Where-Object { $_.FormatHint -like "*$Format*" -or (@($_.ExpectedFileTypes) -join ' ') -like "*$Format*" })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+        $items = @($items | Where-Object { $_.SuggestedProfile -ieq $Profile })
+    }
+    return $items
+}
+
+function Resolve-LogCorpusCatalogEntry {
+    param([Parameter(Mandatory)][string]$Name)
+    $matches = @(Get-LogCorpusCatalog | Where-Object { $_.Name -ieq $Name })
+    if ($matches.Count -eq 1) { return $matches[0] }
+    if ($matches.Count -gt 1) { throw "Multiple corpus catalog entries matched '$Name'." }
+    throw "Unknown corpus catalog entry: $Name. Run Get-LogCorpusCatalog or Search-LogCorpusCatalog."
+}
+
+function Write-LogCorpusRiskWarning {
+    param($Entry)
+    Write-Warn "External corpus content may be raw, unsanitized, offensive, realistic, or license-restricted."
+    if ($Entry -and $Entry.SafetyWarning) { Write-Warn $Entry.SafetyWarning }
+    if ($Entry -and $Entry.LicenseNote) { Write-Info $Entry.LicenseNote }
+}
+
+function Save-LogCorpusManifest {
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][string]$Path,
+        [string]$DownloadedFile,
+        [string]$Sha256,
+        [string]$Status
+    )
+    $manifest = [pscustomobject]@{
+        schemaVersion          = '4.12'
+        generatedUtc           = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
+        name                   = $Entry.Name
+        source                 = $Entry.Source
+        homepage               = $Entry.Homepage
+        downloadUrl            = $Entry.DownloadUrl
+        instructionsUrl        = $Entry.InstructionsUrl
+        destination            = $Path
+        downloadedFile         = $DownloadedFile
+        sha256                 = $Sha256
+        requiresManualDownload = $Entry.RequiresManualDownload
+        canDownloadDirectly    = $Entry.CanDownloadDirectly
+        status                 = $Status
+        licenseNote            = $Entry.LicenseNote
+        safetyWarning          = $Entry.SafetyWarning
+        notes                  = $Entry.Notes
+    }
+    $manifestPath = Join-Path $Path 'corpus-manifest.json'
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+    return $manifestPath
+}
+
+function Save-LogCorpusSample {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Destination = (Get-DefaultExternalCorpusRoot),
+        [switch]$Force,
+        [switch]$AcceptRisk
+    )
+
+    $entry = Resolve-LogCorpusCatalogEntry -Name $Name
+    $destRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+    $sampleDir = Join-Path $destRoot (Get-SafeCorpusName -Name $entry.Name)
+
+    Write-Rule "External corpus sample"
+    Write-Info "Name: $($entry.Name)"
+    Write-Info "Source: $($entry.Source)"
+    Write-Info "Destination: $sampleDir"
+    Write-LogCorpusRiskWarning -Entry $entry
+
+    if ((Test-Path -LiteralPath $sampleDir -PathType Container) -and -not $Force) {
+        $existing = @(Get-ChildItem -LiteralPath $sampleDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($existing.Count -gt 0) {
+            throw "Corpus sample directory already has content: $sampleDir. Pass -Force to overwrite or update it."
+        }
+    }
+
+    if ($entry.RequiresManualDownload -or -not $entry.CanDownloadDirectly) {
+        New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
+        Write-Warn "This catalog entry requires manual download. No network download will be attempted."
+        if ($entry.InstructionsUrl) { Write-Info "Instructions: $($entry.InstructionsUrl)" }
+        if ($entry.Homepage) { Write-Info "Homepage: $($entry.Homepage)" }
+        $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -Status 'ManualDownloadRequired'
+        Write-Ok "Instructions manifest written: $manifestPath"
+        return [pscustomobject]@{
+            Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $null
+            ManifestPath = $manifestPath; RequiresManualDownload = $true
+            CanDownloadDirectly = $false; Status = 'ManualDownloadRequired'
+        }
+    }
+
+    if (-not $AcceptRisk) {
+        throw "Refusing to download '$($entry.Name)' without -AcceptRisk. Review the warning, source, size and license first."
+    }
+    if ([string]::IsNullOrWhiteSpace($entry.DownloadUrl)) { throw "Catalog entry '$($entry.Name)' has no direct DownloadUrl." }
+
+    New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
+    $uri = [Uri]$entry.DownloadUrl
+    $fileName = [System.IO.Path]::GetFileName($uri.AbsolutePath)
+    if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = ((Get-SafeCorpusName -Name $entry.Name) + '.log') }
+    $targetPath = Join-Path $sampleDir $fileName
+    if ((Test-Path -LiteralPath $targetPath) -and -not $Force) {
+        throw "Corpus sample already exists: $targetPath. Pass -Force to overwrite."
+    }
+
+    Write-Info "Downloading: $($entry.DownloadUrl)"
+    try {
+        Invoke-WebRequest -Uri $entry.DownloadUrl -OutFile $targetPath -UseBasicParsing -ErrorAction Stop
+    }
+    catch {
+        throw "Download failed for '$($entry.Name)': $($_.Exception.Message)"
+    }
+
+    $hash = ''
+    try { $hash = (Get-FileHash -Path $targetPath -Algorithm SHA256).Hash } catch { }
+    $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -DownloadedFile $targetPath -Sha256 $hash -Status 'Downloaded'
+    Write-Ok "Downloaded: $targetPath"
+    if ($hash) { Write-Info "SHA256: $hash" }
+    Write-Ok "Manifest written: $manifestPath"
+    return [pscustomobject]@{
+        Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $targetPath
+        ManifestPath = $manifestPath; Sha256 = $hash
+        RequiresManualDownload = $false; CanDownloadDirectly = $true; Status = 'Downloaded'
+    }
+}
+
+function ConvertTo-MarkdownTableCell {
+    param($Value)
+    $s = if ($null -eq $Value) { '' } else { [string]$Value }
+    return (($s -replace '\|','\|') -replace "`r?`n",' ')
+}
+
+function Write-ExternalCorpusSmokeTestSummary {
+    param(
+        [Parameter(Mandatory)][object[]]$Rows,
+        [Parameter(Mandatory)][string]$WorkDir
+    )
+
+    New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+    $csvPath = Join-Path $WorkDir 'external-corpus-summary.csv'
+    $jsonPath = Join-Path $WorkDir 'external-corpus-summary.json'
+    $mdPath = Join-Path $WorkDir 'external-corpus-summary.md'
+
+    $Rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    $Rows | ConvertTo-Json -Depth 6 | Set-Content -Path $jsonPath -Encoding UTF8
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('# External Corpus Smoke Test Summary')
+    [void]$lines.Add('')
+    [void]$lines.Add(('Generated: {0}' -f ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))))
+    [void]$lines.Add('')
+    [void]$lines.Add('| File | Format | Profile | Mode | Result | RuntimeSeconds | Warning/Error |')
+    [void]$lines.Add('|---|---|---|---|---:|---:|---|')
+    foreach ($r in @($Rows)) {
+        $warnErr = @($r.Warning, $r.Error) -join ' '
+        [void]$lines.Add(('| {0} | {1} | {2} | {3} | {4} | {5} | {6} |' -f `
+            (ConvertTo-MarkdownTableCell $r.FilePath),
+            (ConvertTo-MarkdownTableCell $r.DetectedFormat),
+            (ConvertTo-MarkdownTableCell $r.SuggestedProfile),
+            (ConvertTo-MarkdownTableCell $r.Mode),
+            (ConvertTo-MarkdownTableCell $r.PassFail),
+            (ConvertTo-MarkdownTableCell $r.RuntimeSeconds),
+            (ConvertTo-MarkdownTableCell $warnErr)))
+    }
+    $lines | Set-Content -Path $mdPath -Encoding UTF8
+
+    return [pscustomobject]@{ Csv = $csvPath; Json = $jsonPath; Markdown = $mdPath }
+}
+
+function Invoke-ExternalCorpusSmokeTest {
+    [CmdletBinding()]
+    param(
+        [string]$CorpusRoot = (Get-DefaultExternalCorpusRoot),
+        [string]$WorkDir = (Get-DefaultExternalCorpusWorkDir),
+        [string]$Name,
+        [switch]$Recurse,
+        [switch]$DryRunOnly,
+        [switch]$UseRecommendations,
+        [switch]$NonInteractive,
+        [string]$Salt,
+        [string]$SaltFile,
+        [string]$SaltFromEnv
+    )
+
+    Write-Rule "External corpus smoke test"
+    Write-LogCorpusRiskWarning -Entry $null
+    $root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CorpusRoot)
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "CorpusRoot not found: $root" }
+    $outRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir)
+    New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
+
+    $targets = Resolve-LogRecommendationTargets -Path $root -Recurse:$Recurse
+    if ($Name) {
+        $safeName = Get-SafeCorpusName -Name $Name
+        $targets = @($targets | Where-Object { $_.FullName -match [regex]::Escape($safeName) -or $_.FullName -match [regex]::Escape($Name) })
+    }
+    if ($targets.Count -eq 0) { throw "No corpus candidate files found under: $root" }
+
+    $rows = @()
+    $i = 0
+    foreach ($t in $targets) {
+        $i++
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $rec = $null
+        $mode = if ($DryRunOnly) { 'RecommendationAndDryRun' } else { 'RecommendationOnly' }
+        $passFail = 'Pass'
+        $cmd = ''
+        $outputPath = ''
+        $warning = ''
+        $errorText = ''
+        try {
+            $rec = Get-LogFormatRecommendation -File $t -SampleLines 50
+            $warning = (@($rec.Warnings) -join '; ')
+            if ($DryRunOnly) {
+                $profile = if ($UseRecommendations -and $rec.SuggestedProfile) { $rec.SuggestedProfile } else { 'Generic' }
+                $caseOut = Join-Path $outRoot ("dryrun-{0:000}-{1}" -f $i, (Get-SafeCorpusName -Name $t.BaseName))
+                $cmd = "Invoke-UniversalScrubber -Path '$($t.FullName)' -WorkDir '$caseOut' -Profile $profile -DryRun -MapSource Discover -NonInteractive"
+                $scrubArgs = @{
+                    Path = $t.FullName; WorkDir = $caseOut; Profile = $profile; DryRun = $true
+                    MapSource = 'Discover'; NonInteractive = [bool]$NonInteractive
+                }
+                if ($Salt) { $scrubArgs.Salt = $Salt }
+                if ($SaltFile) { $scrubArgs.SaltFile = $SaltFile }
+                if ($SaltFromEnv) { $scrubArgs.SaltFromEnv = $SaltFromEnv }
+                if (-not $Salt -and -not $SaltFile -and -not $SaltFromEnv) {
+                    throw "DryRunOnly requires -Salt, -SaltFile, or -SaltFromEnv."
+                }
+                $dry = @(Invoke-UniversalScrubber @scrubArgs)
+                $outputPath = (@($dry | ForEach-Object { $_.Output }) | Where-Object { $_ } | Select-Object -First 1)
+            }
+        }
+        catch {
+            $passFail = 'Fail'
+            $errorText = $_.Exception.Message
+        }
+        finally { $sw.Stop() }
+
+        $rows += [pscustomobject]@{
+            FilePath          = $t.FullName
+            Name              = $t.Name
+            DetectedFormat    = if ($rec) { $rec.DetectedFormat } else { '' }
+            SuggestedProfile  = if ($rec) { $rec.SuggestedProfile } else { '' }
+            Confidence        = if ($rec) { $rec.Confidence } else { 0 }
+            CommandUsed       = if ($cmd) { $cmd } elseif ($rec) { $rec.RecommendedCommand } else { '' }
+            PassFail          = $passFail
+            RuntimeSeconds    = [Math]::Round($sw.Elapsed.TotalSeconds, 3)
+            OutputPath        = $outputPath
+            Warning           = $warning
+            Error             = $errorText
+            Mode              = $mode
+        }
+    }
+
+    $summary = Write-ExternalCorpusSmokeTestSummary -Rows $rows -WorkDir $outRoot
+    Write-Ok "External corpus summary CSV: $($summary.Csv)"
+    Write-Ok "External corpus summary JSON: $($summary.Json)"
+    Write-Ok "External corpus summary Markdown: $($summary.Markdown)"
+    return [pscustomobject]@{ WorkDir = $outRoot; Summary = $summary; Results = $rows }
 }
 
 # =====================================================================
@@ -4316,7 +4770,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.11 -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.12 -- SELF-TEST" "Synthetic data only; no real logs touched."
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -4371,7 +4825,46 @@ function Invoke-ScrubSelfTest {
         }
         finally { $script:Salt = $recSalt }
 
-        # ---- 1) One planted fixture per profile ----
+        # ---- 2) External corpus catalog and offline smoke test ----
+        Write-Rule "External corpus catalog"
+        $catalog = @(Get-LogCorpusCatalog)
+        & $assert ($catalog.Count -ge 5) "corpus catalog returns curated entries"
+        $requiredCatalogFields = @('Name','Source','Description','Homepage','DownloadUrl','InstructionsUrl','FormatHint','SuggestedProfile','ExpectedFileTypes','ApproxSize','LicenseNote','SafetyWarning','RequiresManualDownload','CanDownloadDirectly','Notes')
+        foreach ($field in $requiredCatalogFields) {
+            & $assert (($catalog | Where-Object { $_.PSObject.Properties.Name -contains $field }).Count -eq $catalog.Count) "corpus catalog field present: $field"
+        }
+        & $assert (($catalog | Where-Object { -not [string]::IsNullOrWhiteSpace($_.DownloadUrl) -or -not [string]::IsNullOrWhiteSpace($_.InstructionsUrl) }).Count -eq $catalog.Count) "corpus catalog has download or instructions URL"
+        $apacheCatalog = @(Search-LogCorpusCatalog -Query apache)
+        & $assert (@($apacheCatalog | Where-Object { $_.Name -eq 'Loghub-Apache' }).Count -eq 1) "corpus search query finds Loghub-Apache"
+        $profileCatalog = @(Search-LogCorpusCatalog -Profile WindowsEventCsv)
+        & $assert (@($profileCatalog | Where-Object { $_.Name -eq 'EVTX-ATTACK-SAMPLES' }).Count -eq 1) "corpus search profile filters entries"
+        $formatCatalog = @(Search-LogCorpusCatalog -Format evtx)
+        & $assert (@($formatCatalog | Where-Object { $_.FormatHint -match 'EVTX' }).Count -ge 1) "corpus search format filters entries"
+
+        $corpusDownloadDir = Join-Path $dir 'corpus-downloads'
+        $downloadRefused = $false
+        try { [void](Save-LogCorpusSample -Name Loghub-Apache -Destination $corpusDownloadDir -Force) }
+        catch { $downloadRefused = ($_.Exception.Message -match 'AcceptRisk') }
+        & $assert $downloadRefused "Save-LogCorpusSample refuses direct download without AcceptRisk"
+        $manual = Save-LogCorpusSample -Name Splunk-BOTS-v3 -Destination $corpusDownloadDir -Force
+        & $assert ($manual.RequiresManualDownload -and (Test-Path -LiteralPath $manual.ManifestPath)) "manual corpus entry writes instructions manifest without download"
+        $manualOverwriteRefused = $false
+        try { [void](Save-LogCorpusSample -Name Splunk-BOTS-v3 -Destination $corpusDownloadDir) }
+        catch { $manualOverwriteRefused = ($_.Exception.Message -match 'already has content') }
+        & $assert $manualOverwriteRefused "manual corpus manifest refuses overwrite without Force"
+
+        $localCorpus = Join-Path $dir 'local-corpus'
+        New-Item -ItemType Directory -Path $localCorpus -Force | Out-Null
+        @(
+            '{"timestamp":"2026-01-01T00:00:00Z","level":"INFO","username":"corpus.user","host":"corpus01.internal.test","src_ip":"10.71.1.2","message":"synthetic external corpus row"}',
+            '{"timestamp":"2026-01-01T00:00:01Z","level":"WARN","username":"corpus.admin","host":"corpus02.internal.test","src_ip":"10.71.1.3","message":"synthetic external corpus warning"}'
+        ) | Set-Content -Path (Join-Path $localCorpus 'mini-app.jsonl') -Encoding UTF8
+        $corpusOut = Join-Path $dir 'external-corpus-results'
+        $corpusSmoke = Invoke-ExternalCorpusSmokeTest -CorpusRoot $localCorpus -WorkDir $corpusOut -UseRecommendations -DryRunOnly -Salt 'selftest-fixed-salt' -NonInteractive
+        & $assert ((Test-Path -LiteralPath $corpusSmoke.Summary.Csv) -and (Test-Path -LiteralPath $corpusSmoke.Summary.Json) -and (Test-Path -LiteralPath $corpusSmoke.Summary.Markdown)) "external corpus smoke test writes CSV/JSON/Markdown summaries"
+        & $assert (@($corpusSmoke.Results | Where-Object { $_.PassFail -eq 'Pass' }).Count -eq 1) "external corpus smoke test passes synthetic local corpus"
+
+        # ---- 3) One planted fixture per profile ----
         Write-Rule "Per-profile fixtures"
         foreach ($pol in @('Balanced','Strict')) {
             $script:ScrubPolicy = $pol
@@ -4828,8 +5321,8 @@ function Write-RunManifest {
         }
     }
     $manifest = [pscustomobject]@{
-        tool            = "UniversalLogScrubber_v4_11.psm1"
-        schemaVersion   = "4.11"
+        tool            = "UniversalLogScrubber_v4_12.psm1"
+        schemaVersion   = "4.12"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
         hmacLength      = $script:HmacLength
@@ -4902,7 +5395,7 @@ function Invoke-UniversalScrubber {
     $script:DetectionTrace = New-Object System.Collections.Generic.List[object]
     $script:DetectionCounts = @{}
 
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.11" "Token-map first, then scrub. Nothing leaves until it's clean."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.12" "Token-map first, then scrub. Nothing leaves until it's clean."
     if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
     if ($SafeFirstRun) { Write-Info "SAFE FIRST RUN mode -- local sample analysis only." }
     if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
@@ -5278,8 +5771,10 @@ function Invoke-UniversalScrubber {
 }
 
 Export-ModuleMember -Function `
-    Invoke-UniversalScrubber, Test-LogFormat, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
+    Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
+    Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
     Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
     Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
+

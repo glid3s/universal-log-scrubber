@@ -17,7 +17,7 @@ The short version:
 Open PowerShell in the repository root and run the built-in self-test:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 Invoke-ScrubSelfTest
 ```
 
@@ -49,6 +49,51 @@ Invoke-UniversalScrubber `
 If a folder contains mixed log types, `-AutoProfile -NonInteractive` stops and
 asks you to pass `-Profile` explicitly or split the files by type.
 
+## Optional External Corpus Testing
+
+v4.12 can help you test against public log corpora without adding those corpora
+to this repository. Public corpora can be raw, unsanitized, operationally
+realistic, offensive, or license-restricted. Review the source and terms before
+download, and keep downloaded corpora in an approved local folder.
+
+List the built-in catalog without network access:
+
+```powershell
+Get-LogCorpusCatalog
+
+Search-LogCorpusCatalog -Query apache
+```
+
+Save a small direct-download sample. Downloads require `-AcceptRisk`:
+
+```powershell
+.\scripts\Get-SampleLogs.ps1 `
+  -Name Loghub-Apache `
+  -AcceptRisk
+```
+
+Downloaded samples default to `.\samples\external-corpora`, which is ignored by
+git. Use `-Destination D:\log-corpora` when you want an explicit location.
+Large or source-controlled datasets write manual instructions instead of
+downloading automatically.
+
+Run an optional local smoke test over a corpus folder:
+
+```powershell
+Invoke-ExternalCorpusSmokeTest `
+  -CorpusRoot .\samples\external-corpora `
+  -Recurse `
+  -UseRecommendations `
+  -DryRunOnly `
+  -Salt "preview-only" `
+  -NonInteractive
+```
+
+The smoke test writes CSV, JSON, and Markdown summaries under
+`.\external-corpus-results` by default. GitHub Actions does not download or test
+external corpora. v4.12 does not support real scrubbing from this smoke-test
+command; use it for recommendations and dry-run previews only.
+
 Set a salt. The salt makes the same real value become the same token every time.
 Use the same salt when multiple logs need to correlate with each other.
 
@@ -59,7 +104,7 @@ $env:SCRUB_SALT = 'use-a-long-random-secret-value'
 Run a dry-run preview. This writes no scrubbed files and no token map:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
@@ -71,7 +116,7 @@ Run a dry-run preview. This writes no scrubbed files and no token map:
 If the preview looks good, run the real scrub:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -SaltFromEnv SCRUB_SALT `
@@ -97,7 +142,7 @@ Never upload:
 Create a safer upload zip:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -SafeBundleOut C:\scrubbed\safe-upload.zip `
@@ -137,7 +182,7 @@ Use `Generic` when unsure. Use a specific profile when the log type is known:
 Example:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs\app.ndjson `
   -WorkDir C:\scrubbed `
   -Profile AppJson `
@@ -153,7 +198,7 @@ a BYOP profile.
 Analyzer-only mode:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -173,7 +218,7 @@ What this creates:
 Optional wizard mode:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -187,7 +232,7 @@ must stay local.
 Preview with the generated profile:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -ProfileFile C:\profiles\generated-profile.json `
@@ -200,7 +245,7 @@ Preview with the generated profile:
 Validate a profile without scrubbing:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 Test-ScrubProfile -Path C:\profiles\generated-profile.json
 ```
 
@@ -253,7 +298,7 @@ internal-product-code
 Use it:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -SeedFile C:\profiles\client-seeds.txt `
@@ -282,7 +327,7 @@ regex:^build-[0-9]+$
 Use it:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -AllowlistFile C:\profiles\public-allowlist.txt `
@@ -343,7 +388,7 @@ EVTX files are converted to CSV before scrubbing. Conversion streams rows and
 shows progress so large event logs do not look hung.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs\Security.evtx `
   -WorkDir C:\scrubbed `
   -SaltFromEnv SCRUB_SALT `
@@ -362,7 +407,7 @@ tokens later. It must not be uploaded.
 Merge into an existing map:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\more-logs `
   -WorkDir C:\scrubbed `
   -TokenMapCsv C:\scrubbed\scrub_token_map_DO_NOT_UPLOAD.csv `
@@ -374,7 +419,7 @@ Merge into an existing map:
 Use replace mode only when intentionally starting a new map:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -TokenMapMode Replace `
@@ -389,7 +434,7 @@ Use replace mode only when intentionally starting a new map:
 - `Readable` preserves more known diagnostics and should be paired with review.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -ScrubPolicy Strict `
@@ -403,7 +448,7 @@ Detailed detection reports can contain original values or context. Treat them as
 local-only.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_11.ps1 `
+.\scripts\Run-UniversalScrubber_v4_12.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed `
   -FalsePositiveReport C:\scrubbed\detection_review_DO_NOT_UPLOAD.csv `
@@ -420,7 +465,7 @@ externally, but still review it before sharing.
 Use restore only inside the secure environment with the private token map.
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 
 Restore-ScrubbedFile `
   -InputPath C:\analysis\findings_from_llm.csv `
@@ -440,9 +485,10 @@ Restore-ScrubbedFile `
 ## Validation
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_11.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
 Invoke-ScrubSelfTest
 ```
 
 Use synthetic or approved local logs for dry-run validation. The dry run previews
 what would be detected and tokenized without writing scrubbed output files.
+
