@@ -6439,6 +6439,214 @@ function Find-Identifiers {
 # END ULS v4.12 hotfix: LogHub online flattening and positive detection review rows
 
 
+
+# BEGIN ULS v4.12 OpenSSH corpus hardening hotfix
+# Addresses common sshd/syslog free-text forms that are not label:value pairs:
+#   - syslog emitter hostname after timestamp (for example: "Dec 10 06:55:46 LabSZ sshd[...]")
+#   - OpenSSH authentication usernames in prose (Invalid user, Failed password for ...)
+#   - reverse-DNS hostnames before IPv4 hardening can split numeric-leading FQDNs
+# This is heuristic/contextual matching, not a static allowlist or static denylist.
+
+if (-not (Get-Variable -Name __ULS_FindIdentifiers_BeforeOpenSsh -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_FindIdentifiers_BeforeOpenSsh = ${function:Find-Identifiers}
+}
+if (-not (Get-Variable -Name __ULS_InvokeFreeTextHardening_BeforeOpenSsh -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_InvokeFreeTextHardening_BeforeOpenSsh = ${function:Invoke-FreeTextHardening}
+}
+if (-not (Get-Variable -Name __ULS_InvokeLeakHardeningText_BeforeOpenSsh -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh = ${function:Invoke-LeakHardeningText}
+}
+
+function Test-UlsOpenSshLogText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text -match '(?im)^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+sshd(?:\[\d+\])?:')
+}
+
+function Get-UlsOpenSshValuePrefix {
+    param([string]$Value, [string]$DefaultPrefix = 'HOST')
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $DefaultPrefix }
+    $v = $Value.Trim()
+    if ($v -match '^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$') { return 'IP' }
+    if ($v -match '^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$') { return 'DNS' }
+    return $DefaultPrefix
+}
+
+function Add-UlsOpenSshIdentifier {
+    param(
+        [Parameter(Mandatory)]$List,
+        [Parameter(Mandatory)][hashtable]$Seen,
+        [string]$Raw,
+        [string]$Prefix,
+        [string]$Detector = 'OpenSSHAuth',
+        [string]$Reason = 'OpenSSH auth context',
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return }
+    $v = ([string]$Raw).Trim()
+    $v = $v.TrimStart([char[]]@('[','('))
+    $v = $v.TrimEnd([char[]]@('.', ',', ';', ':', ']', ')'))
+    if ([string]::IsNullOrWhiteSpace($v)) { return }
+    if (Is-AlreadyToken -Value $v) { return }
+    if ($v -match '^(?:-|unknown|none|null|\(null\))$') { return }
+
+    $p = if ([string]::IsNullOrWhiteSpace($Prefix)) { Get-UlsOpenSshValuePrefix -Value $v } else { $Prefix }
+    $norm = Normalize-TokenKey -Value $v
+    if (-not $norm) { return }
+    if ($Seen.ContainsKey($norm)) { return }
+    $Seen[$norm] = $true
+
+    [void]$List.Add([pscustomobject]@{
+        Raw      = $v
+        Prefix   = $p
+        Detector = $Detector
+        Reason   = $Reason
+        Index    = $Index
+        Length   = $(if ($Length -gt 0) { $Length } else { $v.Length })
+    })
+}
+
+function Find-OpenSshAuthIdentifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $out = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    if (-not (Test-UlsOpenSshLogText -Text $Text)) { return @() }
+
+    $patterns = @(
+        [pscustomobject]@{ Pattern='(?m)^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+)([A-Za-z][A-Za-z0-9_.-]{1,127})(?=\s+sshd(?:\[\d+\])?:)'; Group=2; Prefix=''; Reason='Syslog emitter hostname' },
+        [pscustomobject]@{ Pattern='(?i)\bgetaddrinfo\s+for\s+([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?=\s+\[)'; Group=1; Prefix='DNS'; Reason='OpenSSH reverse-DNS hostname' },
+        [pscustomobject]@{ Pattern='(?i)\brhost=([^\s]+)'; Group=1; Prefix=''; Reason='OpenSSH rhost value' },
+        [pscustomobject]@{ Pattern='(?i)\bfrom\s+([A-Za-z0-9][A-Za-z0-9_.-]*)(?=\s+(?:port\b|ssh2\b|\[preauth\]|$))'; Group=1; Prefix=''; Reason='OpenSSH remote endpoint' },
+        [pscustomobject]@{ Pattern='(?i)\bInvalid user\s+([^\s]+)(?=\s+from\b)'; Group=1; Prefix='PRINCIPAL'; Reason='OpenSSH invalid username' },
+        [pscustomobject]@{ Pattern='(?i)\binput_userauth_request:\s+invalid user\s+([^\s\[]+)'; Group=1; Prefix='PRINCIPAL'; Reason='OpenSSH invalid username' },
+        [pscustomobject]@{ Pattern='(?i)\bFailed password for invalid user\s+([^\s]+)(?=\s+from\b)'; Group=1; Prefix='PRINCIPAL'; Reason='OpenSSH failed-password username' },
+        [pscustomobject]@{ Pattern='(?i)\bFailed password for\s+([^\s]+)(?=\s+from\b)'; Group=1; Prefix='PRINCIPAL'; Reason='OpenSSH failed-password username' },
+        [pscustomobject]@{ Pattern='(?i)\bToo many authentication failures for\s+([^\s\[]+)'; Group=1; Prefix='PRINCIPAL'; Reason='OpenSSH auth-failure username' },
+        [pscustomobject]@{ Pattern='(?i)\buser=([^\s]+)'; Group=1; Prefix='PRINCIPAL'; Reason='OpenSSH user field' }
+    )
+
+    foreach ($spec in $patterns) {
+        $rx = New-ScrubRegex -Pattern ([string]$spec.Pattern) -Context "OpenSSH auth detector '$($spec.Reason)'"
+        foreach ($m in $rx.Matches($Text)) {
+            $g = $m.Groups[[int]$spec.Group]
+            if (-not $g.Success) { continue }
+            $raw = $g.Value
+            $prefix = [string]$spec.Prefix
+            if ([string]::IsNullOrWhiteSpace($prefix)) { $prefix = Get-UlsOpenSshValuePrefix -Value $raw }
+            Add-UlsOpenSshIdentifier -List $out -Seen $seen -Raw $raw -Prefix $prefix -Reason ([string]$spec.Reason) -Index $g.Index -Length $g.Length
+        }
+    }
+
+    return @($out.ToArray())
+}
+
+function Invoke-OpenSshAuthHardening {
+    param([Parameter(Mandatory)][string]$Text, [string]$ColumnName = '')
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    if (-not (Test-UlsOpenSshLogText -Text $Text)) { return $Text }
+
+    $out = $Text
+
+    function _ReplaceOpenSshGroup {
+        param(
+            [Parameter(Mandatory)][string]$InputText,
+            [Parameter(Mandatory)][string]$Pattern,
+            [int]$GroupNumber = 1,
+            [string]$Prefix = '',
+            [string]$Reason = 'OpenSSH auth context'
+        )
+
+        $rx = New-ScrubRegex -Pattern $Pattern -Context "OpenSSH hardening '$Reason'"
+        return $rx.Replace($InputText, {
+            param($m)
+            $g = $m.Groups[$GroupNumber]
+            if (-not $g.Success) { return $m.Value }
+
+            $raw = $g.Value.Trim()
+            $clean = $raw.TrimStart([char[]]@('[','(')).TrimEnd([char[]]@('.', ',', ';', ':', ']', ')'))
+            if ([string]::IsNullOrWhiteSpace($clean)) { return $m.Value }
+            if (Is-AlreadyToken -Value $clean) { return $m.Value }
+            if ($clean -match '^(?:-|unknown|none|null|\(null\))$') { return $m.Value }
+
+            $p = if ([string]::IsNullOrWhiteSpace($Prefix)) { Get-UlsOpenSshValuePrefix -Value $clean } else { $Prefix }
+            $tok = Get-Token -Value $clean -Prefix $p
+            Add-DetectionTrace -Detector 'OpenSSHAuth' -Action 'Tokenized' -Value $clean -Token $tok -Reason $Reason -ColumnName $ColumnName -Context (Get-DetectionContext -Text $InputText -Index $g.Index -Length $g.Length)
+
+            $rel = $g.Index - $m.Index
+            if ($rel -lt 0) { return $m.Value }
+            $before = $m.Value.Substring(0, $rel)
+            $afterStart = $rel + $g.Length
+            $after = if ($afterStart -lt $m.Value.Length) { $m.Value.Substring($afterStart) } else { '' }
+            return $before + $tok + $after
+        })
+    }
+
+    # Do DNS-like OpenSSH fields before the generic IPv4 detector to avoid split tokens
+    # such as IP_x.DNS_y for numeric-leading reverse-DNS hostnames.
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?m)^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+)([A-Za-z][A-Za-z0-9_.-]{1,127})(?=\s+sshd(?:\[\d+\])?:)' -GroupNumber 2 -Prefix '' -Reason 'Syslog emitter hostname'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\bgetaddrinfo\s+for\s+)([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?=\s+\[)' -GroupNumber 2 -Prefix 'DNS' -Reason 'OpenSSH reverse-DNS hostname'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\brhost=)([^\s]+)' -GroupNumber 2 -Prefix '' -Reason 'OpenSSH rhost value'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\bfrom\s+)([A-Za-z0-9][A-Za-z0-9_.-]*)(?=\s+(?:port\b|ssh2\b|\[preauth\]|$))' -GroupNumber 2 -Prefix '' -Reason 'OpenSSH remote endpoint'
+
+    # Then handle auth usernames expressed in prose rather than label:value form.
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\bInvalid user\s+)([^\s]+)(?=\s+from\b)' -GroupNumber 2 -Prefix 'PRINCIPAL' -Reason 'OpenSSH invalid username'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\binput_userauth_request:\s+invalid user\s+)([^\s\[]+)' -GroupNumber 2 -Prefix 'PRINCIPAL' -Reason 'OpenSSH invalid username'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\bFailed password for invalid user\s+)([^\s]+)(?=\s+from\b)' -GroupNumber 2 -Prefix 'PRINCIPAL' -Reason 'OpenSSH failed-password username'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\bFailed password for\s+)([^\s]+)(?=\s+from\b)' -GroupNumber 2 -Prefix 'PRINCIPAL' -Reason 'OpenSSH failed-password username'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\bToo many authentication failures for\s+)([^\s\[]+)' -GroupNumber 2 -Prefix 'PRINCIPAL' -Reason 'OpenSSH auth-failure username'
+    $out = _ReplaceOpenSshGroup -InputText $out -Pattern '(?i)(\buser=)([^\s]+)' -GroupNumber 2 -Prefix 'PRINCIPAL' -Reason 'OpenSSH user field'
+
+    return $out
+}
+
+function Find-Identifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $base = @(& $script:__ULS_FindIdentifiers_BeforeOpenSsh -Text $Text)
+    $seen = @{}
+    foreach ($id in $base) {
+        if ($id -and $id.Raw) {
+            $norm = Normalize-TokenKey -Value ([string]$id.Raw)
+            if ($norm) { $seen[$norm] = $true }
+        }
+    }
+
+    $extra = New-Object System.Collections.Generic.List[object]
+    foreach ($id in (Find-OpenSshAuthIdentifiers -Text $Text)) {
+        if (-not $id -or [string]::IsNullOrWhiteSpace([string]$id.Raw)) { continue }
+        $norm = Normalize-TokenKey -Value ([string]$id.Raw)
+        if (-not $norm -or $seen.ContainsKey($norm)) { continue }
+        $seen[$norm] = $true
+        $tok = Get-Token -Value ([string]$id.Raw) -Prefix ([string]$id.Prefix)
+        Add-DetectionTrace -Detector 'OpenSSHAuth' -Action 'Tokenized' -Value ([string]$id.Raw) -Token $tok -Reason ([string]$id.Reason) -ColumnName '(openssh)' -Context (Get-DetectionContext -Text $Text -Index ([int]$id.Index) -Length ([int]$id.Length))
+        [void]$extra.Add([pscustomobject]@{
+            Raw      = [string]$id.Raw
+            Prefix   = [string]$id.Prefix
+            Detector = 'OpenSSHAuth'
+            Reason   = [string]$id.Reason
+        })
+    }
+
+    return @($base + @($extra.ToArray()))
+}
+
+function Invoke-FreeTextHardening {
+    param([string]$ColumnName, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    $pre = Invoke-OpenSshAuthHardening -Text $Value -ColumnName $ColumnName
+    return [string](& $script:__ULS_InvokeFreeTextHardening_BeforeOpenSsh -ColumnName $ColumnName -Value $pre)
+}
+
+function Invoke-LeakHardeningText {
+    param([Parameter(Mandatory)][string]$Text)
+    $pre = Invoke-OpenSshAuthHardening -Text $Text -ColumnName ''
+    return [string](& $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh -Text $pre)
+}
+
+# END ULS v4.12 OpenSSH corpus hardening hotfix
 Export-ModuleMember -Function `
     Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
     Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
