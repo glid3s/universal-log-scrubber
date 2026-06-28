@@ -5796,30 +5796,81 @@ function Test-GeneratedScrubArtifactName {
 }
 
 function Test-PreserveNonSensitiveDottedArtifactName {
-    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+    param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+
+    $v = $Value.Trim()
+
+    # Only preserve bare dotted artifacts here. Anything with stronger network,
+    # credential, URL, email, or path signals should remain eligible for normal
+    # tokenization. Strict mode intentionally does not use this readability rule.
     if ($script:ScrubPolicy -eq 'Strict') { return $false }
-
-    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    if ($v -match '@|://|[\\/]|^\d') { return $false }
     if ($v -notmatch '\.') { return $false }
+    if ($v.Length -gt 160) { return $false }
 
-    # Do not preserve network/identity/path forms here. Let the normal detectors handle them.
-    if ($v -match '@|://|\\|/') { return $false }
-    if ($v -match '^\d') { return $false }
-
-    # Obvious local/config/source/log artifact filenames that can look like FQDNs to a shape regex.
-    if ($v -match '(?i)\.(properties|conf|cfg|ini|yaml|yml|toml|xml|json|log|txt|pid|lock|policy|rules|template|templates)$') { return $true }
+    # Preserve local/config filenames that the generic FQDN detector often sees
+    # in logs. This is extension-shape based, not an exact-value allowlist.
+    if ($v -match '(?i)^[A-Za-z0-9_.-]+\.(properties|conf|cfg|ini|yaml|yml|toml|xml|json|log|txt|pid|lock|policy|rules|template|templates|jar|war|ear|class)$') {
+        return $true
+    }
 
     $parts = @($v -split '\.')
+    if ($parts.Count -lt 2) { return $false }
+
+    # Avoid preserving ordinary public-domain-shaped two-part names like
+    # example.com, example.net, etc. This keeps the heuristic conservative.
+    $publicTlds = @{
+        'com'=$true; 'net'=$true; 'org'=$true; 'edu'=$true; 'gov'=$true; 'mil'=$true; 'int'=$true;
+        'io'=$true; 'co'=$true; 'us'=$true; 'uk'=$true; 'ca'=$true; 'de'=$true; 'fr'=$true; 'au'=$true;
+        'br'=$true; 'mx'=$true; 'cn'=$true; 'jp'=$true; 'in'=$true; 'ru'=$true; 'eu'=$true; 'biz'=$true;
+        'info'=$true; 'dev'=$true; 'app'=$true; 'cloud'=$true; 'local'=$true; 'lan'=$true
+    }
+    $lastLower = $parts[-1].ToLowerInvariant()
+    if ($parts.Count -eq 2 -and $publicTlds.ContainsKey($lastLower)) { return $false }
+
+    # Preserve Java/property-style keys and ZooKeeper/log-framework labels.
+    # This is family/shape based, not exact-value allowlisting.
+    $safePropertyPrefixes = @{
+        'java'=$true; 'javax'=$true; 'jdk'=$true; 'sun'=$true; 'os'=$true; 'user'=$true;
+        'file'=$true; 'path'=$true; 'line'=$true; 'host'=$true; 'zookeeper'=$true;
+        'autopurge'=$true; 'snap'=$true; 'data'=$true; 'client'=$true; 'server'=$true;
+        'quorum'=$true; 'sync'=$true; 'tick'=$true; 'init'=$true; 'leader'=$true;
+        'election'=$true; 'log4j'=$true; 'slf4j'=$true; 'netty'=$true; 'jline'=$true;
+        'xerces'=$true; 'xml'=$true; 'xmlParserAPIs'=$true
+    }
+    $first = $parts[0]
+    $firstLower = $first.ToLowerInvariant()
+    if ($safePropertyPrefixes.ContainsKey($firstLower)) {
+        return $true
+    }
+
+    # Preserve compact metric/state labels like n.sid, n.zxid, n.peerEpoch, etc.
+    if ($parts.Count -eq 2 -and $first.Length -le 3 -and $parts[1] -match '^[A-Za-z][A-Za-z0-9_-]{1,48}$') {
+        return $true
+    }
+
+    # Preserve method/context identifiers such as workerEnv.init.
     if ($parts.Count -eq 2) {
         $left = $parts[0]
         $right = $parts[1]
+        if (($left -match '[a-z][A-Z]') -and ($right -match '^[A-Za-z_][A-Za-z0-9_-]{1,48}$')) {
+            return $true
+        }
+    }
 
-        # Preserve method/context identifiers like workerEnv.init, but not plain lowercase internal hosts like web01.corp.
-        if (($left -match '[a-z][A-Z]') -and ($right -match '(?i)^(init|start|stop|run|load|save|open|close|read|write|parse|build|handle|process|worker|factory|service|manager|env)$')) { return $true }
-
-        # Known Apache/mod_jk style symbolic names.
-        if ($v -match '(?i)^(workerEnv|mod_jk|jk2|ajp13)\.[A-Za-z_][A-Za-z0-9_]*$') { return $true }
+    # Preserve Java fully-qualified class/package symbols when they have a Java-ish
+    # package root and at least one class-like segment. Real DNS labels are normally
+    # lowercase; class symbols commonly include PascalCase/camelCase segments.
+    if ($parts.Count -ge 3 -and $firstLower -in @('org','com','net','io','edu','gov')) {
+        $hasClassLikeSegment = $false
+        foreach ($p in $parts) {
+            if ($p -match '[A-Z]' -and $p -match '^[A-Za-z_][A-Za-z0-9_$-]*$') {
+                $hasClassLikeSegment = $true
+                break
+            }
+        }
+        if ($hasClassLikeSegment) { return $true }
     }
 
     return $false
@@ -6655,4 +6706,731 @@ Export-ModuleMember -Function `
     Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
     Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
 
+# BEGIN ULS v4.12 hotfix: LogHub mass-corpus dotted/label FP preservation
+# Current-version bugfix only: no version/banner/schema bump.
+#
+# Purpose:
+#   Preserve common non-sensitive diagnostic identifiers that look like DNS/FQDNs,
+#   URLs, secrets, or base64 only because of their shape:
+#     - Android/Java package/class/action names
+#     - Hadoop/Spark/OpenStack logger/config namespaces
+#     - local artifact filenames (.jar, .map, .rts, .app in app-path context, etc.)
+#     - ACPI/kernel/device diagnostic names
+#     - harmless label-rule captures such as "Auth", "Starting", "/dev/sda", and port "80"
+#
+# Guardrails:
+#   - Strict policy still tokenizes.
+#   - Network/identity/path forms are not globally preserved here.
+#   - Real rhost/reverse-DNS/proxy destination domains remain tokenized unless existing allowlists preserve them.
 
+function Test-PreserveNonSensitiveDottedArtifactName {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    if ($v -notmatch '\.') { return $false }
+
+    # Do not preserve obvious network/identity/path forms here.
+    # Local paths are handled separately by label/path-aware preservation.
+    if ($v -match '@|://|\\|/') { return $false }
+
+    # Values beginning with digits are often message ids, reverse DNS fragments,
+    # timestamps, or generated object ids; do not blanket-preserve them.
+    if ($v -match '^\d') { return $false }
+
+    # Obvious local/config/source/log artifacts that commonly false-match FQDN.
+    if ($v -match '(?i)\.(properties|conf|cfg|ini|yaml|yml|toml|xml|json|log|txt|pid|lock|policy|rules|template|templates|jar|jhist|map|mapfile|rts|trace)$') { return $true }
+
+    # Kernel/initrd image names in Linux/HPC logs.
+    if ($v -match '(?i)^(vmlinuz|initrd)-\d+(?:[.\w-]+)+$') { return $true }
+
+    # .app can be a public TLD, so preserve only when it clearly looks like a
+    # macOS bundle/app artifact or appears in app-bundle context.
+    if ($v -match '(?i)^[A-Za-z0-9 _-]+\.app$') {
+        if (($Value -cmatch '^[A-Z]') -or ($Text -match '(?i)(/Applications/|/System/Library/|CoreServices|PlugIns|\.app/Contents)')) { return $true }
+    }
+
+    # ACPI routing paths in Thunderbird/HPC style logs: PCI0.PALO.DOBA, PCI0.PBHI.PXB.
+    if ($v -match '^[A-Z0-9_]+(?:\.[A-Z0-9_]+){1,8}$') {
+        if ($Text -match '(?i)(ACPI|PCI Interrupt|_PRT|BOOT_IMAGE|kernel command line)') { return $true }
+    }
+
+    $parts = @($v -split '\.')
+    if ($parts.Count -eq 2) {
+        $left = $parts[0]
+        $right = $parts[1]
+
+        # Method/context identifiers like workerEnv.init and NIOServerCxn.Factory.
+        if (($left -match '[a-z][A-Z]') -and ($right -match '(?i)^(init|start|stop|run|load|save|open|close|read|write|parse|build|handle|process|worker|factory|service|manager|env|activity)$')) { return $true }
+
+        # Known Apache/mod_jk style symbolic names and short ZooKeeper labels.
+        if ($v -match '(?i)^(workerEnv|mod_jk|jk2|ajp13|n)\.[A-Za-z_][A-Za-z0-9_]*$') { return $true }
+    }
+
+    # Android / Java / Apple diagnostic namespaces.
+    if ($v -match '^(android|java|javax|sun|kotlin|scala)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^(com\.apple|com\.android|org\.apache)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^vnd\.android\.package$') { return $true }
+
+    # Android app/component/plugin names and public framework action strings.
+    if ($v -match '^(activity|business|cooperation|plugin|system)\.[A-Za-z0-9_.-]+$') { return $true }
+
+    # Hadoop/Spark/OpenStack config keys and logger namespaces.
+    if ($v -match '^(mapred|mapreduce|yarn|hadoop|zookeeper|autopurge|os|user)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^http\.requests\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^SecurityLogger\.org\.apache\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^(nova|compute)\.[A-Za-z0-9_.-]+$') { return $true }
+
+    # Java/reversed-package class-like symbols with a class/component at the end.
+    # Avoid generic public domains by requiring a known code namespace or uppercase class-like final segment.
+    if ($v -match '^(com|org|net)\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$') {
+        $last = $parts[-1]
+        if ($last -cmatch '[A-Z]' -and $last -match '(Activity|Service|Server|Manager|Factory|Driver|Exception|Error|Proxy|Handler|Peer|Cache|Logger|Domain)$') { return $true }
+    }
+
+    return $false
+}
+
+function Test-PreserveLikelyBenignUniversalLabelValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+    if ($Detector -ne 'UniversalLabel') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    # Label rules can over-capture generic words after "host/address/domain" style labels.
+    # Preserve only known harmless diagnostic words, not arbitrary single-word hostnames.
+    if ($Prefix -eq 'DNS') {
+        if ($v -match '^(?i)(Auth|IPC|Starting|Connection|routing|type|nginx|no|\[?ContainerId:?)$') { return $true }
+        if ($v -match '^/dev/[A-Za-z0-9._/-]+$') { return $true }
+        if ($v -match '^<KSOmahaServer:0x[0-9a-fA-F]+$') { return $true }
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+    }
+
+    # Android log labels produced a principal capture of "0". Preserve only the
+    # zero singleton, not real usernames like root/test/mysql.
+    if ($Prefix -eq 'PRINCIPAL') {
+        if ($v -eq '0') { return $true }
+    }
+
+    # Proxifier produced a DomainTenantLabels capture of port "80".
+    if ($Prefix -eq 'X500') {
+        if ($v -match '^\d{1,5}$') { return $true }
+        if ($v -match '^(NS[A-Za-z0-9]+ErrorDomain|kCFErrorDomain[A-Za-z0-9]+|[A-Z][A-Za-z0-9]+ErrorDomain|com\.apple\.[A-Za-z0-9_.-]+)$') { return $true }
+    }
+
+    return $false
+}
+
+function Test-PreserveLikelyBenignSecretValue {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    # Java/Android exception class names and Apple XPC activity diagnostics are not secrets.
+    if ($v -match '^(android|java|javax|org|com)\.[A-Za-z0-9_.]+Exception$') { return $true }
+    if ($v -match '^com\.apple\.xpc\.activity/\d+$') { return $true }
+
+    return $false
+}
+
+function Test-PreserveLikelyBenignBase64FalsePositive {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    # macOS framework/class names can be long mixed-case alphabetic strings and
+    # accidentally trip base64-ish shape detectors. Preserve obvious PascalCase symbols.
+    if ($v -match '^[A-Za-z]{24,120}$' -and $v -cmatch '[a-z][A-Z]' -and $v -match '(Action|Transport|Controller|Constraint|Constraints|Layout|Bluetooth|Visualize|Server|Manager|Domain)') { return $true }
+
+    return $false
+}
+
+function Test-PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if (Test-ScrubAllowlist -Value $Value) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim()
+    if (Is-AlreadyToken -Value $v) { return $true }
+
+    # New mass-corpus false-positive reducers.
+    if (Test-PreserveLikelyBenignUniversalLabelValue -Value $v -Detector $Detector -Prefix $Prefix -Text $Text -Index $Index -Length $Length) { return $true }
+    if ($Prefix -eq 'SECRET' -and (Test-PreserveLikelyBenignSecretValue -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
+    if ($Prefix -eq 'BLOB' -and (Test-PreserveLikelyBenignBase64FalsePositive -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
+
+    # Existing preservation behavior retained.
+    if (Test-PreserveDottedDecimal -Value $v) { return $true }
+    if (($Prefix -eq 'IP' -or $Prefix -eq 'IP6') -and (Test-PreserveIpAddress -Value $v)) { return $true }
+    if ($Prefix -eq 'GUID' -and (Test-PreserveGuid -Value $v)) { return $true }
+    if ($Detector -eq 'DOMAIN\user' -or $Prefix -eq 'PRINCIPAL') {
+        if (Test-WindowsPathLikeDomainUser -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+    }
+    if ($Prefix -eq 'DNS') {
+        if (Test-AllowedDomain -Value $v) { return $true }
+        if (Test-WindowsDiagnosticDottedName -Value $v) { return $true }
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+        if ($script:ScrubPolicy -eq 'Readable' -and (Test-KnownFileOrDiagnosticName -Value $v)) { return $true }
+    }
+    if ($Prefix -eq 'BLOB' -and -not (Test-LooksLikeBase64Blob -Value $v)) { return $true }
+    if (($Prefix -eq 'GUID' -or $Prefix -eq 'CERT') -and (Test-DiagnosticContext -Text $Text -Index $Index -Length $Length)) { return $true }
+
+    return $false
+}
+
+function Get-ValueShapePrefix {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    if ($v -match '^S-1-\d+-')                                                     { return 'SID' }
+    if ($v -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$')  { return 'GUID' }
+    if ($v -match '^[0-9a-fA-F]{32,}$')                                            { return 'CERT' }
+    if ($v -match '^[^@\s]+@[^@\s]+\.[^@\s]+$')                                    { return 'UNMAPPED_UPN' }
+    if ($v -match '^\d{1,3}(\.\d{1,3}){3}$')                                       { return 'IP' }
+    if ($v -match '^[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+$')                          { return 'PRINCIPAL' }
+    if ($v -match '^(CN|OU|DC|O|L|ST|C)=')                                         { return 'X500' }
+
+    if ($v -match '^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$') {
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v) { return $null }
+        return 'DNS'
+    }
+
+    return $null
+}
+
+# END ULS v4.12 hotfix: LogHub mass-corpus dotted/label FP preservation
+
+# BEGIN ULS v4.12 hotfix: LogHub mass-corpus FP preservation round 2
+# Current-version bugfix only: no version/banner/schema bump.
+#
+# This later override intentionally shadows the earlier v4.12 preservation helpers.
+# It keeps real network/privacy-bearing values tokenized while preserving common
+# local diagnostic symbols that only look like DNS/FQDNs because they are dotted.
+
+function Test-UlsCommonPublicNetworkDomain {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}').ToLowerInvariant()
+
+    # Values in these domains are usually real web/proxy/reverse-DNS destinations.
+    # Do not blanket-preserve them as software/package namespaces.
+    if ($v -match '(^|\.)((com|net|org|edu|gov|mil|io|cn|jp|de|nl|uk|br|mx|tw|hk|at|eu|ru|in|fr|au|ca|us|info|biz|asia)$)') {
+        return $true
+    }
+
+    return $false
+}
+
+function Test-UlsLikelyCodeOrConfigNamespace {
+    param([string]$Value, [string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+
+    # Android package/action/component symbols from Android/HealthApp logs.
+    if ($v -match '^(android|vnd\.android|Intent)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^(com\.(tencent|qqgame|amap|example|huawei|android)|com\.google\.(Chrome|Keystone)|com\.apple|org\.apache)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^(activity|business|cooperation|plugin|system|recents|record|state|tr|ui)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^(H|Stub|PowerManagerService|mVisiblity|mVisibility)\.(handleMessage|onTransact|WakeLocks|getValue)$') { return $true }
+
+    # Java/system/config/ZooKeeper property names.
+    if ($v -match '^(java|javax|sun|kotlin|scala|zookeeper|autopurge|os|user|host)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^(n)\.[A-Za-z_][A-Za-z0-9_]*$') { return $true }
+
+    # Hadoop/HDFS/Spark/OpenStack logger/config namespaces.
+    if ($v -match '^(dfs|NameSystem|DefaultSpeculator|maps|mapred|mapreduce|yarn|hadoop|spark|storage|executor|broadcast|output|python|rdd|netty|akka|slf4j|Configuration|util|nova|compute|http\.requests)\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^SecurityLogger\.org\.apache\.[A-Za-z0-9_.-]+$') { return $true }
+    if ($v -match '^org\.(mortbay|apache)\.[A-Za-z0-9_.-]+$') { return $true }
+
+    # BGL/HPC local event-category and source/artifact namespaces.
+    if ($v -match '^(SPaSM|XL|mpi|partad|raptor|fdmn|clusterfilesystem|change|unix|net\.niff|home)\.[A-Za-z0-9_.-]+$') { return $true }
+
+    # macOS diagnostic/component symbols.
+    if ($v -match '^(DiskStore|EC|ImportBailout|KSOutOfProcessFetcher|Keystone|dispatcher|subject)\.[A-Za-z0-9_.-]+$') { return $true }
+
+    return $false
+}
+
+function Test-PreserveNonSensitiveDottedArtifactName {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    if ($v -notmatch '\.') { return $false }
+
+    # Do not preserve obvious identity/URL/path forms here.
+    if ($v -match '@|://|\\|/') { return $false }
+
+    # Local diagnostic/source/package artifact extensions. This intentionally runs
+    # before the leading-digit guard so names like 8x4x4.map and 1.jhist survive.
+    if ($v -match '(?i)\.(properties|conf|cfg|ini|yaml|yml|toml|xml|json|log|txt|pid|lock|policy|rules|template|templates|jar|jhist|map|mapfile|rts|trace|out|cpp|cc|cxx|h|hpp|pcap|pcapng|plist|bundle|framework|dylib|qlgenerator|db|sqlite|bin|sqm)$') {
+        return $true
+    }
+
+    # macOS .app can also be a public suffix. Preserve only bundle-looking app names
+    # or values in app-bundle context.
+    if ($v -match '(?i)^[A-Za-z0-9 _-]+\.app$') {
+        if (($Value -cmatch '^[A-Z]') -or ($Text -match '(?i)(/Applications/|/System/Library/|CoreServices|PlugIns|\.app/Contents|LaunchServices)')) { return $true }
+    }
+
+    # Linux kernel/initrd image names.
+    if ($v -match '(?i)^(vmlinuz|initrd)-\d+(?:[.\w-]+)+$') { return $true }
+
+    # Thunderbird/BGL/HPC timestamp-ish local identifiers like 200511091901.jA.
+    if ($v -match '^\d{10,}\.[A-Za-z]{1,3}$') { return $true }
+
+    # If it begins with a digit and is not a known local artifact/timestamp above,
+    # keep the conservative behavior.
+    if ($v -match '^\d') { return $false }
+
+    # ACPI / PCI route symbols.
+    if ($v -match '^[A-Z0-9_]+(?:\.[A-Z0-9_]+){1,8}$') {
+        if ($Text -match '(?i)(ACPI|PCI Interrupt|_PRT|BOOT_IMAGE|kernel command line|Thunderbird|BGL|HPC)') { return $true }
+    }
+
+    # Explicit package/config/logger namespace families from the LogHub pass.
+    if (Test-UlsLikelyCodeOrConfigNamespace -Value $v -Text $Text) { return $true }
+
+    # Class/method/logger shapes. Avoid obvious public network domains.
+    $parts = @($v -split '\.')
+    if ($parts.Count -ge 2 -and -not (Test-UlsCommonPublicNetworkDomain -Value $v)) {
+        $last = [string]$parts[-1]
+
+        # CamelCase or Java-style method/class symbol in any segment.
+        if ($v -cmatch '[a-z][A-Z]' -or $last -cmatch '^[A-Z][A-Za-z0-9_]*$') { return $true }
+
+        # Common short logger/method words.
+        if ($last -match '^(?i)(init|start|stop|run|load|save|open|close|read|write|parse|build|handle|process|worker|factory|service|manager|env|activity|isEmpty|baseline|new|rel|old|panic|full|down|up|hw|ticketstore|arpc|OU|Normal|SleepTimer|Error)$') { return $true }
+    }
+
+    return $false
+}
+
+function Test-PreserveLikelyBenignUniversalLabelValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+    if ($Detector -ne 'UniversalLabel') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    if ($Prefix -eq 'DNS') {
+        if ($v -match '^(?i)(Auth|IPC|Starting|Connection|routing|type|nginx|no|\[?ContainerId:?)$') { return $true }
+        if ($v -match '^/dev/[A-Za-z0-9._/-]+$') { return $true }
+        if ($v -match '^<KSOmahaServer:0x[0-9a-fA-F]+$') { return $true }
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+    }
+
+    if ($Prefix -eq 'PRINCIPAL') {
+        # Preserve only the obvious Android zero singleton. Keep real Linux/OpenSSH
+        # usernames like root, test, git, mysql tokenized.
+        if ($v -eq '0') { return $true }
+    }
+
+    if ($Prefix -eq 'X500') {
+        if ($v -match '^\d{1,5}$') { return $true }
+        if ($v -match '^(NS[A-Za-z0-9]+ErrorDomain|kCFErrorDomain[A-Za-z0-9]+|[A-Z][A-Za-z0-9]+ErrorDomain|com\.apple\.[A-Za-z0-9_.-]+|type)$') { return $true }
+    }
+
+    return $false
+}
+
+function Test-PreserveLikelyBenignSecretValue {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    # Java/Android exception class names and Apple XPC activity diagnostics are not secrets.
+    if ($v -match '^(android|java|javax|org|com)\.[A-Za-z0-9_.]+Exception$') { return $true }
+    if ($v -match '^com\.apple\.xpc\.activity/\d+$') { return $true }
+
+    return $false
+}
+
+function Test-PreserveLikelyBenignBase64FalsePositive {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    # macOS framework/class names can be long mixed-case alphabetic strings and
+    # accidentally trip base64-ish shape detectors.
+    if ($v -match '^[A-Za-z]{24,120}$' -and $v -cmatch '[a-z][A-Z]' -and $v -match '(Action|Transport|Controller|Constraint|Constraints|Layout|Bluetooth|Visualize|Server|Manager|Domain|Display|Power|Notification|Controller|Service)') { return $true }
+
+    return $false
+}
+
+function Test-PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if (Test-ScrubAllowlist -Value $Value) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim()
+    if (Is-AlreadyToken -Value $v) { return $true }
+
+    # New mass-corpus false-positive reducers.
+    if (Test-PreserveLikelyBenignUniversalLabelValue -Value $v -Detector $Detector -Prefix $Prefix -Text $Text -Index $Index -Length $Length) { return $true }
+    if ($Prefix -eq 'SECRET' -and (Test-PreserveLikelyBenignSecretValue -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
+    if ($Prefix -eq 'BLOB' -and (Test-PreserveLikelyBenignBase64FalsePositive -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
+
+    # Existing preservation behavior retained.
+    if (Test-PreserveDottedDecimal -Value $v) { return $true }
+    if (($Prefix -eq 'IP' -or $Prefix -eq 'IP6') -and (Test-PreserveIpAddress -Value $v)) { return $true }
+    if ($Prefix -eq 'GUID' -and (Test-PreserveGuid -Value $v)) { return $true }
+    if ($Detector -eq 'DOMAIN\user' -or $Prefix -eq 'PRINCIPAL') {
+        if (Test-WindowsPathLikeDomainUser -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+    }
+    if ($Prefix -eq 'DNS') {
+        if (Test-AllowedDomain -Value $v) { return $true }
+        if (Test-WindowsDiagnosticDottedName -Value $v) { return $true }
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+        if ($script:ScrubPolicy -eq 'Readable' -and (Test-KnownFileOrDiagnosticName -Value $v)) { return $true }
+    }
+    if ($Prefix -eq 'BLOB' -and -not (Test-LooksLikeBase64Blob -Value $v)) { return $true }
+    if (($Prefix -eq 'GUID' -or $Prefix -eq 'CERT') -and (Test-DiagnosticContext -Text $Text -Index $Index -Length $Length)) { return $true }
+
+    return $false
+}
+
+function Get-ValueShapePrefix {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim().Trim('"', "'", ',', ';', ')', ']', '}')
+
+    if ($v -match '^S-1-\d+-')                                                     { return 'SID' }
+    if ($v -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$')  { return 'GUID' }
+    if ($v -match '^[0-9a-fA-F]{32,}$')                                            { return 'CERT' }
+    if ($v -match '^[^@\s]+@[^@\s]+\.[^@\s]+$')                                    { return 'UNMAPPED_UPN' }
+    if ($v -match '^\d{1,3}(\.\d{1,3}){3}$')                                       { return 'IP' }
+    if ($v -match '^[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+$')                          { return 'PRINCIPAL' }
+    if ($v -match '^(CN|OU|DC|O|L|ST|C)=')                                         { return 'X500' }
+
+    if ($v -match '^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$') {
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v) { return $null }
+        return 'DNS'
+    }
+
+    return $null
+}
+
+# END ULS v4.12 hotfix: LogHub mass-corpus FP preservation round 2
+
+# BEGIN ULS v4.12 LogHub mass false-positive preserve round 3
+# Current-version corpus hardening only: no version/banner/schema bump.
+# This pass suppresses low-signal LogHub false positives found after the Java/ZooKeeper
+# and broad dotted-artifact preservation passes, while keeping real network/identity
+# identifiers tokenized.
+
+if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_TestPreserveDetectedValue_BeforeLogHubRound3 = ${function:Test-PreserveDetectedValue}
+}
+if (-not (Get-Variable -Name __ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 = ${function:Find-UniversalLabeledIdentifiers}
+}
+if (-not (Get-Variable -Name __ULS_FindSecretIdentifiers_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_FindSecretIdentifiers_BeforeLogHubRound3 = ${function:Find-SecretIdentifiers}
+}
+
+function Test-UlsRound3LowSignalUniversalLabel {
+    param(
+        [string]$Value,
+        [string]$Rule
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = ([string]$Value).Trim()
+    $r = ([string]$Rule).Trim()
+
+    # Numeric/word fragments commonly captured by broad "label" rules in prose.
+    if ($v -match '^(?:0|80|no|Starting|IPC|Auth|Connection|routing|type|nginx)$') { return $true }
+    if ($v -match '^\[?ContainerId:?$') { return $true }
+
+    # Local Unix/Linux device names are useful diagnostics, not hosts.
+    if ($v -match '(?i)^/dev/[A-Za-z0-9_.-]+$') { return $true }
+
+    # Apple/macOS diagnostic error domains and service names can look tenant-like.
+    if ($v -match '(?i)^(ABAddressBookErrorDomain|kCFErrorDomainCFNetwork|NSURLErrorDomain|NSOSStatusErrorDomain|CoreDAVHTTPStatusErrorDomain)$') { return $true }
+    if ($v -match '(?i)^com\.apple\.(?:security\.sos\.error|xpc\.activity)(?:/\d+)?$') { return $true }
+
+    # Objective-C object/debug pointer forms are local diagnostic artifacts.
+    if ($v -match '(?i)^<?[A-Za-z][A-Za-z0-9_.$-]*:0x[0-9a-f]+$') { return $true }
+
+    # android/java exception/class symbols may be captured by broad principal/secret-ish rules.
+    if ($v -match '(?i)^(?:android|java|javax|org|com)\.[A-Za-z0-9_.$]+(?:Exception|Error|RuntimeException)$') { return $true }
+
+    return $false
+}
+
+function Test-UlsRound3LowSignalSecret {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = ([string]$Value).Trim()
+
+    # Java/Android exception class names and Apple diagnostic service identifiers are not secrets.
+    if ($v -match '(?i)^(?:android|java|javax|org|com)\.[A-Za-z0-9_.$]+(?:Exception|Error|RuntimeException)$') { return $true }
+    if ($v -match '(?i)^com\.apple\.xpc\.activity/\d+$') { return $true }
+
+    return $false
+}
+
+function Test-UlsRound3PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = ([string]$Value).Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    $ctx = if ($null -ne $Text) { [string]$Text } else { '' }
+
+    if ($Prefix -eq 'DNS') {
+        # Local package/archive/app artifacts that are not DNS names.
+        if ($v -match '(?i)\.(apk|ipa|app|framework|bundle|dylib|kext|sqm)$') { return $true }
+
+        # Public documentation link in Hadoop sample, not an operational destination.
+        if ($v -ieq 'wiki.apache.org' -and $ctx -match '(?i)NoRouteToHost|apache\.org/hadoop|For more details see') { return $true }
+    }
+
+    if ($Prefix -eq 'IP') {
+        # Non-routable wildcard/bind address: useful to keep readable.
+        if ($v -eq '0.0.0.0') { return $true }
+
+        # Windows package/file version strings can look exactly like IPv4 addresses.
+        $versionEsc = [regex]::Escape($v)
+        if ($ctx -match "(?i)(Package_for_KB|ApplicableState|CurrentState|wcp\.dll version|~~$versionEsc\b)") { return $true }
+    }
+
+    if ($Prefix -eq 'IP6') {
+        # PCI/ACPI bus/device identifiers and abbreviated status/debug fragments are not IPv6 addresses.
+        if ($ctx -match '(?i)\b(PCI|ACPI|GSI|IRQ|Transparent bridge|interrupt|IStorePendingTransaction|coldpatching|onTouchEvent|chip status changed|New ido chip|mLp\()\b') { return $true }
+
+        # Very short :: fragments are almost always parser artifacts in these free-form logs.
+        if ($v -match '(?i)^(?:::?[0-9a-f]{1,3}|[0-9a-f]{1,3}::)$') { return $true }
+    }
+
+    return $false
+}
+
+function Test-PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    try {
+        if (& $script:__ULS_TestPreserveDetectedValue_BeforeLogHubRound3 `
+            -Value $Value `
+            -Detector $Detector `
+            -Prefix $Prefix `
+            -Text $Text `
+            -Index $Index `
+            -Length $Length) {
+            return $true
+        }
+    }
+    catch { }
+
+    if (Test-UlsRound3PreserveDetectedValue -Value $Value -Detector $Detector -Prefix $Prefix -Text $Text -Index $Index -Length $Length) {
+        return $true
+    }
+
+    return $false
+}
+
+function Find-UniversalLabeledIdentifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $items = @(& $script:__ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 -Text $Text)
+    if ($script:ScrubPolicy -eq 'Strict') { return @($items) }
+
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($id in $items) {
+        $raw = ''
+        $rule = ''
+        try { $raw = [string]$id.Raw } catch { $raw = '' }
+        try { $rule = [string]$id.Rule } catch { $rule = '' }
+
+        if (Test-UlsRound3LowSignalUniversalLabel -Value $raw -Rule $rule) { continue }
+        [void]$out.Add($id)
+    }
+
+    return @($out.ToArray())
+}
+
+function Find-SecretIdentifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $items = @(& $script:__ULS_FindSecretIdentifiers_BeforeLogHubRound3 -Text $Text)
+    if ($script:ScrubPolicy -eq 'Strict') { return @($items) }
+
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($id in $items) {
+        $raw = ''
+        try { $raw = [string]$id.Raw } catch { $raw = '' }
+
+        if (Test-UlsRound3LowSignalSecret -Value $raw) { continue }
+        [void]$out.Add($id)
+    }
+
+    return @($out.ToArray())
+}
+
+# END ULS v4.12 LogHub mass false-positive preserve round 3
+
+# BEGIN ULS v4.12 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
+# Current-version bugfix only: no version/banner/schema bump.
+#
+# Some macOS/corecaptured/kernel lines contain C++/IOKit scope operators such as:
+#   CCIOReporterFormatter::addRegistryChildToChannelDictionary
+#   AppleThunderboltNHIType2::waitForOk2Go2Sx
+#   en0::IO80211Interface::postMessage
+#
+# A generic IPv6 shape regex can see tiny substrings like "::add", "e2::",
+# "0::", "face::", or "::f" inside those symbols. In Balanced/Readable mode,
+# preserve those when the match is embedded in an alphanumeric symbol context.
+# Real standalone IPv6 addresses continue through the previous detector logic.
+if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeIpv6ScopeRound4 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_TestPreserveDetectedValue_BeforeIpv6ScopeRound4 = ${function:Test-PreserveDetectedValue}
+}
+
+function Test-UlsScopeOperatorIpv6FalsePositive {
+    param(
+        [string]$Value,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if ($Prefix -ne 'IP6') { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+
+    $v = ([string]$Value).Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+
+    # Only target the tiny compressed fragments that commonly arise from
+    # language scope operators. Do not preserve full multi-hextet IPv6 values here.
+    if ($v -notmatch '^(?:[0-9A-Fa-f]{1,4})?::(?:[0-9A-Fa-f]{0,4})$') { return $false }
+    if ($v -match '^(?i)(?:fe80|2607|2001|fd[0-9a-f]{2}|fc[0-9a-f]{2})') { return $false }
+
+    if ([string]::IsNullOrEmpty($Text) -or $Index -lt 0) { return $false }
+
+    $len = if ($Length -gt 0) { $Length } else { $Value.Length }
+    if ($len -lt 2) { return $false }
+
+    $before = ''
+    $after = ''
+    if ($Index -gt 0) {
+        $before = $Text.Substring($Index - 1, 1)
+    }
+    if (($Index + $len) -lt $Text.Length) {
+        $after = $Text.Substring($Index + $len, 1)
+    }
+
+    # If the detector match is embedded inside an identifier, it is much more
+    # likely to be a C++/Obj-C/IOKit scope-operator fragment than a real IPv6.
+    if ($before -match '[A-Za-z0-9_]' -or $after -match '[A-Za-z0-9_]') { return $true }
+
+    # Also preserve when the nearby context visibly contains a scoped method/class.
+    $start = [Math]::Max(0, $Index - 48)
+    $take = [Math]::Min($Text.Length - $start, $len + 96)
+    $ctx = $Text.Substring($start, $take)
+    if ($ctx -match '[A-Za-z_][A-Za-z0-9_]{1,80}::[A-Za-z_][A-Za-z0-9_]{1,80}') { return $true }
+
+    return $false
+}
+
+function Test-PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    if (Test-UlsScopeOperatorIpv6FalsePositive -Value $Value -Prefix $Prefix -Text $Text -Index $Index -Length $Length) {
+        return $true
+    }
+
+    return (& $script:__ULS_TestPreserveDetectedValue_BeforeIpv6ScopeRound4 `
+        -Value $Value `
+        -Detector $Detector `
+        -Prefix $Prefix `
+        -Text $Text `
+        -Index $Index `
+        -Length $Length)
+}
+
+# END ULS v4.12 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
