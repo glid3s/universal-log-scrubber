@@ -10,7 +10,7 @@ These files are synthetic. They are safe to commit and safe to use for demos.
 
 Do not replace them with real client logs. If you need a new fixture, fictionalize it first.
 
-External public corpora downloaded through v4.12 tools belong in
+External public corpora downloaded through v4.13 tools belong in
 `samples/external-corpora/` by default. That folder is ignored by git because
 public corpora may be raw, unsanitized, realistic, offensive, or
 license-restricted.
@@ -57,7 +57,7 @@ Dry-run an NDJSON app log:
 
 ```powershell
 $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
-.\scripts\Run-UniversalScrubber_v4_12.ps1 `
+.\scripts\Run-UniversalScrubber_v4_13.ps1 `
   -Path .\samples\logs\app-auth.ndjson `
   -WorkDir .\samples\out\app-auth-preview `
   -Profile AppJson `
@@ -72,7 +72,7 @@ $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
 Build a profile from the gateway sample:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_12.ps1 `
+.\scripts\Run-UniversalScrubber_v4_13.ps1 `
   -BuildProfileFromSample `
   -Path .\samples\logs\gateway-kv.log `
   -WorkDir .\samples\generated-profile `
@@ -86,7 +86,7 @@ Create a safe upload bundle from a sample run:
 
 ```powershell
 $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
-.\scripts\Run-UniversalScrubber_v4_12.ps1 `
+.\scripts\Run-UniversalScrubber_v4_13.ps1 `
   -Path .\samples\logs\web-access.log `
   -WorkDir .\samples\out\web-access `
   -Profile WebAccess `

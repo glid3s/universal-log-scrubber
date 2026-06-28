@@ -168,7 +168,7 @@
     * -AutoProfile can choose one high-confidence profile for uniform inputs and
       refuses mixed/low-confidence folders in noninteractive mode.
 
-  v4.12 ADDS
+  v4.13 ADDS
   ----------
     * External corpus catalog commands help operators find and optionally fetch
       curated public log samples without committing downloaded corpora.
@@ -760,7 +760,7 @@ function Test-PreserveGuid {
     return ($v -eq '00000000-0000-0000-0000-000000000000')
 }
 
-function Test-PreserveDetectedValue {
+function __ULS_Legacy_Test_PreserveDetectedValue_763 {
     param(
         [string]$Value,
         [string]$Detector,
@@ -1037,7 +1037,7 @@ function Test-PreserveUniversalLabeledValue {
     return $false
 }
 
-function Find-UniversalLabeledIdentifiers {
+function __ULS_Legacy_Find_UniversalLabeledIdentifiers_1040 {
     param([Parameter(Mandatory)][string]$Text)
     $found = @{}
     if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
@@ -1201,7 +1201,7 @@ function Test-PreserveSecretCandidate {
     return $false
 }
 
-function Find-SecretIdentifiers {
+function __ULS_Legacy_Find_SecretIdentifiers_1204 {
     param([Parameter(Mandatory)][string]$Text)
     $found = @{}
     if ($Text -notmatch '(?i)(Authorization\s*[:=]|Bearer\s+|Basic\s+|password\s*[:=]|passwd\s*[:=]|pwd\s*[:=]|secret\s*[:=]|client_secret|api[_-]?key\s*[:=]|access[_-]?token\s*[:=]|refresh[_-]?token\s*[:=]|private[_-]?key\s*[:=]|PRIVATE KEY|connectionstring|connstr|Data Source=|Server=[^\r\n]{0,500}(?:Password|Pwd)=|gh[pousr]_|xox[baprs]-|sk_(?:live|test)_|sk-[A-Za-z0-9]|(?:AKIA|ASIA)[0-9A-Z]{16}|\b(?:token|secret|key|password)[A-Za-z0-9_. \-]{0,24}[:=])') { return @() }
@@ -1369,8 +1369,9 @@ function Invoke-CommonDetectors {
         return '\\' + $tok + $m.Groups[2].Value
     })
 
-    # URL: tokenize optional userinfo and the host in scheme://[user@]host[:port]/...
-    $out = [regex]::Replace($out, '(?i)\b(https?|ftp|ldap|ldaps|smb)://([^/\s"'',;]+)', {
+    # URL / connection URI: tokenize optional userinfo and the host in scheme://[user@]host[:port]/...
+    # Includes common database, cache, queue, Kafka, WebSocket, and JDBC schemes.
+    $out = [regex]::Replace($out, '(?i)\b((?:jdbc:[a-z][a-z0-9+.-]*|https?|ftp|ldap|ldaps|smb|wss?|postgres(?:ql)?|mysql|mssql|sqlserver|redis|mongodb(?:\+srv)?|amqps?|kafka))://([^/\s"'',;]+)', {
         param($m)
         $scheme = $m.Groups[1].Value
         $auth = $m.Groups[2].Value
@@ -1427,7 +1428,7 @@ function Invoke-KvValueOnlyText {
 }
 
 # Decide a token prefix from a value's SHAPE alone (no column context).
-function Get-ValueShapePrefix {
+function __ULS_Legacy_Get_ValueShapePrefix_1430 {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
     $v = $Value.Trim()
@@ -1444,7 +1445,7 @@ function Get-ValueShapePrefix {
 
 # Return the set of DISTINCT raw identifier strings present in a chunk of text,
 # each tagged with a best-effort prefix. Used by the discovery map builder.
-function Find-Identifiers {
+function __ULS_Legacy_Find_Identifiers_1447 {
     param([Parameter(Mandatory)][string]$Text)
     $found = @{}   # normalizedKey -> @{ Raw; Prefix }
     if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
@@ -1750,8 +1751,18 @@ function New-ScrubTokenMap {
             Write-Progress -Activity "Discovering identifiers in $name" -Completed
         }
         else {
+            $fileLength = 0
+            try { $fileLength = (Get-Item -LiteralPath $file).Length } catch { }
+            Write-Progress -Activity "Discovering identifiers in $name" -Status "Reading $fileLength bytes" -PercentComplete -1
             $text = [System.IO.File]::ReadAllText($file)
-            foreach ($id in (Find-Identifiers -Text $text)) {
+            Write-Progress -Activity "Discovering identifiers in $name" -Status "Scanning text/KV content" -PercentComplete -1
+            $ids = @(Find-Identifiers -Text $text)
+            $idNo = 0
+            foreach ($id in $ids) {
+                $idNo++
+                if ($idNo % 500 -eq 0) {
+                    Write-Progress -Activity "Discovering identifiers in $name" -Status "Candidate $idNo of $($ids.Count) ($($seen.Count) unique so far)" -PercentComplete ([int](($idNo / [Math]::Max($ids.Count,1)) * 100))
+                }
                 $norm = Normalize-TokenKey -Value $id.Raw
                 if ($norm -and -not $seen.ContainsKey($norm)) {
                     $tok = Get-Token -Value $id.Raw -Prefix $id.Prefix
@@ -1763,6 +1774,7 @@ function New-ScrubTokenMap {
                     if (-not $seen[$norm].SourcePathHash) { $seen[$norm].SourcePathHash = $fileHash }
                 }
             }
+            Write-Progress -Activity "Discovering identifiers in $name" -Completed
         }
         Write-Detail "$hits new identifier(s) from $name"
     }
@@ -2193,7 +2205,7 @@ function Get-ScrubProfile {
 # =====================================================================
 # REGION: Local log format recommendations (no salt, no scrubbing)
 # =====================================================================
-function Test-GeneratedScrubArtifactName {
+function __ULS_Legacy_Test_GeneratedScrubArtifactName_2196 {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
     if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|scrub_run_manifest|corpus-manifest|external-corpus-summary)') { return $true }
@@ -2201,7 +2213,7 @@ function Test-GeneratedScrubArtifactName {
     return $false
 }
 
-function Resolve-LogRecommendationTargets {
+function __ULS_Legacy_Resolve_LogRecommendationTargets_2204 {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -2669,7 +2681,7 @@ function Get-LogCorpusCatalog {
     )
 }
 
-function Search-LogCorpusCatalog {
+function __ULS_Legacy_Search_LogCorpusCatalog_2672 {
     [CmdletBinding()]
     param(
         [string]$Query,
@@ -2743,7 +2755,7 @@ function Save-LogCorpusManifest {
     return $manifestPath
 }
 
-function Save-LogCorpusSample {
+function __ULS_Legacy_Save_LogCorpusSample_2746 {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -2892,8 +2904,11 @@ function Invoke-ExternalCorpusSmokeTest {
 
     $rows = @()
     $i = 0
+    $targetCount = @($targets).Count
     foreach ($t in $targets) {
         $i++
+        $pct = [int](($i / [Math]::Max($targetCount, 1)) * 100)
+        Write-Progress -Activity "External corpus smoke test" -Status "File $i of ${targetCount}: $($t.Name)" -PercentComplete $pct
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $rec = $null
         $mode = if ($DryRunOnly) { 'RecommendationAndDryRun' } else { 'RecommendationOnly' }
@@ -2944,6 +2959,7 @@ function Invoke-ExternalCorpusSmokeTest {
             Mode              = $mode
         }
     }
+    Write-Progress -Activity "External corpus smoke test" -Completed
 
     $summary = Write-ExternalCorpusSmokeTestSummary -Rows $rows -WorkDir $outRoot
     Write-Ok "External corpus summary CSV: $($summary.Csv)"
@@ -3037,7 +3053,7 @@ function Invoke-TokenizeWholeValue {
 
 # Per-field free-text hardening (the fuller set; safe because it runs on ONE cell,
 # not across the whole CSV). Every match routes through Get-Token.
-function Invoke-FreeTextHardening {
+function __ULS_Legacy_Invoke_FreeTextHardening_3040 {
     param([string]$ColumnName, [string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
     $out = $Value
@@ -3167,7 +3183,7 @@ function Scrub-Field {
 # =====================================================================
 # CSV-safe whole-file passes (value classes stop at quote/comma/space so they
 # never swallow a neighbouring column). Routes every match through Get-Token.
-function Invoke-LeakHardeningText {
+function __ULS_Legacy_Invoke_LeakHardeningText_3170 {
     param([Parameter(Mandatory)][string]$Text)
     $out = $Text
     $out = Invoke-SecretHardening -Text $out
@@ -3329,13 +3345,137 @@ function Test-ScrubbedForLeaks {
 # REGION: JSON adapter (values only -- keys are preserved)
 #   Walks a parsed JSON tree and tokenizes leaf STRING values through the same
 #   Scrub-Field path as CSV cells (so the JSON key acts as the column hint).
-#   Numbers / booleans / nulls and all keys pass through unchanged.
+#   Sensitive-key numeric values are tokenized conservatively; booleans / nulls
+#   and all keys pass through unchanged.
 # =====================================================================
 function Get-JsonNodeIdentity {
     param($Node)
     if ($null -eq $Node) { return $null }
     if ($Node -is [string] -or $Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal] -or $Node -is [datetime] -or $Node -is [guid]) { return $null }
     try { return [string][System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Node) } catch { return $null }
+}
+
+function Test-JsonNumericNode {
+    param($Node)
+    return (
+        $Node -is [byte] -or $Node -is [sbyte] -or
+        $Node -is [System.Int16] -or $Node -is [System.UInt16] -or
+        $Node -is [int] -or $Node -is [uint32] -or
+        $Node -is [long] -or $Node -is [uint64] -or
+        $Node -is [single] -or $Node -is [double] -or $Node -is [decimal]
+    )
+}
+
+function Get-JsonSensitiveNumericPrefix {
+    param([string]$KeyName)
+    if ([string]::IsNullOrWhiteSpace($KeyName)) { return $null }
+
+    $key = $KeyName.Trim()
+    if ($key -match '(?i)(?:time|timestamp|date|duration|elapsed|latency|count|size|bytes|statuscode|httpstatus|eventid|port|pid|processid|threadid|row|line|version|ttl|retry|retries|attempt|attempts|year|month|day|hour|minute|second|milliseconds|seconds|ms)$') {
+        return $null
+    }
+    if ($key -match '(?i)(^|[_\-.])(?:time|timestamp|date|duration|elapsed|latency|count|size|bytes|status|code|level|severity|eventid|event_id|port|pid|processid|threadid|row|line|version|httpstatus|http_status|ttl|retry|retries|attempt|attempts|year|month|day|hour|minute|second|ms|milliseconds|seconds)(?:$|[_\-.])') {
+        return $null
+    }
+    if ($key -match '(?i)(secret|password|passwd|pwd|token|api[_-]?key|key[_-]?id|credential)') { return 'SECRET' }
+    if ($key -match '(?i)(^|[_\-.])(?:ip|ipaddr|ipaddress|srcip|dstip|src_ip|dst_ip|source_ip|destination_ip|client_ip|remote_ip)(?:$|[_\-.])') { return 'IP' }
+    if ($key -match '(?i)(host|hostname|server|machine|device|asset|node|instance|ip|address)') { return 'DNS' }
+    if ($key -match '(?i)(user|account|principal|subject|actor|tenant|client|customer|owner|member|identity|person|employee)') { return 'PRINCIPAL' }
+    if ($key -match '(?i)(session|object|request|correlation|trace|span|transaction|resource|target)') { return 'OBJECT' }
+    return $null
+}
+
+function Invoke-JsonStringValueScrub {
+    param(
+        [string]$KeyName,
+        [string]$Value,
+        $Profile
+    )
+
+    $wholeRule = Get-MatchingProfileColumnRule -Profile $Profile -ColumnName $KeyName -RuleSet 'WholeColumnRules'
+    if ($wholeRule) {
+        return [string](Invoke-TokenizeWholeValue -ColumnName $KeyName -Value $Value -Prefix $wholeRule.Prefix -SplitOn $wholeRule.SplitOn)
+    }
+
+    $schemaRule = Get-MatchingProfileColumnRule -Profile $Profile -ColumnName $KeyName -RuleSet 'SchemaColumns'
+    if ($schemaRule -and $schemaRule.Action -eq 'Scrub') {
+        return [string](Invoke-TokenizeWholeValue -ColumnName $KeyName -Value $Value -Prefix $schemaRule.Prefix -SplitOn $schemaRule.SplitOn)
+    }
+
+    $scrubbed = [string](Scrub-Field -ColumnName $KeyName -Value $Value -Profile $Profile)
+    if ($scrubbed -ne $Value -or (Is-AlreadyToken -Value $scrubbed)) { return $scrubbed }
+
+    $fallbackPrefix = Get-JsonSensitiveNumericPrefix -KeyName $KeyName
+    if ($fallbackPrefix -and -not (Test-ScrubAllowlist -Value $Value)) {
+        return [string](Get-Token -Value $Value -Prefix $fallbackPrefix)
+    }
+
+    return $scrubbed
+}
+
+function Invoke-JsonSerializedKeyValueHardening {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)]$Profile,
+        $Changes
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+
+    $stringPattern = '(?<prefix>"(?<key>[A-Za-z0-9_.-]+)"\s*:\s*)"(?<value>[^"\\]*(?:\\.[^"\\]*)*)"'
+    $stringMatches = [System.Text.RegularExpressions.Regex]::Matches($Text, $stringPattern)
+    if ($stringMatches.Count -gt 0) {
+        $sb = New-Object System.Text.StringBuilder
+        $lastIndex = 0
+        foreach ($Match in $stringMatches) {
+            if ($Match.Index -gt $lastIndex) { [void]$sb.Append($Text.Substring($lastIndex, $Match.Index - $lastIndex)) }
+            $replacement = $Match.Value
+            $key = $Match.Groups['key'].Value
+            $value = $Match.Groups['value'].Value
+            if (-not ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($value) -or (Is-AlreadyToken -Value $value))) {
+                $scrubbed = Invoke-JsonStringValueScrub -KeyName $key -Value $value -Profile $Profile
+                if ($scrubbed -ne $value) {
+                    if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $key; Original = $value; Token = $scrubbed }) }
+                    $replacement = $Match.Groups['prefix'].Value + '"' + $scrubbed + '"'
+                }
+            }
+            [void]$sb.Append($replacement)
+            $lastIndex = $Match.Index + $Match.Length
+        }
+        if ($lastIndex -lt $Text.Length) { [void]$sb.Append($Text.Substring($lastIndex)) }
+        $hardened = $sb.ToString()
+    }
+    else {
+        $hardened = $Text
+    }
+
+    $numberPattern = '(?<prefix>"(?<key>[A-Za-z0-9_.-]+)"\s*:\s*)(?<value>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+    $numberMatches = [System.Text.RegularExpressions.Regex]::Matches($hardened, $numberPattern)
+    if ($numberMatches.Count -eq 0) { return $hardened }
+
+    $sb = New-Object System.Text.StringBuilder
+    $lastIndex = 0
+    foreach ($Match in $numberMatches) {
+        if ($Match.Index -gt $lastIndex) { [void]$sb.Append($hardened.Substring($lastIndex, $Match.Index - $lastIndex)) }
+        $replacement = $Match.Value
+        $key = $Match.Groups['key'].Value
+        $value = $Match.Groups['value'].Value
+        if (-not ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($value) -or (Is-AlreadyToken -Value $value))) {
+            $prefix = Get-JsonSensitiveNumericPrefix -KeyName $key
+            if ($prefix) {
+                $token = Get-Token -Value $value -Prefix $prefix
+                if ($token -ne $value) {
+                    if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $key; Original = $value; Token = $token }) }
+                    $replacement = $Match.Groups['prefix'].Value + '"' + $token + '"'
+                }
+            }
+        }
+        [void]$sb.Append($replacement)
+        $lastIndex = $Match.Index + $Match.Length
+    }
+    if ($lastIndex -lt $hardened.Length) { [void]$sb.Append($hardened.Substring($lastIndex)) }
+
+    return $sb.ToString()
 }
 
 function Invoke-JsonNodeScrub {
@@ -3356,11 +3496,21 @@ function Invoke-JsonNodeScrub {
     }
     if ($null -eq $Node) { return $null }
     if ($Node -is [string]) {
-        $s = Scrub-Field -ColumnName $KeyName -Value $Node -Profile $Profile
+        $s = Invoke-JsonStringValueScrub -KeyName $KeyName -Value $Node -Profile $Profile
         if ($Changes -and ($s -ne $Node)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $Node; Token = $s }) }
         return $s
     }
-    if ($Node -is [bool] -or $Node -is [int] -or $Node -is [long] -or $Node -is [double] -or $Node -is [decimal] -or $Node -is [datetime] -or $Node -is [guid]) { return $Node }
+    if (Test-JsonNumericNode -Node $Node) {
+        $numericPrefix = Get-JsonSensitiveNumericPrefix -KeyName $KeyName
+        if ($numericPrefix) {
+            $rawNumber = [System.Convert]::ToString($Node, [System.Globalization.CultureInfo]::InvariantCulture)
+            $token = Get-Token -Value $rawNumber -Prefix $numericPrefix
+            if ($Changes -and ($token -ne $rawNumber)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $rawNumber; Token = $token }) }
+            return $token
+        }
+        return $Node
+    }
+    if ($Node -is [bool] -or $Node -is [datetime] -or $Node -is [guid]) { return $Node }
 
     $id = Get-JsonNodeIdentity -Node $Node
     if ($id -and $Seen.ContainsKey($id)) {
@@ -3380,14 +3530,6 @@ function Invoke-JsonNodeScrub {
             return [pscustomobject]$newMap
         }
 
-        if (($Node -is [System.Collections.IEnumerable]) -and -not ($Node -is [string])) {
-            $arr = New-Object System.Collections.Generic.List[object]
-            foreach ($item in $Node) {
-                [void]$arr.Add((Invoke-JsonNodeScrub -Node $item -Profile $Profile -KeyName $KeyName -Changes $Changes -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen))
-            }
-            return ,@($arr.ToArray())
-        }
-
         $props = @()
         if ($Node.PSObject) { $props = @($Node.PSObject.Properties | Where-Object { $_.MemberType -eq 'NoteProperty' }) }
         if ($props.Count -gt 0) {
@@ -3396,6 +3538,14 @@ function Invoke-JsonNodeScrub {
                 $new[$p.Name] = Invoke-JsonNodeScrub -Node $p.Value -Profile $Profile -KeyName $p.Name -Changes $Changes -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen
             }
             return [pscustomobject]$new
+        }
+
+        if (($Node -is [System.Collections.IEnumerable]) -and -not ($Node -is [string])) {
+            $arr = New-Object System.Collections.Generic.List[object]
+            foreach ($item in $Node) {
+                [void]$arr.Add((Invoke-JsonNodeScrub -Node $item -Profile $Profile -KeyName $KeyName -Changes $Changes -Depth ($Depth + 1) -MaxDepth $MaxDepth -Seen $Seen))
+            }
+            return ,@($arr.ToArray())
         }
         return $Node
     }
@@ -3418,21 +3568,25 @@ function Invoke-ScrubJsonText {
         # One JSON object per line (NDJSON / JSON Lines).
         $sb = New-Object System.Text.StringBuilder
         foreach ($line in ($Text -split '\r?\n')) {
-            $trim = $line.Trim()
+            $trim = $line.Trim().TrimStart([char]0xFEFF)
             if ($trim -eq '') { continue }
             try {
                 $obj = $trim | ConvertFrom-Json -ErrorAction Stop
                 $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $Changes -MaxDepth $MaxDepth -Seen @{}
-                [void]$sb.AppendLine(($scrubbed | ConvertTo-Json -Depth $jsonDepth -Compress))
+                $lineOut = $scrubbed | ConvertTo-Json -Depth $jsonDepth -Compress
+                $lineOut = Invoke-JsonSerializedKeyValueHardening -Text $lineOut -Profile $Profile -Changes $Changes
+                [void]$sb.AppendLine($lineOut)
             }
             catch { [void]$sb.AppendLine((Invoke-LeakHardeningText -Text $line)) }
         }
         return $sb.ToString()
     }
     try {
-        $obj = $Text | ConvertFrom-Json -ErrorAction Stop
+        $jsonText = ([string]$Text).TrimStart([char]0xFEFF)
+        $obj = $jsonText | ConvertFrom-Json -ErrorAction Stop
         $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $Changes -MaxDepth $MaxDepth -Seen @{}
-        return ($scrubbed | ConvertTo-Json -Depth $jsonDepth)
+        $jsonOut = $scrubbed | ConvertTo-Json -Depth $jsonDepth
+        return (Invoke-JsonSerializedKeyValueHardening -Text $jsonOut -Profile $Profile -Changes $Changes)
     }
     catch {
         Write-Warn "Not valid JSON or JSON scrub failed; falling back to whole-text hardening. $($_.Exception.Message)"
@@ -4409,22 +4563,32 @@ function ConvertFrom-W3CToCsv {
     $fields = $null
     $rows = New-Object System.Collections.Generic.List[object]
     $reader = [System.IO.StreamReader]::new($LogPath)
+    $lineNo = 0
+    $dataRows = 0
     try {
         while (-not $reader.EndOfStream) {
             $line = $reader.ReadLine()
+            $lineNo++
             if ($null -eq $line) { break }
             if ($line.StartsWith('#')) {
                 if ($line -match '^#Fields:\s*(.+)$') { $fields = @($matches[1].Trim() -split '\s+') }
                 continue
             }
             if (-not $fields -or [string]::IsNullOrWhiteSpace($line)) { continue }
+            $dataRows++
+            if ($dataRows % 1000 -eq 0) {
+                Write-Progress -Activity "Converting W3C/IIS -> CSV: $([System.IO.Path]::GetFileName($LogPath))" -Status "$dataRows data rows read ($lineNo lines scanned)" -PercentComplete -1
+            }
             $vals = @($line -split '\s+')
             $obj = [ordered]@{}
             for ($i = 0; $i -lt $fields.Count; $i++) { $obj[$fields[$i]] = if ($i -lt $vals.Count) { $vals[$i] } else { '' } }
             $rows.Add([pscustomobject]$obj)
         }
     }
-    finally { $reader.Close() }
+    finally {
+        $reader.Close()
+        Write-Progress -Activity "Converting W3C/IIS -> CSV: $([System.IO.Path]::GetFileName($LogPath))" -Completed
+    }
     $out = Resolve-OutPath -Path $OutCsv
     if ($rows.Count -gt 0) { $rows | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8 }
     else { [pscustomobject]@{ Note = 'No data rows / no #Fields header found.' } | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8 }
@@ -4775,7 +4939,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.12 -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.13 -- SELF-TEST" "Synthetic data only; no real logs touched."
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -4787,6 +4951,19 @@ function Invoke-ScrubSelfTest {
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("scrubtest_" + ([System.IO.Path]::GetRandomFileName().Replace('.', '')))
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     try {
+        # ---- 0) Static module guardrails ----
+        Write-Rule "Module guardrails"
+        $modulePath = $null
+        try { if ($MyInvocation.MyCommand.Module -and $MyInvocation.MyCommand.Module.Path) { $modulePath = $MyInvocation.MyCommand.Module.Path } } catch { }
+        if (-not $modulePath) { $modulePath = $PSCommandPath }
+        & $assert ((Split-Path -Leaf $modulePath) -eq 'UniversalLogScrubber_v4_13.psm1') "self-test is running against the v4.13 module file"
+        $moduleText = if ($modulePath -and (Test-Path -LiteralPath $modulePath)) { [System.IO.File]::ReadAllText($modulePath) } else { '' }
+        $guardTokens = $null; $guardErrors = $null
+        $guardAst = [System.Management.Automation.Language.Parser]::ParseInput($moduleText, [ref]$guardTokens, [ref]$guardErrors)
+        & $assert ($guardErrors.Count -eq 0) "module parses without static errors"
+        $duplicateFunctions = @($guardAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Group-Object Name | Where-Object { $_.Count -gt 1 })
+        & $assert ($duplicateFunctions.Count -eq 0) "module has no duplicate function definitions"
+
         # ---- 1) Local recommendation mode (no salt required) ----
         Write-Rule "Log format recommendations"
         $recDir = Join-Path $dir 'recommendations'
@@ -4928,7 +5105,28 @@ function Invoke-ScrubSelfTest {
         & $assert ($dh -match 'download\.microsoft\.com') "detector kept allowlisted domain"
         & $assert ($dh -match '1\.3\.6\.1\.4\.1\.311\.20\.2\.2') "detector kept OID"
 
-        # ---- 3) Windows Event false-positive regression ----
+        # ---- 3) v4.13 JSON numeric and connection URI regression ----
+        Write-Rule "v4.13 JSON numeric and connection URI detection"
+        & $reset
+        $jsonNumeric = '{"userId":123456,"traceId":987654,"count":5,"statusCode":200,"serverPort":443,"ok":true}'
+        $jsonNumericOut = Invoke-ScrubJsonText -Text $jsonNumeric -Profile (Get-ScrubProfile -Name Generic)
+        $jsonNumericObj = $jsonNumericOut | ConvertFrom-Json
+        & $assert ([string]$jsonNumericObj.userId -match '^PRINCIPAL_[A-F0-9]+$') "JSON sensitive numeric userId is scrubbed"
+        & $assert ([string]$jsonNumericObj.traceId -match '^OBJECT_[A-F0-9]+$') "JSON sensitive numeric traceId is scrubbed"
+        & $assert ([int]$jsonNumericObj.count -eq 5) "JSON benign count number is preserved"
+        & $assert ([int]$jsonNumericObj.statusCode -eq 200) "JSON benign statusCode number is preserved"
+        & $assert ([int]$jsonNumericObj.serverPort -eq 443) "JSON benign serverPort number is preserved"
+
+        $conn = 'jdbc:postgresql://appuser@db01.corp.local:5432/app redis://cache01.corp.local:6379/0 wss://gateway.corp.local/socket kafka://broker01.corp.local:9092'
+        $connOut = Invoke-FreeTextHardening -ColumnName 'connectionString' -Value $conn
+        foreach ($gone in @('db01.corp.local','cache01.corp.local','gateway.corp.local','broker01.corp.local')) {
+            & $assert (-not ($connOut -match [regex]::Escape($gone))) "connection URI host removed: $gone"
+        }
+        foreach ($scheme in @('jdbc:postgresql://','redis://','wss://','kafka://')) {
+            & $assert ($connOut -match [regex]::Escape($scheme)) "connection URI scheme preserved: $scheme"
+        }
+
+        # ---- 4) Windows Event false-positive regression ----
         Write-Rule "Windows Event balanced readability"
         $script:ScrubPolicy = 'Balanced'
         & $reset
@@ -4942,7 +5140,7 @@ function Invoke-ScrubSelfTest {
         }
         & $assert ($wh -match '\\\?\\C:\\WINDOWS\\LiveKernelReports\\WHEA\\') "WindowsEvent path separators preserved"
 
-        # ---- 4) BYOP schema v2 and universal detection ----
+        # ---- 5) BYOP schema v2 and universal detection ----
         Write-Rule "BYOP schema v2 and universal detection"
         $script:ScrubPolicy = 'Balanced'
         & $reset
@@ -5257,20 +5455,29 @@ function Invoke-ScrubFile {
     }
     elseif ($format -eq 'Kv') {
         Write-Work "Scrubbing (key=value, profile '$($Profile.Name)'): $name"
+        Write-Progress -Activity "Scrubbing $name" -Status "Reading key=value content" -PercentComplete 10
         $text = [System.IO.File]::ReadAllText($InputPath)
+        Write-Progress -Activity "Scrubbing $name" -Status "Scrubbing key=value values" -PercentComplete 35
         $text = Invoke-KvValueOnlyText -Text $text
+        Write-Progress -Activity "Scrubbing $name" -Status "Running whole-file hardening" -PercentComplete 70
         $text = Invoke-LeakHardeningText -Text $text
+        Write-Progress -Activity "Scrubbing $name" -Status "Applying explicit sensitive terms" -PercentComplete 85
         $text = Protect-SensitiveTerms -Text $text -SensitiveTerms $SensitiveTerms
         [System.IO.File]::WriteAllText($outFull, $text, [System.Text.Encoding]::UTF8)
+        Write-Progress -Activity "Scrubbing $name" -Completed
         Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
     }
     else {
         Write-Work "Scrubbing (text, profile '$($Profile.Name)'): $name"
+        Write-Progress -Activity "Scrubbing $name" -Status "Reading text content" -PercentComplete 10
         $text = [System.IO.File]::ReadAllText($InputPath)
         Write-Detail "Input size: $($text.Length) characters"
+        Write-Progress -Activity "Scrubbing $name" -Status "Running whole-file hardening" -PercentComplete 60
         $text = Invoke-LeakHardeningText -Text $text
+        Write-Progress -Activity "Scrubbing $name" -Status "Applying explicit sensitive terms" -PercentComplete 85
         $text = Protect-SensitiveTerms -Text $text -SensitiveTerms $SensitiveTerms
         [System.IO.File]::WriteAllText($outFull, $text, [System.Text.Encoding]::UTF8)
+        Write-Progress -Activity "Scrubbing $name" -Completed
         Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
     }
 
@@ -5326,7 +5533,7 @@ function Write-RunManifest {
         }
     }
     $manifest = [pscustomobject]@{
-        tool            = "UniversalLogScrubber_v4_12.psm1"
+        tool            = "UniversalLogScrubber_v4_13.psm1"
         schemaVersion   = "4.12"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
@@ -5401,7 +5608,7 @@ function Invoke-UniversalScrubber {
     $script:DetectionTraceSeen = @{}
     $script:DetectionCounts = @{}
 
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.12" "Token-map first, then scrub. Nothing leaves until it's clean."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.13" "Token-map first, then scrub. Nothing leaves until it's clean."
     if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
     if ($SafeFirstRun) { Write-Info "SAFE FIRST RUN mode -- local sample analysis only." }
     if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
@@ -5784,7 +5991,7 @@ function Invoke-UniversalScrubber {
     return $results
 }
 
-# BEGIN ULS v4.12 current-version bugfixes: detection review, corpus filtering, LogHub online
+# BEGIN ULS v4.13 current-version bugfixes: detection review, corpus filtering, LogHub online
 
 # Override: broader generated/local artifact exclusion used by recommendations, smoke tests, and folder scrubs.
 function Test-GeneratedScrubArtifactName {
@@ -5795,7 +6002,7 @@ function Test-GeneratedScrubArtifactName {
     return $false
 }
 
-function Test-PreserveNonSensitiveDottedArtifactName {
+function __ULS_Legacy_Test_PreserveNonSensitiveDottedArtifactName_5798 {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
 
@@ -5877,7 +6084,7 @@ function Test-PreserveNonSensitiveDottedArtifactName {
 }
 
 # Override: DNS/FQDN preservation now keeps obvious local dotted artifacts in Balanced/Readable.
-function Test-PreserveDetectedValue {
+function __ULS_Legacy_Test_PreserveDetectedValue_5880 {
     param(
         [string]$Value,
         [string]$Detector,
@@ -5909,7 +6116,7 @@ function Test-PreserveDetectedValue {
 }
 
 # Override: shape fallback should not classify obvious local dotted artifact names as DNS.
-function Get-ValueShapePrefix {
+function __ULS_Legacy_Get_ValueShapePrefix_5912 {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
     $v = $Value.Trim()
@@ -6018,7 +6225,7 @@ function New-LogHubOnlineCatalogEntry {
     }
 }
 
-function Get-LogHubOnlineCatalog {
+function __ULS_Legacy_Get_LogHubOnlineCatalog_6021 {
     [CmdletBinding()]
     param(
         [string]$Dataset,
@@ -6031,7 +6238,7 @@ function Get-LogHubOnlineCatalog {
         return @($cached | Where-Object { $_.Dataset -like "*$Dataset*" })
     }
 
-    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.12' }
+    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.13' }
     $rootUri = 'https://api.github.com/repos/logpai/loghub/contents'
     try {
         $root = @(Invoke-RestMethod -Uri $rootUri -Headers $headers -ErrorAction Stop)
@@ -6276,9 +6483,9 @@ function Save-LogCorpusSample {
     }
 }
 
-# END ULS v4.12 current-version bugfixes
+# END ULS v4.13 current-version bugfixes
 
-# BEGIN ULS v4.12 hotfix: LogHub online flattening and positive detection review rows
+# BEGIN ULS v4.13 hotfix: LogHub online flattening and positive detection review rows
 # Current-version bugfix only: no version/banner/schema bump.
 
 function ConvertTo-UlsFlatArray {
@@ -6333,7 +6540,7 @@ function Get-LogHubOnlineCatalog {
         return @($cached | Where-Object { $_.Dataset -like "*$Dataset*" })
     }
 
-    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.12' }
+    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.13' }
     $rootUri = 'https://api.github.com/repos/logpai/loghub/contents'
 
     try {
@@ -6385,7 +6592,7 @@ function Get-LogHubOnlineCatalog {
 }
 
 # Override: return detector/reason metadata and add Tokenized trace rows for positive dry-run detections.
-function Find-Identifiers {
+function __ULS_Legacy_Find_Identifiers_6388 {
     param([Parameter(Mandatory)][string]$Text)
 
     $found = @{}   # normalizedKey -> identifier object
@@ -6487,11 +6694,11 @@ function Find-Identifiers {
     return @($found.Values)
 }
 
-# END ULS v4.12 hotfix: LogHub online flattening and positive detection review rows
+# END ULS v4.13 hotfix: LogHub online flattening and positive detection review rows
 
 
 
-# BEGIN ULS v4.12 OpenSSH corpus hardening hotfix
+# BEGIN ULS v4.13 OpenSSH corpus hardening hotfix
 # Addresses common sshd/syslog free-text forms that are not label:value pairs:
 #   - syslog emitter hostname after timestamp (for example: "Dec 10 06:55:46 LabSZ sshd[...]")
 #   - OpenSSH authentication usernames in prose (Invalid user, Failed password for ...)
@@ -6499,13 +6706,13 @@ function Find-Identifiers {
 # This is heuristic/contextual matching, not a static allowlist or static denylist.
 
 if (-not (Get-Variable -Name __ULS_FindIdentifiers_BeforeOpenSsh -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_FindIdentifiers_BeforeOpenSsh = ${function:Find-Identifiers}
+    $script:__ULS_FindIdentifiers_BeforeOpenSsh = ${function:__ULS_Legacy_Find_Identifiers_6388}
 }
 if (-not (Get-Variable -Name __ULS_InvokeFreeTextHardening_BeforeOpenSsh -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_InvokeFreeTextHardening_BeforeOpenSsh = ${function:Invoke-FreeTextHardening}
+    $script:__ULS_InvokeFreeTextHardening_BeforeOpenSsh = ${function:__ULS_Legacy_Invoke_FreeTextHardening_3040}
 }
 if (-not (Get-Variable -Name __ULS_InvokeLeakHardeningText_BeforeOpenSsh -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh = ${function:Invoke-LeakHardeningText}
+    $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh = ${function:__ULS_Legacy_Invoke_LeakHardeningText_3170}
 }
 
 function Test-UlsOpenSshLogText {
@@ -6697,16 +6904,9 @@ function Invoke-LeakHardeningText {
     return [string](& $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh -Text $pre)
 }
 
-# END ULS v4.12 OpenSSH corpus hardening hotfix
-Export-ModuleMember -Function `
-    Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
-    Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
-    Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
-    ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
-    Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
-    Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
+# END ULS v4.13 OpenSSH corpus hardening hotfix
 
-# BEGIN ULS v4.12 hotfix: LogHub mass-corpus dotted/label FP preservation
+# BEGIN ULS v4.13 hotfix: LogHub mass-corpus dotted/label FP preservation
 # Current-version bugfix only: no version/banner/schema bump.
 #
 # Purpose:
@@ -6723,7 +6923,7 @@ Export-ModuleMember -Function `
 #   - Network/identity/path forms are not globally preserved here.
 #   - Real rhost/reverse-DNS/proxy destination domains remain tokenized unless existing allowlists preserve them.
 
-function Test-PreserveNonSensitiveDottedArtifactName {
+function __ULS_Legacy_Test_PreserveNonSensitiveDottedArtifactName_6726 {
     param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
@@ -6793,7 +6993,7 @@ function Test-PreserveNonSensitiveDottedArtifactName {
     return $false
 }
 
-function Test-PreserveLikelyBenignUniversalLabelValue {
+function __ULS_Legacy_Test_PreserveLikelyBenignUniversalLabelValue_6796 {
     param(
         [string]$Value,
         [string]$Detector,
@@ -6833,7 +7033,7 @@ function Test-PreserveLikelyBenignUniversalLabelValue {
     return $false
 }
 
-function Test-PreserveLikelyBenignSecretValue {
+function __ULS_Legacy_Test_PreserveLikelyBenignSecretValue_6836 {
     param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
@@ -6848,7 +7048,7 @@ function Test-PreserveLikelyBenignSecretValue {
     return $false
 }
 
-function Test-PreserveLikelyBenignBase64FalsePositive {
+function __ULS_Legacy_Test_PreserveLikelyBenignBase64FalsePositive_6851 {
     param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
@@ -6863,7 +7063,7 @@ function Test-PreserveLikelyBenignBase64FalsePositive {
     return $false
 }
 
-function Test-PreserveDetectedValue {
+function __ULS_Legacy_Test_PreserveDetectedValue_6866 {
     param(
         [string]$Value,
         [string]$Detector,
@@ -6904,7 +7104,7 @@ function Test-PreserveDetectedValue {
     return $false
 }
 
-function Get-ValueShapePrefix {
+function __ULS_Legacy_Get_ValueShapePrefix_6907 {
     param([string]$Value)
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
@@ -6926,12 +7126,12 @@ function Get-ValueShapePrefix {
     return $null
 }
 
-# END ULS v4.12 hotfix: LogHub mass-corpus dotted/label FP preservation
+# END ULS v4.13 hotfix: LogHub mass-corpus dotted/label FP preservation
 
-# BEGIN ULS v4.12 hotfix: LogHub mass-corpus FP preservation round 2
+# BEGIN ULS v4.13 hotfix: LogHub mass-corpus FP preservation round 2
 # Current-version bugfix only: no version/banner/schema bump.
 #
-# This later override intentionally shadows the earlier v4.12 preservation helpers.
+# This later override intentionally shadows the earlier v4.13 preservation helpers.
 # It keeps real network/privacy-bearing values tokenized while preserving common
 # local diagnostic symbols that only look like DNS/FQDNs because they are dotted.
 
@@ -7104,7 +7304,7 @@ function Test-PreserveLikelyBenignBase64FalsePositive {
     return $false
 }
 
-function Test-PreserveDetectedValue {
+function __ULS_Legacy_Test_PreserveDetectedValue_7107 {
     param(
         [string]$Value,
         [string]$Detector,
@@ -7167,22 +7367,22 @@ function Get-ValueShapePrefix {
     return $null
 }
 
-# END ULS v4.12 hotfix: LogHub mass-corpus FP preservation round 2
+# END ULS v4.13 hotfix: LogHub mass-corpus FP preservation round 2
 
-# BEGIN ULS v4.12 LogHub mass false-positive preserve round 3
+# BEGIN ULS v4.13 LogHub mass false-positive preserve round 3
 # Current-version corpus hardening only: no version/banner/schema bump.
 # This pass suppresses low-signal LogHub false positives found after the Java/ZooKeeper
 # and broad dotted-artifact preservation passes, while keeping real network/identity
 # identifiers tokenized.
 
 if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_TestPreserveDetectedValue_BeforeLogHubRound3 = ${function:Test-PreserveDetectedValue}
+    $script:__ULS_TestPreserveDetectedValue_BeforeLogHubRound3 = ${function:__ULS_Legacy_Test_PreserveDetectedValue_7107}
 }
 if (-not (Get-Variable -Name __ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 = ${function:Find-UniversalLabeledIdentifiers}
+    $script:__ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 = ${function:__ULS_Legacy_Find_UniversalLabeledIdentifiers_1040}
 }
 if (-not (Get-Variable -Name __ULS_FindSecretIdentifiers_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_FindSecretIdentifiers_BeforeLogHubRound3 = ${function:Find-SecretIdentifiers}
+    $script:__ULS_FindSecretIdentifiers_BeforeLogHubRound3 = ${function:__ULS_Legacy_Find_SecretIdentifiers_1204}
 }
 
 function Test-UlsRound3LowSignalUniversalLabel {
@@ -7276,7 +7476,7 @@ function Test-UlsRound3PreserveDetectedValue {
     return $false
 }
 
-function Test-PreserveDetectedValue {
+function __ULS_Legacy_Test_PreserveDetectedValue_7279 {
     param(
         [string]$Value,
         [string]$Detector,
@@ -7344,9 +7544,9 @@ function Find-SecretIdentifiers {
     return @($out.ToArray())
 }
 
-# END ULS v4.12 LogHub mass false-positive preserve round 3
+# END ULS v4.13 LogHub mass false-positive preserve round 3
 
-# BEGIN ULS v4.12 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
+# BEGIN ULS v4.13 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
 # Current-version bugfix only: no version/banner/schema bump.
 #
 # Some macOS/corecaptured/kernel lines contain C++/IOKit scope operators such as:
@@ -7359,7 +7559,7 @@ function Find-SecretIdentifiers {
 # preserve those when the match is embedded in an alphanumeric symbol context.
 # Real standalone IPv6 addresses continue through the previous detector logic.
 if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeIpv6ScopeRound4 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_TestPreserveDetectedValue_BeforeIpv6ScopeRound4 = ${function:Test-PreserveDetectedValue}
+    $script:__ULS_TestPreserveDetectedValue_BeforeIpv6ScopeRound4 = ${function:__ULS_Legacy_Test_PreserveDetectedValue_7279}
 }
 
 function Test-UlsScopeOperatorIpv6FalsePositive {
@@ -7433,4 +7633,12 @@ function Test-PreserveDetectedValue {
         -Length $Length)
 }
 
-# END ULS v4.12 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
+# END ULS v4.13 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
+
+Export-ModuleMember -Function `
+    Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
+    Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
+    Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
+    ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
+    Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
+    Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog

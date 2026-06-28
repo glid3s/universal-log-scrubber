@@ -107,7 +107,7 @@ Search-LogCorpusCatalog -Online -Dataset Zookeeper |
 Get the full online catalog:
 
 ```powershell
-Get-LogCorpusCatalog -Online -Refresh |
+Search-LogCorpusCatalog -Online -Refresh |
   Select-Object Name,Dataset,FileName,SuggestedProfile,ApproxSize |
   Format-Table -AutoSize
 ```
@@ -123,8 +123,9 @@ Typical result fields include:
 | `FileName`         | The source file name in the corpus.                                     |
 | `SuggestedProfile` | The scrubber profile that is likely appropriate for the file.           |
 | `ApproxSize`       | Approximate file size when available.                                   |
-| `SourceUrl`        | The raw download URL or source location.                                |
-| `Provider`         | The corpus provider, such as LogHub.                                    |
+| `DownloadUrl`      | The raw download URL, when a direct download is available.              |
+| `HtmlUrl`          | The source browser URL for online LogHub entries.                       |
+| `Source`           | The corpus provider, such as LogHub.                                    |
 
 The suggested profile is a convenience hint. It is not a safety guarantee. You can override the profile during testing.
 
@@ -158,7 +159,7 @@ Then save the selected entry:
 ```powershell
 Save-LogCorpusSample `
   -Online `
-  -Name "LogHub-Apache-Apache_2k.log" `
+  -Name "Loghub-Apache-Apache_2k" `
   -Destination "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
   -AcceptRisk
 ```
@@ -183,8 +184,6 @@ Save-LogCorpusSample `
 Supported extraction behavior may include:
 
 * `.zip`
-* single-file `.gz`
-* `.tar`
 * `.tgz`
 * `.tar.gz`, when `tar.exe` is available
 
@@ -201,11 +200,13 @@ $corpusRoot = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\e
 $outRoot = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\external-corpus-results"
 
 Invoke-ExternalCorpusSmokeTest `
-  -Path $corpusRoot `
-  -Destination $outRoot `
+  -CorpusRoot $corpusRoot `
+  -WorkDir $outRoot `
   -Salt "external-corpus-preview-only" `
-  -Profile Text `
-  -Recurse
+  -UseRecommendations `
+  -DryRunOnly `
+  -Recurse `
+  -NonInteractive
 ```
 
 The smoke test writes local summary files such as:
@@ -316,12 +317,12 @@ Search-LogCorpusCatalog -Online -Dataset Apache |
 
 Save-LogCorpusSample `
   -Online `
-  -Name "LogHub-Apache-Apache_2k.log" `
+  -Name "Loghub-Apache-Apache_2k" `
   -Destination "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
   -AcceptRisk
 
-$apacheLog = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora\LogHub-Apache\Apache_2k.log"
-$work = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\external-corpus-results\LogHub-Apache-review"
+$apacheLog = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora\Loghub-Apache-Apache_2k\Apache_2k.log"
+$work = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\external-corpus-results\Loghub-Apache-review"
 
 Invoke-UniversalScrubber `
   -Path $apacheLog `
@@ -381,11 +382,11 @@ Wait and retry, or use static catalog entries when possible.
 
 ### A downloaded file is not the log I expected
 
-Run the search again and inspect the returned `Name`, `Dataset`, `FileName`, and `SourceUrl`.
+Run the search again and inspect the returned `Name`, `Dataset`, `FileName`, and `DownloadUrl`.
 
 ```powershell
 Search-LogCorpusCatalog -Online -Dataset Apache |
-  Select-Object Name,Dataset,FileName,SourceUrl |
+  Select-Object Name,Dataset,FileName,DownloadUrl |
   Format-List
 ```
 
@@ -400,7 +401,7 @@ Preservation rows are useful because they explain why values such as local diagn
 The report should be deduplicated by detector, action, value, token, reason, and column. If duplicates appear, rerun the latest module and confirm self-tests pass:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
 Invoke-ScrubSelfTest
 ```
 
@@ -412,8 +413,8 @@ For the current PowerShell session only:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-Unblock-File .\src\UniversalLogScrubber_v4_12.psm1
-Import-Module .\src\UniversalLogScrubber_v4_12.psm1 -Force
+Unblock-File .\src\UniversalLogScrubber_v4_13.psm1
+Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
 ```
 
 ## What good output looks like

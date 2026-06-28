@@ -1,5 +1,22 @@
 # Changelog
 
+## v4.13
+
+- Bumped the versioned module and launcher names to v4.13.
+- Consolidated duplicate hotfix override functions and moved module exports to
+  the true end of the module.
+- Added conservative JSON numeric scrubbing for sensitive-looking keys while
+  preserving benign counts, ports, status codes, timings, sizes, and versions.
+- Expanded connection URI host detection for JDBC, database, cache, queue,
+  Kafka, and WS/WSS-style schemes.
+- Added progress feedback for external corpus smoke tests, W3C conversion,
+  large text/KV discovery, and normal text/KV scrubbing phases.
+- Added offline static guardrails for stale version references, documented
+  command examples, exported command signatures, parse errors, and duplicate
+  function definitions.
+- Corrected external corpus documentation and refreshed v4.13 workflow and PR
+  testing references.
+
 ## v4.12
 
 - Added a curated external corpus catalog via `Get-LogCorpusCatalog` and
@@ -11,7 +28,7 @@
 - Added `scripts\Get-SampleLogs.ps1` as a friendly catalog/search/save wrapper.
 - Ignored `samples/external-corpora/` and `external-corpus-results/` so public
   corpora and smoke-test outputs do not get committed.
-- Bumped the versioned module and launcher names to v4.12.
+- Bumped the versioned module and launcher names to v4.13.
 
 ## v4.11
 

@@ -24,9 +24,10 @@ Describe what changed and why.
 Paste the commands you ran:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_10.psm1 -Force
+Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
 Invoke-ScrubSelfTest
 .\scripts\Test-SampleLogs.ps1
+.\scripts\Test-StaticChecks.ps1
 ```
 
 ## Notes for reviewers
