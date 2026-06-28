@@ -141,7 +141,7 @@ $root = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\externa
 
 Save-LogCorpusSample `
   -Name Loghub-Apache `
-  -OutputDirectory $root `
+  -Destination $root `
   -AcceptRisk
 ```
 
@@ -159,7 +159,7 @@ Then save the selected entry:
 Save-LogCorpusSample `
   -Online `
   -Name "LogHub-Apache-Apache_2k.log" `
-  -OutputDirectory "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
+  -Destination "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
   -AcceptRisk
 ```
 
@@ -175,7 +175,7 @@ Use `-ExtractArchive` when you want the helper to extract supported archive form
 Save-LogCorpusSample `
   -Online `
   -Name "LogHub-SomeDataset-SomeArchive.zip" `
-  -OutputDirectory "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
+  -Destination "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
   -AcceptRisk `
   -ExtractArchive
 ```
@@ -202,7 +202,7 @@ $outRoot = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\external-cor
 
 Invoke-ExternalCorpusSmokeTest `
   -Path $corpusRoot `
-  -OutputDirectory $outRoot `
+  -Destination $outRoot `
   -Salt "external-corpus-preview-only" `
   -Profile Text `
   -Recurse
@@ -317,7 +317,7 @@ Search-LogCorpusCatalog -Online -Dataset Apache |
 Save-LogCorpusSample `
   -Online `
   -Name "LogHub-Apache-Apache_2k.log" `
-  -OutputDirectory "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
+  -Destination "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora" `
   -AcceptRisk
 
 $apacheLog = "C:\Users\$env:USERNAME\Documents\Universal Log Scrubber\samples\external-corpora\LogHub-Apache\Apache_2k.log"
