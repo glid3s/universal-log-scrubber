@@ -24,6 +24,7 @@ output/
 outputs/
 scrubbed/
 converted/
+logs/
 
 # Keep intentional sample logs tracked
 
@@ -40,6 +41,9 @@ external-corpus-results/
 repo-improvements/
 wiki-pages*/
 universal-log-scrubber-*.zip
+UniversalLogScrubber-*.zip
+release/
+*.nupkg
 
 # PowerShell / local tooling
 
@@ -62,3 +66,7 @@ Thumbs.db
 
 .agents/
 .codex/
+
+# Maintainer-only local release tooling
+
+maintainer-tools/

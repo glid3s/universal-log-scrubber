@@ -7,7 +7,7 @@ events can still be correlated without exposing the original identifiers.
 
 It works offline against Windows Event exports, EVTX files, CSV/TSV/PSV,
 JSON/NDJSON, IIS/W3C, web access/proxy logs, key=value/logfmt/CEF-style logs,
-syslog, and mixed diagnostic text. Version 4.13 adds stability fixes, stronger
+syslog, and mixed diagnostic text. Version 4.13.0 adds stability fixes, stronger
 offline guardrails, improved progress feedback, and optional public corpus
 testing on top of the v4.11 local recommendation workflow.
 
@@ -32,10 +32,10 @@ Private artifacts include:
 Open PowerShell in the repository root:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
 Invoke-ScrubSelfTest
 
-.\scripts\Run-UniversalScrubber_v4_13.ps1 `
+.\scripts\Run-UniversalScrubber.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `
@@ -76,7 +76,7 @@ run with `-Profile` explicitly.
 
 ## External Corpus Testing
 
-v4.13 includes an optional catalog for public log corpora. Downloads never run
+v4.13.0 includes an optional catalog for public log corpora. Downloads never run
 automatically, public corpora are not committed to the repo, and GitHub Actions
 does not depend on external network access. Treat public corpora as raw,
 unsanitized, realistic, possibly offensive, and license-restricted.
@@ -98,7 +98,7 @@ Invoke-ExternalCorpusSmokeTest `
 ```
 
 External samples default to `.\samples\external-corpora`, which is ignored by
-git. Use `-Destination` when you want to keep corpora elsewhere. v4.13 smoke
+git. Use `-Destination` when you want to keep corpora elsewhere. v4.13.0 smoke
 tests only support recommendation checks and dry-run scrubs; they do not perform
 real external-corpus scrubbing.
 
@@ -109,7 +109,7 @@ sample. It will create an editable BYOP profile without storing raw sample
 values in the profile.
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_13.ps1 `
+.\scripts\Run-UniversalScrubber.ps1 `
   -BuildProfileFromSample `
   -Path C:\logs\sample.log `
   -WorkDir C:\profiles `
@@ -121,7 +121,7 @@ values in the profile.
 Then preview with the generated profile:
 
 ```powershell
-.\scripts\Run-UniversalScrubber_v4_13.ps1 `
+.\scripts\Run-UniversalScrubber.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -ProfileFile C:\profiles\generated-profile.json `
@@ -157,8 +157,14 @@ domains, and common built-in Windows accounts are preserved where that is safer
 and more readable. You can add your own allowlist values in a profile or
 `-AllowlistFile`.
 
-## v4.13 Highlights
+## v4.13.0 Highlights
 
+- Stable package layout: `UniversalLogScrubber\UniversalLogScrubber.psd1`
+  imports the unversioned `UniversalLogScrubber.psm1`.
+- `Invoke-UniversalScrubber -Version` and `Invoke-UniversalLogScrubber -Version`
+  report the installed module version and paths without prompting for run input.
+- ULS-prefixed aliases are exported for discoverability while existing command
+  names remain canonical.
 - Duplicate hotfix override functions were consolidated and exports now sit at
   the true end of the module.
 - JSON numeric scrubbing is now conservative but safer for sensitive-looking
@@ -167,9 +173,6 @@ and more readable. You can add your own allowlist values in a profile or
   WS/WSS-style schemes.
 - External corpus smoke tests, W3C conversion, large text/KV discovery, and
   text/KV scrubbing phases now provide progress feedback.
-- `scripts\Test-StaticChecks.ps1` validates stale version refs, documented
-  command examples, exported command signatures, parse errors, and duplicate
-  function definitions without network access.
 - `Get-LogCorpusCatalog` and `Search-LogCorpusCatalog` describe curated public
   corpus sources without network access.
 - `Save-LogCorpusSample` downloads only direct samples and only after
@@ -194,27 +197,30 @@ and more readable. You can add your own allowlist values in a profile or
 ## Repository Layout
 
 ```text
-src/            PowerShell module
-scripts/        runnable launcher
-docs/           security and operational notes
-docs/profiles/  BYOP handbook and ready-to-edit profile examples
-.github/        CI self-test workflow
+UniversalLogScrubber/  module manifest and script module
+scripts/               launcher, sample log downloader, and sample tests
+docs/                  security and operational notes
+docs/profiles/         BYOP handbook and ready-to-edit profile examples
+.github/               CI self-test workflow
 ```
 
 ## Validation
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+Test-ModuleManifest .\UniversalLogScrubber\UniversalLogScrubber.psd1
+Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
+Invoke-UniversalScrubber -Version
+Invoke-UniversalLogScrubber -Version
 Test-LogFormat -Path .\samples\logs -Recurse
 Invoke-UniversalScrubber -Path .\samples\logs -Recurse -RecommendOnly -NonInteractive
 Invoke-UniversalScrubber -Path .\samples\logs -Recurse -SafeFirstRun -NonInteractive
 Get-LogCorpusCatalog
 Search-LogCorpusCatalog -Query apache
 Invoke-ScrubSelfTest
+Invoke-ULSScrubSelfTest
 .\scripts\Test-SampleLogs.ps1
-.\scripts\Test-StaticChecks.ps1
 
-.\scripts\Run-UniversalScrubber_v4_13.ps1 `
+.\scripts\Run-UniversalScrubber.ps1 `
   -Path C:\logs `
   -WorkDir C:\scrubbed-preview `
   -SaltFromEnv SCRUB_SALT `

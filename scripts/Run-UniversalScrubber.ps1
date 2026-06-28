@@ -3,25 +3,25 @@
   Launcher for the Universal Log Scrubber. Just run it.
 
 .DESCRIPTION
-  Imports the matching UniversalLogScrubber_*.psm1 (derived from THIS launcher's
-  own filename, so the .ps1 and .psm1 versions can never drift apart) and starts
-  the interactive, hand-held scrubbing flow. Any switch you pass is forwarded;
+  Imports the packaged UniversalLogScrubber module and starts the interactive,
+  hand-held scrubbing flow. Any switch you pass is forwarded;
   anything still required is prompted for.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_13.ps1
+  .\Run-UniversalScrubber.ps1
   # Fully interactive.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_13.ps1 -Path C:\winlogs\Security.evtx
+  .\Run-UniversalScrubber.ps1 -Path C:\winlogs\Security.evtx
   # Auto-converts the .evtx to CSV, then scrubs it.
 
 .EXAMPLE
-  .\Run-UniversalScrubber_v4_13.ps1 -Path C:\logs -DryRun -ExplainDetections
+  .\Run-UniversalScrubber.ps1 -Path C:\logs -DryRun -ExplainDetections
   # Preview what WOULD be tokenized -- writes nothing.
 #>
 [CmdletBinding()]
 param(
+    [switch]$Version,
     [string]$Path,
     [string]$WorkDir,
     [switch]$RecommendOnly,
@@ -66,32 +66,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Derive the module name from THIS launcher's own name:
-#   Run-UniversalScrubber_v4_13.ps1  ->  UniversalLogScrubber_v4_13.psm1
-$myBase = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
-$suffix = ''
-if ($myBase -match '^Run-UniversalScrubber(.*)$') { $suffix = $matches[1] }
-$moduleName = "UniversalLogScrubber{0}.psm1" -f $suffix
-$modulePath = Join-Path $PSScriptRoot $moduleName
+# Prefer the packaged repository layout: scripts\ launcher, UniversalLogScrubber\ module.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$candidatePaths = @(
+    (Join-Path $repoRoot 'UniversalLogScrubber\UniversalLogScrubber.psd1'),
+    (Join-Path $repoRoot 'UniversalLogScrubber\UniversalLogScrubber.psm1'),
+    (Join-Path $PSScriptRoot 'UniversalLogScrubber.psd1'),
+    (Join-Path $PSScriptRoot 'UniversalLogScrubber.psm1')
+)
 
-# Prefer the packaged repository layout: scripts\ launcher, src\ module.
-if (-not (Test-Path $modulePath)) {
-    $repoModulePath = Join-Path (Split-Path -Parent $PSScriptRoot) (Join-Path 'src' $moduleName)
-    if (Test-Path $repoModulePath) { $modulePath = $repoModulePath }
-}
+$modulePath = $candidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
-# Fall back to the newest UniversalLogScrubber_*.psm1 next to the launcher or in
-# ..\src if the exact match isn't present (e.g. the launcher was renamed).
-if (-not (Test-Path $modulePath)) {
-    $searchRoots = @($PSScriptRoot, (Join-Path (Split-Path -Parent $PSScriptRoot) 'src')) | Select-Object -Unique
-    $alt = Get-ChildItem -Path $searchRoots -Filter 'UniversalLogScrubber*.psm1' -ErrorAction SilentlyContinue |
-           Sort-Object Name -Descending | Select-Object -First 1
-    if ($alt) { $modulePath = $alt.FullName }
-}
-
-if (-not (Test-Path $modulePath)) {
-    Write-Host "Cannot find a UniversalLogScrubber_*.psm1 next to this launcher ($PSScriptRoot)." -ForegroundColor Red
-    Write-Host "Keep this launcher and its matching .psm1 module in the same folder." -ForegroundColor Yellow
+if (-not $modulePath) {
+    Write-Host "Cannot find UniversalLogScrubber.psd1 or UniversalLogScrubber.psm1." -ForegroundColor Red
+    Write-Host "Keep this launcher with the packaged UniversalLogScrubber module folder." -ForegroundColor Yellow
     exit 1
 }
 

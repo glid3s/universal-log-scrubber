@@ -401,7 +401,7 @@ Preservation rows are useful because they explain why values such as local diagn
 The report should be deduplicated by detector, action, value, token, reason, and column. If duplicates appear, rerun the latest module and confirm self-tests pass:
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
 Invoke-ScrubSelfTest
 ```
 
@@ -413,8 +413,8 @@ For the current PowerShell session only:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-Unblock-File .\src\UniversalLogScrubber_v4_13.psm1
-Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+Unblock-File .\UniversalLogScrubber\UniversalLogScrubber.psm1
+Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
 ```
 
 ## What good output looks like

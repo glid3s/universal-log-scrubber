@@ -3,7 +3,7 @@
   Lists or saves curated external public log corpus samples.
 
 .DESCRIPTION
-  This helper imports the repository module and exposes the v4.13 external
+  This helper imports the repository module and exposes the external
   corpus catalog. By default it lists or searches catalog entries. When -Name is
   supplied, it saves that corpus entry under .\samples\external-corpora unless
   -Destination is provided.
@@ -25,7 +25,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
-$modulePath = Join-Path $repoRoot 'src\UniversalLogScrubber_v4_13.psm1'
+$modulePath = Join-Path $repoRoot 'UniversalLogScrubber\UniversalLogScrubber.psd1'
 Import-Module $modulePath -Force
 
 if ([string]::IsNullOrWhiteSpace($Destination)) {

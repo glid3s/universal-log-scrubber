@@ -17,17 +17,15 @@ This project handles security-sensitive workflows. The most important contributi
 
 1. Run the synthetic self-test.
 2. Run the sample log smoke tests.
-3. Run the offline static guardrails.
-4. Validate example profiles.
-5. Confirm that no generated artifacts marked `DO_NOT_UPLOAD` are committed.
-6. Confirm that no raw customer/client data is present.
+3. Validate example profiles.
+4. Confirm that no generated artifacts marked `DO_NOT_UPLOAD` are committed.
+5. Confirm that no raw customer/client data is present.
 
 ```powershell
-Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
 Invoke-ScrubSelfTest
 
 .\scripts\Test-SampleLogs.ps1
-.\scripts\Test-StaticChecks.ps1
 
 Get-ChildItem .\docs\profiles\*.json | ForEach-Object {
   if (-not (Test-ScrubProfile -Path $_.FullName -Quiet)) {

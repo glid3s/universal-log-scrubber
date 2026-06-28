@@ -192,7 +192,7 @@
 
   QUICK START
   -----------
-    Import-Module .\UniversalLogScrubber.psm1
+    Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1
     Invoke-UniversalScrubber              # fully interactive, hand-held
     Invoke-UniversalScrubber -Path C:\logs -Profile Generic -MapSource Discover
 
@@ -209,6 +209,8 @@
 # =====================================================================
 # REGION: Session state (shared by every stage)
 # =====================================================================
+$script:ModuleName       = 'UniversalLogScrubber'
+$script:ModuleVersion    = '4.13.0'
 $script:Salt             = $null
 $script:HmacLength       = 24
 $script:TokenByNorm      = @{}     # normalized-value -> token (the loaded map)
@@ -3355,6 +3357,25 @@ function Get-JsonNodeIdentity {
     try { return [string][System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($Node) } catch { return $null }
 }
 
+function Get-UniversalLogScrubberVersionInfo {
+    $modulePath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($modulePath)) {
+        try { if ($MyInvocation.MyCommand.Module -and $MyInvocation.MyCommand.Module.Path) { $modulePath = $MyInvocation.MyCommand.Module.Path } } catch { }
+    }
+
+    $manifestPath = Join-Path $PSScriptRoot 'UniversalLogScrubber.psd1'
+    if (-not (Test-Path -LiteralPath $manifestPath)) { $manifestPath = $null }
+
+    return [pscustomobject]@{
+        Name              = $script:ModuleName
+        Version           = $script:ModuleVersion
+        ModulePath        = $modulePath
+        ManifestPath      = $manifestPath
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        PSEdition         = $PSVersionTable.PSEdition
+    }
+}
+
 function Test-JsonNumericNode {
     param($Node)
     return (
@@ -4939,7 +4960,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.13 -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v$script:ModuleVersion -- SELF-TEST" "Synthetic data only; no real logs touched."
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -4954,9 +4975,19 @@ function Invoke-ScrubSelfTest {
         # ---- 0) Static module guardrails ----
         Write-Rule "Module guardrails"
         $modulePath = $null
-        try { if ($MyInvocation.MyCommand.Module -and $MyInvocation.MyCommand.Module.Path) { $modulePath = $MyInvocation.MyCommand.Module.Path } } catch { }
-        if (-not $modulePath) { $modulePath = $PSCommandPath }
-        & $assert ((Split-Path -Leaf $modulePath) -eq 'UniversalLogScrubber_v4_13.psm1') "self-test is running against the v4.13 module file"
+        if ($PSCommandPath -and ([System.IO.Path]::GetExtension($PSCommandPath) -ieq '.psm1')) { $modulePath = $PSCommandPath }
+        try {
+            if (-not $modulePath -and $MyInvocation.MyCommand.Module -and $MyInvocation.MyCommand.Module.Path) {
+                $candidate = $MyInvocation.MyCommand.Module.Path
+                if ([System.IO.Path]::GetExtension($candidate) -ieq '.psm1') { $modulePath = $candidate }
+                elseif ([System.IO.Path]::GetExtension($candidate) -ieq '.psd1') {
+                    $candidateModule = Join-Path (Split-Path -Parent $candidate) 'UniversalLogScrubber.psm1'
+                    if (Test-Path -LiteralPath $candidateModule) { $modulePath = $candidateModule }
+                }
+            }
+        } catch { }
+        if (-not $modulePath) { $modulePath = Join-Path $PSScriptRoot 'UniversalLogScrubber.psm1' }
+        & $assert ((Split-Path -Leaf $modulePath) -eq 'UniversalLogScrubber.psm1') "self-test is running against the release module file"
         $moduleText = if ($modulePath -and (Test-Path -LiteralPath $modulePath)) { [System.IO.File]::ReadAllText($modulePath) } else { '' }
         $guardTokens = $null; $guardErrors = $null
         $guardAst = [System.Management.Automation.Language.Parser]::ParseInput($moduleText, [ref]$guardTokens, [ref]$guardErrors)
@@ -5533,7 +5564,8 @@ function Write-RunManifest {
         }
     }
     $manifest = [pscustomobject]@{
-        tool            = "UniversalLogScrubber_v4_13.psm1"
+        tool            = "UniversalLogScrubber.psm1"
+        toolVersion     = $script:ModuleVersion
         schemaVersion   = "4.12"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
@@ -5555,6 +5587,7 @@ function Write-RunManifest {
 function Invoke-UniversalScrubber {
         [CmdletBinding()]
     param(
+        [switch]$Version,
         [string]$Path,
         [string]$WorkDir,
         [switch]$RecommendOnly,
@@ -5597,6 +5630,8 @@ function Invoke-UniversalScrubber {
         [switch]$NonInteractive
     )
 
+    if ($Version) { return Get-UniversalLogScrubberVersionInfo }
+
     $script:HmacLength = $HmacLength
     $script:ScrubPolicy = $ScrubPolicy
     $script:TokenMapMode = $TokenMapMode
@@ -5608,7 +5643,7 @@ function Invoke-UniversalScrubber {
     $script:DetectionTraceSeen = @{}
     $script:DetectionCounts = @{}
 
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v4.13" "Token-map first, then scrub. Nothing leaves until it's clean."
+    Write-Banner "UNIVERSAL LOG SCRUBBER  v$script:ModuleVersion" "Token-map first, then scrub. Nothing leaves until it's clean."
     if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
     if ($SafeFirstRun) { Write-Info "SAFE FIRST RUN mode -- local sample analysis only." }
     if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
@@ -7635,10 +7670,22 @@ function Test-PreserveDetectedValue {
 
 # END ULS v4.13 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
 
+Set-Alias -Name Invoke-UniversalLogScrubber -Value Invoke-UniversalScrubber
+Set-Alias -Name Invoke-ULSScrubSelfTest -Value Invoke-ScrubSelfTest
+Set-Alias -Name Test-ULSLogFormat -Value Test-LogFormat
+Set-Alias -Name Get-ULSLogCorpusCatalog -Value Get-LogCorpusCatalog
+Set-Alias -Name Search-ULSLogCorpusCatalog -Value Search-LogCorpusCatalog
+Set-Alias -Name Save-ULSLogCorpusSample -Value Save-LogCorpusSample
+Set-Alias -Name Invoke-ULSExternalCorpusSmokeTest -Value Invoke-ExternalCorpusSmokeTest
+
 Export-ModuleMember -Function `
     Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
     Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
     Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
-    Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
+    Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog `
+    -Alias `
+    Invoke-UniversalLogScrubber, Invoke-ULSScrubSelfTest, Test-ULSLogFormat, `
+    Get-ULSLogCorpusCatalog, Search-ULSLogCorpusCatalog, Save-ULSLogCorpusSample, `
+    Invoke-ULSExternalCorpusSmokeTest

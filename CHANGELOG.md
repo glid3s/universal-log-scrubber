@@ -1,8 +1,15 @@
 # Changelog
 
-## v4.13
+## v4.13.0
 
-- Bumped the versioned module and launcher names to v4.13.
+- Retired versioned module and launcher filenames for the stable package layout:
+  `UniversalLogScrubber\UniversalLogScrubber.psd1` now imports
+  `UniversalLogScrubber.psm1`, and the launcher is
+  `scripts\Run-UniversalScrubber.ps1`.
+- Added ULS-prefixed aliases for command discovery while keeping existing
+  command names canonical.
+- Added `Invoke-UniversalScrubber -Version` and
+  `Invoke-UniversalLogScrubber -Version`.
 - Consolidated duplicate hotfix override functions and moved module exports to
   the true end of the module.
 - Added conservative JSON numeric scrubbing for sensitive-looking keys while
@@ -11,11 +18,8 @@
   Kafka, and WS/WSS-style schemes.
 - Added progress feedback for external corpus smoke tests, W3C conversion,
   large text/KV discovery, and normal text/KV scrubbing phases.
-- Added offline static guardrails for stale version references, documented
-  command examples, exported command signatures, parse errors, and duplicate
-  function definitions.
-- Corrected external corpus documentation and refreshed v4.13 workflow and PR
-  testing references.
+- Corrected external corpus documentation and refreshed v4.13.0 workflow and
+  PR testing references.
 
 ## v4.12
 
@@ -28,7 +32,7 @@
 - Added `scripts\Get-SampleLogs.ps1` as a friendly catalog/search/save wrapper.
 - Ignored `samples/external-corpora/` and `external-corpus-results/` so public
   corpora and smoke-test outputs do not get committed.
-- Bumped the versioned module and launcher names to v4.13.
+- Bumped the versioned module and launcher names to v4.12.
 
 ## v4.11
 

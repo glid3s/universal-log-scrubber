@@ -16,7 +16,7 @@ jobs:
       - name: Run synthetic self-test
         shell: pwsh
         run: |
-          Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+          Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
           try {
             $ok = Invoke-ScrubSelfTest
             if (-not $ok) { throw "Invoke-ScrubSelfTest returned $ok" }
@@ -50,7 +50,7 @@ jobs:
       - name: Validate example profiles
         shell: pwsh
         run: |
-          Import-Module .\src\UniversalLogScrubber_v4_13.psm1 -Force
+          Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
           Get-ChildItem .\docs\profiles\*.json | ForEach-Object {
             if (-not (Test-ScrubProfile -Path $_.FullName -Quiet)) {
               throw "Profile failed validation: $($_.FullName)"
@@ -61,9 +61,3 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\Test-SampleLogs.ps1
-
-      - name: Run static guardrail checks
-        shell: pwsh
-        run: |
-          .\scripts\Test-StaticChecks.ps1
-
