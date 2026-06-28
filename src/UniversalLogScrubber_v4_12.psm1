@@ -217,6 +217,7 @@ $script:AdditionalBroadLabels = @()
 $script:ScrubPolicy = 'Balanced'
 $script:ExplainDetections = $false
 $script:DetectionTrace = $null
+$script:DetectionTraceSeen = @{}
 $script:FalsePositiveReport = $null
 $script:DetectionCounts = @{}
 $script:DetectionSummaryReport = $null
@@ -656,6 +657,10 @@ function Add-DetectionTrace {
     if (-not $script:DetectionCounts.ContainsKey($countKey)) { $script:DetectionCounts[$countKey] = 0 }
     $script:DetectionCounts[$countKey] = [int]$script:DetectionCounts[$countKey] + 1
     if (-not $script:ExplainDetections -and [string]::IsNullOrWhiteSpace($script:FalsePositiveReport)) { return }
+    if (-not $script:DetectionTraceSeen) { $script:DetectionTraceSeen = @{} }
+    $traceKey = (@($Detector,$Action,$Value,$Token,$Reason,$ColumnName) | ForEach-Object { if ($null -eq $_) { '' } else { [string]$_ } }) -join ([string]([char]31))
+    if ($script:DetectionTraceSeen.ContainsKey($traceKey)) { return }
+    $script:DetectionTraceSeen[$traceKey] = $true
     if (-not $script:DetectionTrace) { $script:DetectionTrace = New-Object System.Collections.Generic.List[object] }
     [void]$script:DetectionTrace.Add([pscustomobject]@{
         Detector = $Detector
@@ -5393,6 +5398,7 @@ function Invoke-UniversalScrubber {
     $script:FalsePositiveReport = $FalsePositiveReport
     $script:DetectionSummaryReport = $DetectionSummaryReport
     $script:DetectionTrace = New-Object System.Collections.Generic.List[object]
+    $script:DetectionTraceSeen = @{}
     $script:DetectionCounts = @{}
 
     Write-Banner "UNIVERSAL LOG SCRUBBER  v4.12" "Token-map first, then scrub. Nothing leaves until it's clean."
@@ -5432,6 +5438,14 @@ function Invoke-UniversalScrubber {
     }
     $WorkDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir)
     if (-not (Test-Path $WorkDir)) { New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null }
+    if ($ExplainDetections -and [string]::IsNullOrWhiteSpace($FalsePositiveReport)) {
+        $FalsePositiveReport = Join-Path $WorkDir 'detection_review_DO_NOT_UPLOAD.csv'
+        $script:FalsePositiveReport = $FalsePositiveReport
+        Write-Warn "Detection review report will be written locally: $FalsePositiveReport"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($FalsePositiveReport)) {
+        $script:FalsePositiveReport = $FalsePositiveReport
+    }
     Write-Info "Working folder: $WorkDir"
 
     if ($ProfileTemplate) {
@@ -5463,7 +5477,7 @@ function Invoke-UniversalScrubber {
     $targets = @()
     if (Test-Path $Path -PathType Container) {
         $targets = @(Get-ChildItem -Path $Path -File -Recurse:$Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notmatch '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report)' })
+            Where-Object { -not (Test-GeneratedScrubArtifactName -Name $_.Name) })
         if ($Include -and $Include.Count -gt 0) {
             $targets = @($targets | Where-Object {
                 $n = $_.Name; $ok = $false
@@ -5770,6 +5784,661 @@ function Invoke-UniversalScrubber {
     return $results
 }
 
+# BEGIN ULS v4.12 current-version bugfixes: detection review, corpus filtering, LogHub online
+
+# Override: broader generated/local artifact exclusion used by recommendations, smoke tests, and folder scrubs.
+function Test-GeneratedScrubArtifactName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|detection_review|scrub_run_manifest|corpus-manifest|manifest\.json|external-corpus-summary|profile_build_report|generated-profile|profile-template)') { return $true }
+    if ([System.IO.Path]::GetExtension($Name) -ieq '.zip') { return $true }
+    return $false
+}
+
+function Test-PreserveNonSensitiveDottedArtifactName {
+    param([string]$Value, [string]$Text, [int]$Index = -1, [int]$Length = 0)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    if ($v -notmatch '\.') { return $false }
+
+    # Do not preserve network/identity/path forms here. Let the normal detectors handle them.
+    if ($v -match '@|://|\\|/') { return $false }
+    if ($v -match '^\d') { return $false }
+
+    # Obvious local/config/source/log artifact filenames that can look like FQDNs to a shape regex.
+    if ($v -match '(?i)\.(properties|conf|cfg|ini|yaml|yml|toml|xml|json|log|txt|pid|lock|policy|rules|template|templates)$') { return $true }
+
+    $parts = @($v -split '\.')
+    if ($parts.Count -eq 2) {
+        $left = $parts[0]
+        $right = $parts[1]
+
+        # Preserve method/context identifiers like workerEnv.init, but not plain lowercase internal hosts like web01.corp.
+        if (($left -match '[a-z][A-Z]') -and ($right -match '(?i)^(init|start|stop|run|load|save|open|close|read|write|parse|build|handle|process|worker|factory|service|manager|env)$')) { return $true }
+
+        # Known Apache/mod_jk style symbolic names.
+        if ($v -match '(?i)^(workerEnv|mod_jk|jk2|ajp13)\.[A-Za-z_][A-Za-z0-9_]*$') { return $true }
+    }
+
+    return $false
+}
+
+# Override: DNS/FQDN preservation now keeps obvious local dotted artifacts in Balanced/Readable.
+function Test-PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if (Test-ScrubAllowlist -Value $Value) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+    $v = $Value.Trim()
+    if (Is-AlreadyToken -Value $v) { return $true }
+    if (Test-PreserveDottedDecimal -Value $v) { return $true }
+    if (($Prefix -eq 'IP' -or $Prefix -eq 'IP6') -and (Test-PreserveIpAddress -Value $v)) { return $true }
+    if ($Prefix -eq 'GUID' -and (Test-PreserveGuid -Value $v)) { return $true }
+    if ($Detector -eq 'DOMAIN\user' -or $Prefix -eq 'PRINCIPAL') {
+        if (Test-WindowsPathLikeDomainUser -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+    }
+    if ($Prefix -eq 'DNS') {
+        if (Test-AllowedDomain -Value $v) { return $true }
+        if (Test-WindowsDiagnosticDottedName -Value $v) { return $true }
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v -Text $Text -Index $Index -Length $Length) { return $true }
+        if ($script:ScrubPolicy -eq 'Readable' -and (Test-KnownFileOrDiagnosticName -Value $v)) { return $true }
+    }
+    if ($Prefix -eq 'BLOB' -and -not (Test-LooksLikeBase64Blob -Value $v)) { return $true }
+    if (($Prefix -eq 'GUID' -or $Prefix -eq 'CERT') -and (Test-DiagnosticContext -Text $Text -Index $Index -Length $Length)) { return $true }
+    return $false
+}
+
+# Override: shape fallback should not classify obvious local dotted artifact names as DNS.
+function Get-ValueShapePrefix {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim()
+    if ($v -match '^S-1-\d+-')                                                  { return 'SID' }
+    if ($v -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$') { return 'GUID' }
+    if ($v -match '^[0-9a-fA-F]{32,}$')                                         { return 'CERT' }
+    if ($v -match '^[^@\s]+@[^@\s]+\.[^@\s]+$')                              { return 'UNMAPPED_UPN' }
+    if ($v -match '^\d{1,3}(\.\d{1,3}){3}$')                                  { return 'IP' }
+    if ($v -match '^[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+$')                     { return 'PRINCIPAL' }
+    if ($v -match '^(CN|OU|DC|O|L|ST|C)=')                                      { return 'X500' }
+    if ($v -match '^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$') {
+        if (Test-PreserveNonSensitiveDottedArtifactName -Value $v) { return $null }
+        return 'DNS'
+    }
+    return $null
+}
+
+# Override: recommendation targets skip generated/local artifacts consistently.
+function Resolve-LogRecommendationTargets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Recurse,
+        [string[]]$Include,
+        [string[]]$Exclude
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Path is required.' }
+    $targets = @()
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $targets = @(Get-ChildItem -LiteralPath $Path -File -Recurse:$Recurse -ErrorAction SilentlyContinue)
+    }
+    elseif (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $targets = @(Get-Item -LiteralPath $Path)
+    }
+    else { throw "Path not found: $Path" }
+
+    $targets = @($targets | Where-Object { -not (Test-GeneratedScrubArtifactName -Name $_.Name) })
+    if ($Include -and $Include.Count -gt 0) {
+        $targets = @($targets | Where-Object {
+            $ok = $false
+            foreach ($pat in $Include) { if ($_.Name -like $pat) { $ok = $true; break } }
+            $ok
+        })
+    }
+    if ($Exclude -and $Exclude.Count -gt 0) {
+        $targets = @($targets | Where-Object {
+            $skip = $false
+            foreach ($pat in $Exclude) { if ($_.Name -like $pat) { $skip = $true; break } }
+            -not $skip
+        })
+    }
+    return @($targets | Sort-Object FullName)
+}
+
+function Get-LogHubSuggestedProfile {
+    param([string]$Dataset, [string]$FileName)
+    $d = ([string]$Dataset).ToLowerInvariant()
+    $f = ([string]$FileName).ToLowerInvariant()
+    if ($d -match 'apache|nginx|http|web') { return 'Apache' }
+    if ($d -match 'openssh|linux|syslog|auth') { return 'Syslog' }
+    if ($d -match 'windows') { return 'Text' }
+    if ($f -match '\.json(l)?$') { return 'AppJson' }
+    if ($f -match '\.csv$') { return 'Generic' }
+    return 'Text'
+}
+
+function New-LogHubOnlineCatalogEntry {
+    param(
+        [Parameter(Mandatory)][string]$Dataset,
+        [Parameter(Mandatory)]$Item
+    )
+
+    $download = [string]$Item.download_url
+    if ([string]::IsNullOrWhiteSpace($download)) { return $null }
+    $fileName = [string]$Item.name
+    $safeDataset = Get-SafeCorpusName -Name $Dataset
+    $safeFile = Get-SafeCorpusName -Name ([System.IO.Path]::GetFileNameWithoutExtension($fileName))
+    $profile = Get-LogHubSuggestedProfile -Dataset $Dataset -FileName $fileName
+    $size = ''
+    try {
+        if ($null -ne $Item.size -and [int64]$Item.size -gt 0) {
+            $size = ('{0:N1} KB' -f ([double]([int64]$Item.size) / 1KB))
+        }
+    } catch { }
+
+    [pscustomobject]@{
+        Name                   = "Loghub-$safeDataset-$safeFile"
+        Source                 = 'Loghub'
+        Dataset                = $Dataset
+        FileName               = $fileName
+        Description            = "LogHub $Dataset sample file $fileName."
+        Homepage               = "https://github.com/logpai/loghub/tree/master/$Dataset"
+        DownloadUrl            = $download
+        InstructionsUrl        = "https://github.com/logpai/loghub/tree/master/$Dataset"
+        FormatHint             = "LogHub/$Dataset"
+        SuggestedProfile       = $profile
+        ExpectedFileTypes      = @([System.IO.Path]::GetExtension($fileName))
+        ApproxSize             = $size
+        LicenseNote            = 'Review the Loghub repository license and dataset notes before use.'
+        SafetyWarning          = 'Public corpora may contain raw, unsanitized, offensive, realistic, or operational artifacts. Review source terms and run only in an approved local workspace.'
+        RequiresManualDownload = $false
+        CanDownloadDirectly    = $true
+        Notes                  = 'Discovered dynamically from the public logpai/loghub GitHub repository.'
+        HtmlUrl                = [string]$Item.html_url
+    }
+}
+
+function Get-LogHubOnlineCatalog {
+    [CmdletBinding()]
+    param(
+        [string]$Dataset,
+        [switch]$Refresh
+    )
+
+    if (-not $Refresh -and $script:LogHubOnlineCatalogCache) {
+        $cached = @($script:LogHubOnlineCatalogCache)
+        if ([string]::IsNullOrWhiteSpace($Dataset)) { return $cached }
+        return @($cached | Where-Object { $_.Dataset -like "*$Dataset*" })
+    }
+
+    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.12' }
+    $rootUri = 'https://api.github.com/repos/logpai/loghub/contents'
+    try {
+        $root = @(Invoke-RestMethod -Uri $rootUri -Headers $headers -ErrorAction Stop)
+    }
+    catch {
+        throw "Could not query LogHub GitHub contents API: $($_.Exception.Message)"
+    }
+
+    $dirs = @($root | Where-Object { $_.type -eq 'dir' -and $_.name -notmatch '^\.' })
+    if (-not [string]::IsNullOrWhiteSpace($Dataset)) {
+        $dirs = @($dirs | Where-Object { $_.name -like "*$Dataset*" })
+    }
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($dir in $dirs) {
+        $datasetName = [string]($dir.name)
+        $uri = "https://api.github.com/repos/logpai/loghub/contents/$([uri]::EscapeDataString($datasetName))"
+        try {
+            $items = @(Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop)
+        }
+        catch {
+            Write-Warn "Could not query LogHub dataset '$datasetName': $($_.Exception.Message)"
+            continue
+        }
+        foreach ($item in $items) {
+            if ($item.type -ne 'file') { continue }
+            $name = [string]($item.name)
+            if ($name -notmatch '(?i)\.(log|txt|csv|json|jsonl|ndjson|zip|gz|tgz)$') { continue }
+            if (Test-GeneratedScrubArtifactName -Name $name) { continue }
+            $entry = New-LogHubOnlineCatalogEntry -Dataset $datasetName -Item $item
+            if ($entry) { [void]$entries.Add($entry) }
+        }
+    }
+
+    $script:LogHubOnlineCatalogCache = @($entries.ToArray())
+    return @($script:LogHubOnlineCatalogCache)
+}
+
+# Override: static catalog search plus dynamic LogHub online discovery.
+function Search-LogCorpusCatalog {
+    [CmdletBinding()]
+    param(
+        [string]$Query,
+        [string]$Source,
+        [string]$Format,
+        [string]$Profile,
+        [string]$Dataset,
+        [switch]$Online,
+        [switch]$Refresh
+    )
+
+    if ($Online) {
+        $items = @(Get-LogHubOnlineCatalog -Dataset $Dataset -Refresh:$Refresh)
+    }
+    else {
+        $items = @(Get-LogCorpusCatalog)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Query)) {
+        $q = [regex]::Escape($Query)
+        $items = @($items | Where-Object {
+            (@($_.Name,$_.Source,$_.Description,$_.FormatHint,$_.SuggestedProfile,$_.Notes,$_.Dataset,$_.FileName) -join ' ') -match "(?i)$q"
+        })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Source)) {
+        $items = @($items | Where-Object { $_.Source -like "*$Source*" })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Format)) {
+        $items = @($items | Where-Object { $_.FormatHint -like "*$Format*" -or (@($_.ExpectedFileTypes) -join ' ') -like "*$Format*" })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+        $items = @($items | Where-Object { $_.SuggestedProfile -ieq $Profile })
+    }
+    return @($items | Sort-Object Source,Dataset,Name)
+}
+
+function Resolve-OnlineLogCorpusEntry {
+    param([Parameter(Mandatory)][string]$Name, [string]$Dataset)
+    $items = @(Search-LogCorpusCatalog -Online -Dataset $Dataset)
+    $matches = @($items | Where-Object { $_.Name -ieq $Name })
+    if ($matches.Count -eq 1) { return $matches[0] }
+    if ($matches.Count -gt 1) { throw "Multiple online corpus entries matched '$Name'." }
+
+    $matches = @($items | Where-Object { $_.Name -like "*$Name*" -or $_.FileName -ieq $Name })
+    if ($matches.Count -eq 1) { return $matches[0] }
+    if ($matches.Count -gt 1) {
+        $preview = (($matches | Select-Object -First 10 | ForEach-Object { $_.Name }) -join ', ')
+        throw "Multiple online corpus entries matched '$Name'. Be more specific. Matches: $preview"
+    }
+    throw "Unknown online corpus entry: $Name. Run Search-LogCorpusCatalog -Online first and copy the exact Name."
+}
+
+# Override: static Save-LogCorpusSample behavior plus dynamic LogHub online download/extract.
+function Save-LogCorpusSample {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Destination = (Get-DefaultExternalCorpusRoot),
+        [switch]$Force,
+        [switch]$AcceptRisk,
+        [switch]$Online,
+        [string]$Dataset,
+        [switch]$ExtractArchive
+    )
+
+    if ($Online) {
+        $entry = Resolve-OnlineLogCorpusEntry -Name $Name -Dataset $Dataset
+        $destRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+        $sampleDir = Join-Path $destRoot (Get-SafeCorpusName -Name $entry.Name)
+
+        Write-Rule 'External corpus sample'
+        Write-Info "Name: $($entry.Name)"
+        Write-Info "Source: $($entry.Source)"
+        Write-Info "Dataset: $($entry.Dataset)"
+        Write-Info "Destination: $sampleDir"
+        Write-LogCorpusRiskWarning -Entry $entry
+
+        if (-not $AcceptRisk) {
+            throw "Refusing to download '$($entry.Name)' without -AcceptRisk. Review the warning, source, size and license first."
+        }
+
+        if ((Test-Path -LiteralPath $sampleDir -PathType Container) -and -not $Force) {
+            $existing = @(Get-ChildItem -LiteralPath $sampleDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($existing.Count -gt 0) {
+                throw "Corpus sample directory already has content: $sampleDir. Pass -Force to overwrite or update it."
+            }
+        }
+
+        New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
+        $targetPath = Join-Path $sampleDir $entry.FileName
+        if ((Test-Path -LiteralPath $targetPath) -and -not $Force) {
+            throw "Corpus sample already exists: $targetPath. Pass -Force to overwrite."
+        }
+
+        Write-Info "Downloading: $($entry.DownloadUrl)"
+        try {
+            Invoke-WebRequest -Uri $entry.DownloadUrl -OutFile $targetPath -UseBasicParsing -ErrorAction Stop
+        }
+        catch {
+            throw "Download failed for '$($entry.Name)': $($_.Exception.Message)"
+        }
+
+        $hash = ''
+        try { $hash = (Get-FileHash -Path $targetPath -Algorithm SHA256).Hash } catch { }
+        $extractPath = $null
+        if ($ExtractArchive) {
+            $extractPath = Join-Path $sampleDir 'extracted'
+            New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+            if ($entry.FileName -match '(?i)\.zip$') {
+                Expand-Archive -Path $targetPath -DestinationPath $extractPath -Force
+                Write-Ok "Archive extracted: $extractPath"
+            }
+            elseif ($entry.FileName -match '(?i)\.(tgz|tar\.gz)$' -and (Get-Command tar -ErrorAction SilentlyContinue)) {
+                & tar -xzf $targetPath -C $extractPath
+                if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit code $LASTEXITCODE" }
+                Write-Ok "Archive extracted: $extractPath"
+            }
+            else {
+                Write-Warn "ExtractArchive was requested, but this file type is not supported for inline extraction: $($entry.FileName)"
+                $extractPath = $null
+            }
+        }
+        elseif ($entry.FileName -match '(?i)\.(zip|tgz|tar\.gz)$') {
+            Write-Warn "Downloaded archive but did not extract it. Re-run with -ExtractArchive to extract inline."
+        }
+
+        $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -DownloadedFile $targetPath -Sha256 $hash -Status 'Downloaded'
+        Write-Ok "Downloaded: $targetPath"
+        if ($hash) { Write-Info "SHA256: $hash" }
+        Write-Ok "Manifest written: $manifestPath"
+        return [pscustomobject]@{
+            Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $targetPath
+            ExtractedPath = $extractPath; ManifestPath = $manifestPath; Sha256 = $hash
+            RequiresManualDownload = $false; CanDownloadDirectly = $true; Status = 'Downloaded'
+        }
+    }
+
+    # Original static-catalog behavior retained.
+    $entry = Resolve-LogCorpusCatalogEntry -Name $Name
+    $destRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+    $sampleDir = Join-Path $destRoot (Get-SafeCorpusName -Name $entry.Name)
+
+    Write-Rule 'External corpus sample'
+    Write-Info "Name: $($entry.Name)"
+    Write-Info "Source: $($entry.Source)"
+    Write-Info "Destination: $sampleDir"
+    Write-LogCorpusRiskWarning -Entry $entry
+
+    if ((Test-Path -LiteralPath $sampleDir -PathType Container) -and -not $Force) {
+        $existing = @(Get-ChildItem -LiteralPath $sampleDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($existing.Count -gt 0) {
+            throw "Corpus sample directory already has content: $sampleDir. Pass -Force to overwrite or update it."
+        }
+    }
+
+    if ($entry.RequiresManualDownload -or -not $entry.CanDownloadDirectly) {
+        New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
+        Write-Warn 'This catalog entry requires manual download. No network download will be attempted.'
+        if ($entry.InstructionsUrl) { Write-Info "Instructions: $($entry.InstructionsUrl)" }
+        if ($entry.Homepage) { Write-Info "Homepage: $($entry.Homepage)" }
+        $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -Status 'ManualDownloadRequired'
+        Write-Ok "Instructions manifest written: $manifestPath"
+        return [pscustomobject]@{
+            Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $null
+            ManifestPath = $manifestPath; RequiresManualDownload = $true
+            CanDownloadDirectly = $false; Status = 'ManualDownloadRequired'
+        }
+    }
+
+    if (-not $AcceptRisk) {
+        throw "Refusing to download '$($entry.Name)' without -AcceptRisk. Review the warning, source, size and license first."
+    }
+    if ([string]::IsNullOrWhiteSpace($entry.DownloadUrl)) { throw "Catalog entry '$($entry.Name)' has no direct DownloadUrl." }
+
+    New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
+    $uri = [Uri]$entry.DownloadUrl
+    $fileName = [System.IO.Path]::GetFileName($uri.AbsolutePath)
+    if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = ((Get-SafeCorpusName -Name $entry.Name) + '.log') }
+    $targetPath = Join-Path $sampleDir $fileName
+    if ((Test-Path -LiteralPath $targetPath) -and -not $Force) {
+        throw "Corpus sample already exists: $targetPath. Pass -Force to overwrite."
+    }
+
+    Write-Info "Downloading: $($entry.DownloadUrl)"
+    try {
+        Invoke-WebRequest -Uri $entry.DownloadUrl -OutFile $targetPath -UseBasicParsing -ErrorAction Stop
+    }
+    catch {
+        throw "Download failed for '$($entry.Name)': $($_.Exception.Message)"
+    }
+
+    $hash = ''
+    try { $hash = (Get-FileHash -Path $targetPath -Algorithm SHA256).Hash } catch { }
+    $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -DownloadedFile $targetPath -Sha256 $hash -Status 'Downloaded'
+    Write-Ok "Downloaded: $targetPath"
+    if ($hash) { Write-Info "SHA256: $hash" }
+    Write-Ok "Manifest written: $manifestPath"
+    return [pscustomobject]@{
+        Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $targetPath
+        ManifestPath = $manifestPath; Sha256 = $hash
+        RequiresManualDownload = $false; CanDownloadDirectly = $true; Status = 'Downloaded'
+    }
+}
+
+# END ULS v4.12 current-version bugfixes
+
+# BEGIN ULS v4.12 hotfix: LogHub online flattening and positive detection review rows
+# Current-version bugfix only: no version/banner/schema bump.
+
+function ConvertTo-UlsFlatArray {
+    param([AllowNull()]$Value)
+
+    $flat = New-Object System.Collections.Generic.List[object]
+    $queue = New-Object System.Collections.Generic.List[object]
+
+    foreach ($item in @($Value)) {
+        [void]$queue.Add($item)
+    }
+
+    while ($queue.Count -gt 0) {
+        $item = $queue[0]
+        $queue.RemoveAt(0)
+
+        if ($null -eq $item) { continue }
+
+        if ($item -is [System.Array]) {
+            foreach ($child in $item) {
+                [void]$queue.Add($child)
+            }
+            continue
+        }
+
+        [void]$flat.Add($item)
+    }
+
+    return @($flat.ToArray())
+}
+
+function Test-GeneratedLogHubArtifactName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $true }
+
+    # Do not use Test-GeneratedScrubArtifactName here because online corpus files may
+    # legitimately be .zip/.gz archives. Only skip ULS-local/generated metadata.
+    return ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|detection_review|scrub_run_manifest|corpus-manifest|manifest\.json|external-corpus-summary|profile_build_report|generated-profile|profile-template)')
+}
+
+function Get-LogHubOnlineCatalog {
+    [CmdletBinding()]
+    param(
+        [string]$Dataset,
+        [switch]$Refresh
+    )
+
+    if (-not $Refresh -and $script:LogHubOnlineCatalogCache) {
+        $cached = @(ConvertTo-UlsFlatArray -Value $script:LogHubOnlineCatalogCache)
+        if ([string]::IsNullOrWhiteSpace($Dataset)) { return $cached }
+        return @($cached | Where-Object { $_.Dataset -like "*$Dataset*" })
+    }
+
+    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.12' }
+    $rootUri = 'https://api.github.com/repos/logpai/loghub/contents'
+
+    try {
+        $rootRaw = Invoke-RestMethod -Uri $rootUri -Headers $headers -ErrorAction Stop
+        $root = @(ConvertTo-UlsFlatArray -Value $rootRaw)
+    }
+    catch {
+        throw "Could not query LogHub GitHub contents API: $($_.Exception.Message)"
+    }
+
+    $dirs = @($root | Where-Object { ($null -ne $_) -and ([string]($_.type) -eq 'dir') -and ([string]($_.name) -notmatch '^\.') -and ([string]($_.name) -notmatch '^(docs?|test|tests?)$') })
+
+    if (-not [string]::IsNullOrWhiteSpace($Dataset)) {
+        $dirs = @($dirs | Where-Object { [string]($_.name) -like "*$Dataset*" })
+    }
+
+    $entries = New-Object System.Collections.Generic.List[object]
+
+    foreach ($dir in $dirs) {
+        $datasetName = [string]($dir.name)
+        if ([string]::IsNullOrWhiteSpace($datasetName)) { continue }
+
+        $uri = "https://api.github.com/repos/logpai/loghub/contents/$([uri]::EscapeDataString($datasetName))"
+
+        try {
+            $itemsRaw = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
+            $items = @(ConvertTo-UlsFlatArray -Value $itemsRaw)
+        }
+        catch {
+            Write-Warn "Could not query LogHub dataset '$datasetName': $($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($item in $items) {
+            if ($null -eq $item) { continue }
+            if ([string]($item.type) -ne 'file') { continue }
+
+            $name = [string]($item.name)
+            if ($name -notmatch '(?i)\.(log|txt|csv|json|jsonl|ndjson|zip|gz|tgz|tar\.gz)$') { continue }
+            if (Test-GeneratedLogHubArtifactName -Name $name) { continue }
+
+            $entry = New-LogHubOnlineCatalogEntry -Dataset $datasetName -Item $item
+            if ($entry) { [void]$entries.Add($entry) }
+        }
+    }
+
+    $script:LogHubOnlineCatalogCache = @($entries.ToArray())
+    return @($script:LogHubOnlineCatalogCache)
+}
+
+# Override: return detector/reason metadata and add Tokenized trace rows for positive dry-run detections.
+function Find-Identifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $found = @{}   # normalizedKey -> identifier object
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+
+    function _AddFoundIdentifier {
+        param(
+            [string]$Raw,
+            [string]$Prefix,
+            [string]$Detector,
+            [string]$Reason,
+            [int]$Index = -1,
+            [int]$Length = 0,
+            [string]$ColumnName = ''
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Raw)) { return }
+        if ([string]::IsNullOrWhiteSpace($Prefix)) { return }
+
+        $norm = Normalize-TokenKey -Value $Raw
+        if (-not $norm -or $found.ContainsKey($norm)) { return }
+
+        $tokenPreview = ''
+        try { $tokenPreview = Get-Token -Value $Raw -Prefix $Prefix } catch { $tokenPreview = '' }
+
+        Add-DetectionTrace `
+            -Detector $Detector `
+            -Action 'Tokenized' `
+            -Value $Raw `
+            -Token $tokenPreview `
+            -Reason $Reason `
+            -ColumnName $ColumnName `
+            -Context (Get-DetectionContext -Text $Text -Index $Index -Length $Length)
+
+        $found[$norm] = [pscustomobject]@{
+            Raw      = $Raw
+            Prefix   = $Prefix
+            Detector = $Detector
+            Reason   = $Reason
+        }
+    }
+
+    foreach ($id in (Find-UniversalLabeledIdentifiers -Text $Text)) {
+        $reason = if ($id.Rule) { [string]$id.Rule } else { 'Universal label rule' }
+        _AddFoundIdentifier -Raw $id.Raw -Prefix $id.Prefix -Detector 'UniversalLabel' -Reason $reason -ColumnName '(label)'
+    }
+
+    foreach ($id in (Find-CustomRegexIdentifiers -Text $Text)) {
+        $reason = if ($id.Rule) { [string]$id.Rule } else { 'Custom regex rule' }
+        _AddFoundIdentifier -Raw $id.Raw -Prefix $id.Prefix -Detector 'CustomRegex' -Reason $reason -ColumnName '(custom-regex)'
+    }
+
+    foreach ($id in (Find-SecretIdentifiers -Text $Text)) {
+        $reason = switch ($id.Prefix) {
+            'PEM'     { 'Private key block' }
+            'CONNSTR' { 'Connection string pattern' }
+            'APIKEY'  { 'API key/token pattern' }
+            default   { 'Secret pattern' }
+        }
+        _AddFoundIdentifier -Raw $id.Raw -Prefix $id.Prefix -Detector 'Secret' -Reason $reason -ColumnName '(secret)'
+    }
+
+    foreach ($d in $script:ShapeDetectors) {
+        foreach ($m in [regex]::Matches($Text, $d.Rx)) {
+            $raw = $m.Value
+
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+            if (Is-AlreadyToken -Value $raw) { continue }
+            if (Test-PreserveDottedDecimal -Value $raw) { continue }
+            if ($d.Skip -and ($raw -match $d.Skip)) { continue }
+
+            # Keep well-known public domains readable. They are intentionally not
+            # positive detections because they are allowlisted public diagnostics.
+            if (($d.Prefix -eq 'DNS' -or $d.Prefix -eq 'UNMAPPED_UPN') -and (Test-AllowedDomain -Value $raw)) { continue }
+
+            if (Test-PreserveDetectedValue -Value $raw -Detector $d.Name -Prefix $d.Prefix -Text $Text -Index $m.Index -Length $m.Length) {
+                Add-DetectionTrace `
+                    -Detector $d.Name `
+                    -Action 'Preserved' `
+                    -Value $raw `
+                    -Token '' `
+                    -Reason 'Discovery preserve' `
+                    -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
+                continue
+            }
+
+            _AddFoundIdentifier `
+                -Raw $raw `
+                -Prefix $d.Prefix `
+                -Detector $d.Name `
+                -Reason 'Shape detector' `
+                -Index $m.Index `
+                -Length $m.Length `
+                -ColumnName '(shape)'
+        }
+    }
+
+    return @($found.Values)
+}
+
+# END ULS v4.12 hotfix: LogHub online flattening and positive detection review rows
+
+
 Export-ModuleMember -Function `
     Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
     Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
@@ -5777,4 +6446,5 @@ Export-ModuleMember -Function `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
     Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
     Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog
+
 

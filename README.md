@@ -215,3 +215,8 @@ See [USAGE.md](USAGE.md) for step-by-step workflows, profile generation,
 profile authoring, seed and allowlist file formats, policy modes, token map
 handling, EVTX conversion guidance, and safe-upload checklists.
 
+
+## External corpus search
+
+See [External Corpus Search and Smoke Testing](docs/EXTERNAL_CORPUS_SEARCH.md) for LogHub online search, sample downloads, smoke testing, and detection review workflows.
+
