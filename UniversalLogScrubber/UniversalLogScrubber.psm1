@@ -210,7 +210,7 @@
 # REGION: Session state (shared by every stage)
 # =====================================================================
 $script:ModuleName       = 'UniversalLogScrubber'
-$script:ModuleVersion    = '4.13.0'
+$script:ModuleVersion    = '4.14.0'
 $script:Salt             = $null
 $script:HmacLength       = 24
 $script:TokenByNorm      = @{}     # normalized-value -> token (the loaded map)
@@ -238,6 +238,136 @@ $script:KnownTokenPrefixes = @(
     'GUID','IP','IP6','HOST','URL','URI','MAC','JWT','ARN','AWSKEY',
     'INSTANCE','BLOB','SECRET','APIKEY','CONNSTR','PEM'
 )
+
+# =====================================================================
+# REGION: Performance patch (v4.14.0 perf-1) -- behavior-preserving
+#   1. Per-file (column,value)->scrubbed memoization cache. Populated per file
+#      in Invoke-ScrubFile; $null disables it so direct callers/discovery are
+#      unaffected. See Scrub-Field.
+#   2. Larger static regex cache. The free-text / secret / common / leak
+#      hardening passes use static [regex]::Replace/Matches(string, pattern, ...)
+#      calls that share the process-wide cache (default size 15). The per-cell
+#      battery cycles through more than 15 distinct patterns, so they were being
+#      evicted and recompiled on essentially every cell. Raising the cache keeps
+#      them compiled. Pure speed; no behavior change.
+# =====================================================================
+$script:__cellCache = $null
+$script:__hmacTokenCache = $null
+[System.Text.RegularExpressions.Regex]::CacheSize = 256
+
+# Low-risk perf patch: precompiled Windows user-profile path regexes. These are used
+# only behind a cheap substring gate in Invoke-WindowsPathUserHardening. Behavior is
+# intended to match the prior dynamic [regex]::Replace calls while avoiding repeated
+# regex lookup/compile overhead on hot Windows Event Message/EventDataJson paths.
+$script:__rxWinUserPathOptions = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+$script:__rxWinUserPathNormal = [System.Text.RegularExpressions.Regex]::new('((?:\\\?\\)?[A-Za-z]:\\Users\\)([^\\/"'',;:\r\n]+)', $script:__rxWinUserPathOptions, $script:RegexTimeout)
+$script:__rxWinUserPathEscaped = [System.Text.RegularExpressions.Regex]::new('([A-Za-z]:\\\\Users\\\\)([^\\/"'',;:\r\n]+)', $script:__rxWinUserPathOptions, $script:RegexTimeout)
+
+
+# Optional phase timing report (-PerfReport). Behavior-neutral: timings are collected only
+# when enabled and are written at the end of Invoke-UniversalScrubber.
+$script:PerfReportEnabled = $false
+$script:PerfReportDetailedEnabled = $false
+$script:PerfReportRows = $null
+$script:PerfReportPath = $null
+$script:PerfReportTextPath = $null
+
+function New-UlsPerfStopwatch {
+    if (-not $script:PerfReportEnabled) { return $null }
+    return [System.Diagnostics.Stopwatch]::StartNew()
+}
+
+function Add-UlsPerfPhase {
+    param(
+        [Parameter(Mandatory)][string]$Phase,
+        [System.Diagnostics.Stopwatch]$Stopwatch,
+        [double]$Seconds = -1,
+        [string]$File = '',
+        [int]$Rows = -1,
+        [int]$Cells = -1,
+        [string]$Notes = ''
+    )
+    if (-not $script:PerfReportEnabled) { return }
+    if ($null -eq $script:PerfReportRows) { $script:PerfReportRows = New-Object System.Collections.Generic.List[object] }
+    if ($Stopwatch) {
+        if ($Stopwatch.IsRunning) { $Stopwatch.Stop() }
+        $Seconds = $Stopwatch.Elapsed.TotalSeconds
+    }
+    [void]$script:PerfReportRows.Add([pscustomobject]@{
+        Phase   = $Phase
+        File    = $File
+        Seconds = [Math]::Round([double]$Seconds, 3)
+        Rows    = $Rows
+        Cells   = $Cells
+        Notes   = $Notes
+    })
+}
+
+function Write-UlsPerfReport {
+    param([Parameter(Mandatory)][string]$WorkDir)
+    if (-not $script:PerfReportEnabled) { return $null }
+    if ($null -eq $script:PerfReportRows) { $script:PerfReportRows = New-Object System.Collections.Generic.List[object] }
+
+    $csvPath = Resolve-OutPath -Path (Join-Path $WorkDir 'scrub_perf_report.csv')
+    $txtPath = Resolve-OutPath -Path (Join-Path $WorkDir 'scrub_perf_report.txt')
+
+    # Materialize the generic List[object] as a real object array.  Do not use
+    # @($script:PerfReportRows): in some PowerShell/.NET combinations that wraps
+    # the List object itself instead of enumerating its rows, which can produce
+    # noisy post-run Export-Csv / type conversion errors even after scrubbing has
+    # completed successfully.
+    $rows = @(
+        foreach ($r in $script:PerfReportRows) {
+            if ($null -ne $r) { $r }
+        }
+    )
+
+    if ($rows.Count -gt 0) {
+        $rows |
+            Select-Object Phase, File, Seconds, Rows, Cells, Notes |
+            Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        '"Phase","File","Seconds","Rows","Cells","Notes"' | Set-Content -Path $csvPath -Encoding UTF8
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('Universal Log Scrubber performance report')
+    [void]$lines.Add(('GeneratedUtc: {0}' -f ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))))
+    [void]$lines.Add('')
+
+    $preferred = @('Read CSV','Discover identifiers','Build/correlate map','Scrub fields','Post hardening','Leak check','Write output')
+    $grouped = $rows | Group-Object Phase
+    $byPhase = @{}
+    foreach ($g in $grouped) { $byPhase[[string]$g.Name] = [double](($g.Group | Measure-Object -Property Seconds -Sum).Sum) }
+
+    foreach ($p in $preferred) {
+        if ($byPhase.ContainsKey($p)) { [void]$lines.Add(('{0}: {1:N3} sec' -f $p, [double]$byPhase[$p])) }
+        else { [void]$lines.Add(('{0}: 0.000 sec' -f $p)) }
+    }
+    $detailOnlyPhases = @('Scrub column')
+    foreach ($k in ($byPhase.Keys | Sort-Object)) {
+        if ($preferred -contains $k) { continue }
+        if ($detailOnlyPhases -contains $k) { continue }
+        [void]$lines.Add(('{0}: {1:N3} sec' -f $k, [double]$byPhase[$k]))
+    }
+
+    [void]$lines.Add('')
+    [void]$lines.Add('Details:')
+    foreach ($r in $rows) {
+        $detail = '{0} | {1:N3}s | file={2} | rows={3} | cells={4}' -f $r.Phase, [double]$r.Seconds, $r.File, $r.Rows, $r.Cells
+        if ($r.Notes) { $detail += ' | ' + [string]$r.Notes }
+        [void]$lines.Add($detail)
+    }
+
+    [string[]]$lineArray = $lines.ToArray()
+    [System.IO.File]::WriteAllLines($txtPath, $lineArray, [System.Text.Encoding]::UTF8)
+    $script:PerfReportPath = $csvPath
+    $script:PerfReportTextPath = $txtPath
+    Write-Ok "Performance report written: $csvPath"
+    Write-Ok "Performance summary written: $txtPath"
+    return $csvPath
+}
 
 # =====================================================================
 # REGION: Pretty console UI
@@ -430,7 +560,15 @@ function Get-TokenCountInText {
 function Get-TokenCountInFile {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return 0 }
-    try { return (Get-TokenCountInText -Text ([System.IO.File]::ReadAllText($Path))) } catch { return 0 }
+    try {
+        $count = 0
+        $rx = [regex]'(?:HV_|UNMAPPED_)?[A-Z0-9]+(?:_[A-Z0-9]+)*_[A-F0-9]{4,}|(?:BROAD|ADCS|HV_GROUP|BUILTIN)_[A-Z0-9_]+'
+        foreach ($line in [System.IO.File]::ReadLines((Resolve-Path -LiteralPath $Path).Path)) {
+            if ([string]::IsNullOrEmpty($line)) { continue }
+            $count += $rx.Matches($line).Count
+        }
+        return $count
+    } catch { return 0 }
 }
 
 # =====================================================================
@@ -459,7 +597,10 @@ function Normalize-TokenKey {
 
 function ConvertTo-HexString {
     param([byte[]]$Bytes)
-    return (($Bytes | ForEach-Object { $_.ToString("x2") }) -join "")
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return "" }
+    # PowerShell pipeline-per-byte conversion is expensive in hot HMAC fallback paths.
+    # BitConverter preserves the same byte-to-hex content; callers already normalize case.
+    return ([System.BitConverter]::ToString($Bytes).Replace('-', '').ToLowerInvariant())
 }
 
 # Returns "PREFIX_<hex>" or $null if the value cannot be normalized.
@@ -468,13 +609,25 @@ function Invoke-HmacToken {
     $normalized = Normalize-TokenKey -Value $Value
     if (-not $normalized) { return $null }
     $salt = Get-SessionSalt
+    $len = [Math]::Min([Math]::Max($script:HmacLength, 4), 64)
+
+    # Low/medium-risk perf patch: cache deterministic HMAC fallback tokens during a file scrub.
+    # Token-map hits still win before this function is called. The cache key includes salt,
+    # output length, prefix, and normalized value so changing any token parameter cannot reuse
+    # an incompatible token. $null disables caching for direct/discovery callers.
+    $cacheKey = $salt + ([char]0) + ([string]$len) + ([char]0) + $Prefix + ([char]0) + $normalized
+    if ($null -ne $script:__hmacTokenCache -and $script:__hmacTokenCache.ContainsKey($cacheKey)) {
+        return $script:__hmacTokenCache[$cacheKey]
+    }
+
     $keyBytes = [System.Text.Encoding]::UTF8.GetBytes($salt)
     $msgBytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
     $hmac = [System.Security.Cryptography.HMACSHA256]::new($keyBytes)
     try { $hash = $hmac.ComputeHash($msgBytes) } finally { $hmac.Dispose() }
-    $len = [Math]::Min([Math]::Max($script:HmacLength, 4), 64)
     $hex = (ConvertTo-HexString -Bytes $hash).Substring(0, $len).ToUpperInvariant()
-    return "$Prefix`_$hex"
+    $token = "$Prefix`_$hex"
+    if ($null -ne $script:__hmacTokenCache) { $script:__hmacTokenCache[$cacheKey] = $token }
+    return $token
 }
 
 function Is-AlreadyToken {
@@ -579,9 +732,16 @@ function Get-Token {
     if (Is-AlreadyToken -Value $clean) { return $clean }
     $norm = Normalize-TokenKey -Value $clean
     if ($norm -and $script:TokenByNorm.ContainsKey($norm)) { return $script:TokenByNorm[$norm] }
+    if ($script:ScrubPolicy -ne 'Strict' -and (Test-UlsWellKnownSid -Value $clean)) { return $clean }
+    if ($script:ScrubPolicy -ne 'Strict' -and (Test-UlsWellKnownWindowsPrincipal -Value $clean)) { return $clean }
     $known = Get-CanonicalKnownLabelByValue -Value $clean
     if ($known) { return $known }
     if (Test-PreserveDottedDecimal -Value $clean) { return $clean }   # leave OIDs / versions (not IPs) intact
+    # ULS perf patch 5 (FP fix): never tokenize loopback / localhost on ANY path. The universal-label
+    # path otherwise reached the HMAC fallback without the shape path's loopback guard, so values like
+    # ::1 ended up tokenized. Gated -- Strict still tokenizes everything.
+    if ($script:ScrubPolicy -ne 'Strict' -and (Test-PreserveIpAddress -Value $clean)) { return $clean }
+    if ($script:ScrubPolicy -ne 'Strict' -and $Prefix -eq 'IP6' -and -not (Test-UlsValidIpv6Address -Value $clean)) { return $clean }
     $token = Invoke-HmacToken -Value $clean -Prefix $Prefix
     if ($token) { return $token }
     return $clean
@@ -595,18 +755,18 @@ function Get-Token {
 # Each entry: Name, Prefix, Rx (single-quoted regex, no anchors so it can be
 # scanned anywhere in a string).
 $script:ShapeDetectors = @(
-    @{ Name = 'SID';       Prefix = 'SID';  Common = $true; Rx = 'S-1-\d+(?:-\d+)+' },
+    @{ Name = 'SID';       Prefix = 'SID';  Common = $true; Sentinel = 'S-1-'; Rx = 'S-1-\d+(?:-\d+)+' },
     @{ Name = 'GUID';      Prefix = 'GUID'; Common = $true; Rx = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' },
-    @{ Name = 'Email/UPN'; Prefix = 'UNMAPPED_UPN'; Rx = '[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}' },
+    @{ Name = 'Email/UPN'; Prefix = 'UNMAPPED_UPN'; Sentinel = '@'; Rx = '[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}' },
     @{ Name = 'IPv4';      Prefix = 'IP';   Rx = '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)' },
     @{ Name = 'DOMAIN\user'; Prefix = 'PRINCIPAL'; Rx = '(?<![A-Za-z0-9_.\-])[A-Za-z0-9_.\-]+\\[A-Za-z0-9_.\-$]+' },
     @{ Name = 'FQDN';      Prefix = 'DNS';  Rx = '(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}' },
     @{ Name = 'LongHex';   Prefix = 'CERT'; Rx = '(?<![A-Za-z0-9_])[0-9a-fA-F]{20,}(?![A-Za-z0-9_])' },
     # --- v3 additions (also applied at scrub time by Invoke-CommonDetectors) ---
-    @{ Name = 'JWT';       Prefix = 'JWT';  Common = $true; Rx = 'eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}' },
-    @{ Name = 'AWS_ARN';   Prefix = 'ARN';  Common = $true; Rx = 'arn:aws[A-Za-z0-9\-]*:[A-Za-z0-9\-]*:[A-Za-z0-9\-]*:[0-9]*:[A-Za-z0-9_/.:\-]+' },
+    @{ Name = 'JWT';       Prefix = 'JWT';  Common = $true; Sentinel = 'eyJ'; Rx = 'eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}' },
+    @{ Name = 'AWS_ARN';   Prefix = 'ARN';  Common = $true; Sentinel = 'arn:'; Rx = 'arn:aws[A-Za-z0-9\-]*:[A-Za-z0-9\-]*:[A-Za-z0-9\-]*:[0-9]*:[A-Za-z0-9_/.:\-]+' },
     @{ Name = 'AWS_Key';   Prefix = 'AWSKEY'; Common = $true; Rx = '(?:AKIA|ASIA)[0-9A-Z]{16}' },
-    @{ Name = 'CloudInstance'; Prefix = 'INSTANCE'; Common = $true; Rx = '\bi-[0-9a-f]{8,17}\b' },
+    @{ Name = 'CloudInstance'; Prefix = 'INSTANCE'; Common = $true; Sentinel = 'i-'; Rx = '\bi-[0-9a-f]{8,17}\b' },
     @{ Name = 'MAC';       Prefix = 'MAC';  Common = $true; Rx = '(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}' },
     @{ Name = 'IPv6';      Prefix = 'IP6';  Common = $true; Skip = '^\d{1,5}(:\d{1,5}){1,7}$'; Rx = '(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{1,4}|::(?:[A-Fa-f0-9]{1,4}:){0,6}[A-Fa-f0-9]{1,4}|(?:[A-Fa-f0-9]{1,4}:){1,7}:' },
     @{ Name = 'Base64Blob'; Prefix = 'BLOB'; Common = $true; Rx = '(?<![A-Za-z0-9+/=_])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])' }
@@ -638,6 +798,12 @@ function Test-AllowedDomain {
 
 function Get-DetectionContext {
     param([string]$Text, [int]$Index, [int]$Length, [int]$Radius = 48)
+    # ULS perf patch 3: this context string is only consumed by Add-DetectionTrace's
+    # detailed trace, which is discarded unless -ExplainDetections or -FalsePositiveReport
+    # is active (same gate as Add-DetectionTrace). Skip the Substring + regex on the common
+    # (non-reporting) path. Test-DiagnosticContext no longer routes through here (it computes
+    # its own window), so this gate cannot affect any preserve / scrub decision.
+    if (-not $script:ExplainDetections -and [string]::IsNullOrWhiteSpace($script:FalsePositiveReport)) { return "" }
     if ([string]::IsNullOrEmpty($Text) -or $Index -lt 0) { return "" }
     $start = [Math]::Max(0, $Index - $Radius)
     $end = [Math]::Min($Text.Length, $Index + $Length + $Radius)
@@ -680,7 +846,7 @@ function Test-KnownFileOrDiagnosticName {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
     $v = $Value.Trim().Trim('"', "'", '.', ',', ';', ':')
     return (
-        $v -match '(?i)\.(exe|dll|sys|log|dat|xml|csv|txt|dmp|tmp|etl|evtx|werinternalmetadata)$' -or
+        $v -match '(?i)\.(exe|dll|sys|log|dat|xml|csv|txt|dmp|tmp|etl|evtx|edb|asar|unpacked|jar|sqm|mui|cat|inf|werinternalmetadata)$' -or
         $v -match '(?i)^WER[.-]' -or
         $v -match '(?i)^DSS\d*\.log$' -or
         $v -match '(?i)^0x[0-9a-f]+$'
@@ -744,7 +910,13 @@ function Test-LooksLikeBase64Blob {
 
 function Test-DiagnosticContext {
     param([string]$Text, [int]$Index, [int]$Length)
-    $ctx = Get-DetectionContext -Text $Text -Index $Index -Length $Length -Radius 80
+    # Computes its own context window (was Get-DetectionContext -Radius 80) so the perf
+    # gate added to Get-DetectionContext cannot change this preserve decision. The window
+    # math and the cleanup regex are identical to the previous behavior.
+    if ([string]::IsNullOrEmpty($Text) -or $Index -lt 0) { return $false }
+    $start = [Math]::Max(0, $Index - 80)
+    $end   = [Math]::Min($Text.Length, $Index + $Length + 80)
+    $ctx   = (($Text.Substring($start, $end - $start)) -replace "`r|`n", " ")
     return ($ctx -match '(?i)\b(WER|Windows Error Reporting|Fault bucket|Report Id|ReportQueue|ReportArchive|AppHang|LiveKernelEvent|Hashed bucket|Cab Guid|Attached files)\b')
 }
 
@@ -1063,7 +1235,16 @@ function Find-UniversalLabeledLeaks {
     param([Parameter(Mandatory)][string]$Text)
     $leaks = @()
     foreach ($id in (Find-UniversalLabeledIdentifiers -Text $Text)) {
-        if (-not (Is-AlreadyToken -Value $id.Raw)) { $leaks += ("{0}: {1}" -f $id.Rule, $id.Raw) }
+        $rawLeakValue = [string]$id.Raw
+        if (Is-AlreadyToken -Value $rawLeakValue) { continue }
+        if ($rawLeakValue -match '(?i)^[a-z][a-z0-9+.-]*://[^/\s]*(?:HV_)?(?:PRINCIPAL|COMPUTER|GROUP|OBJECT|SID|DNS|UPN|EMAIL|CERT|TEMPLATE|CA|X500|GUID|IP|IP6|HOST|URL|URI|MAC|JWT|ARN|AWSKEY|INSTANCE|BLOB|SECRET|APIKEY|CONNSTR|PEM)_[A-F0-9]{4,}') { continue }
+        if ($rawLeakValue -match '(?i)^(?:Bearer|Basic|Digest|Token)?\s*(?:HV_)?(?:PRINCIPAL|COMPUTER|GROUP|OBJECT|SID|DNS|UPN|EMAIL|CERT|TEMPLATE|CA|X500|GUID|IP|IP6|HOST|URL|URI|MAC|JWT|ARN|AWSKEY|INSTANCE|BLOB|SECRET|APIKEY|CONNSTR|PEM)_[A-F0-9]{4,}$') { continue }
+        # ULS patch 7 (consistency fix): do NOT flag values the scrubber intentionally preserves, so
+        # the leak check agrees with Get-Token. Loopback / localhost (::1, 127.x) are preserved by
+        # Get-Token in Balanced/Readable (patch 5); without this the check flagged its own preserve
+        # (e.g. "AddressLabels: ::1") and failed a file that holds nothing sensitive.
+        if ($script:ScrubPolicy -ne 'Strict' -and (Test-PreserveIpAddress -Value $rawLeakValue)) { continue }
+        $leaks += ("{0}: {1}" -f $id.Rule, $rawLeakValue)
     }
     return @($leaks | Select-Object -Unique)
 }
@@ -1079,6 +1260,9 @@ function Invoke-UniversalLabelHardening {
             $label = ($prefixText -replace '\s*(?:[:=])\s*$', '').Trim()
             $raw = $m.Groups[2].Value.Trim().Trim('"', "'")
             if (Test-PreserveUniversalLabeledValue -Rule $rule -Label $label -Value $raw) { return $m.Value }
+            # ULS patch 9: apply the same high-confidence low-signal filter the discovery and leak-check
+            # finders use, so the scrub agrees with them and stops tokenizing junk words after labels.
+            if (Test-UlsRound3LowSignalUniversalLabel -Value $raw -Rule $rule.Name) { return $m.Value }
             $prefix = Get-UniversalLabeledValuePrefix -Label $label -Value $raw -DefaultPrefix $rule.Prefix
             if (-not $prefix) { return $m.Value }
             $tok = Get-Token -Value $raw -Prefix $prefix
@@ -1152,14 +1336,37 @@ function Invoke-CustomRegexHardening {
     return $out
 }
 
+function Test-UlsWindowsUserPathHardeningNeeded {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    # One sentinel catches both normal paths (C:\Users\name) and JSON/CSV-escaped
+    # paths (C:\\Users\\name), because the escaped form still contains "\Users\"
+    # starting at its second slash. Avoids a second full-string IndexOf on hot fields.
+    return ($Text.IndexOf('\Users\', [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
 function Invoke-WindowsPathUserHardening {
     param([Parameter(Mandatory)][string]$Text)
-    return [regex]::Replace($Text, '(?i)((?:\\\\\?\\)?[A-Za-z]:\\Users\\)([^\\/"'',;:]+)', {
+    if (-not (Test-UlsWindowsUserPathHardeningNeeded -Text $Text)) { return $Text }
+
+    $preserveProfileRegex = '^(Public|Default|Default User|All Users)$'
+    $replaceProfile = {
         param($m)
         $profile = $m.Groups[2].Value
-        if ([string]::IsNullOrWhiteSpace($profile) -or $profile -match '^(Public|Default|Default User|All Users)$') { return $m.Value }
+        if ([string]::IsNullOrWhiteSpace($profile) -or
+            $profile -match $preserveProfileRegex -or
+            (Is-AlreadyToken -Value $profile)) {
+            return $m.Value
+        }
         return $m.Groups[1].Value + (Get-Token -Value $profile -Prefix "PRINCIPAL")
-    })
+    }
+
+    # Normal Windows paths: C:\Users\alice\...
+    $out = $script:__rxWinUserPathNormal.Replace($Text, $replaceProfile)
+
+    # JSON/CSV-escaped Windows paths: C:\\Users\\alice\\...
+    $out = $script:__rxWinUserPathEscaped.Replace($out, $replaceProfile)
+    return $out
 }
 
 function Get-WindowsEventLabelRegex {
@@ -1357,42 +1564,52 @@ function Write-DetectionSummaryReport {
 function Invoke-CommonDetectors {
     param([Parameter(Mandatory)][string]$Text)
     $out = $Text
-    $out = Invoke-WindowsPathUserHardening -Text $out
+    # ULS perf patch 4: cheap literal pre-checks -- skip a pass when the required literal
+    # substring is absent from the current text. Hardening replaces identifiers with tokens
+    # (which never contain these sentinels) and never ADDS one, so skipping a pass that could
+    # not have matched is byte-identical.
+    $oic = [System.StringComparison]::OrdinalIgnoreCase
+    if ($out.IndexOf('\Users\', $oic) -ge 0) { $out = Invoke-WindowsPathUserHardening -Text $out }
 
     # UNC path: tokenize the host in \\host\share (before any DOMAIN\user pass).
-    $out = [regex]::Replace($out, '\\\\([A-Za-z0-9._\-]+)((?:\\[^\s",;]*)?)', {
-        param($m)
-        $h = $m.Groups[1].Value
-        if (Is-AlreadyToken -Value $h) { return $m.Value }
-        if (Test-AllowedDomain -Value $h) { return $m.Value }
-        if (Test-PreserveDetectedValue -Value $h -Detector 'UNC host' -Prefix 'DNS' -Text $out -Index $m.Groups[1].Index -Length $h.Length) { return $m.Value }
-        $tok = Get-Token -Value $h -Prefix "DNS"
-        Add-DetectionTrace -Detector 'UNC host' -Action 'Tokenized' -Value $h -Token $tok -Reason 'UNC host' -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
-        return '\\' + $tok + $m.Groups[2].Value
-    })
+    if ($out.IndexOf('\\') -ge 0) {
+        $out = [regex]::Replace($out, '\\\\([A-Za-z0-9._\-]+)((?:\\[^\s",;]*)?)', {
+            param($m)
+            $h = $m.Groups[1].Value
+            if (Is-AlreadyToken -Value $h) { return $m.Value }
+            if (Test-AllowedDomain -Value $h) { return $m.Value }
+            if (Test-PreserveDetectedValue -Value $h -Detector 'UNC host' -Prefix 'DNS' -Text $out -Index $m.Groups[1].Index -Length $h.Length) { return $m.Value }
+            $tok = Get-Token -Value $h -Prefix "DNS"
+            Add-DetectionTrace -Detector 'UNC host' -Action 'Tokenized' -Value $h -Token $tok -Reason 'UNC host' -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
+            return '\\' + $tok + $m.Groups[2].Value
+        })
+    }
 
     # URL / connection URI: tokenize optional userinfo and the host in scheme://[user@]host[:port]/...
     # Includes common database, cache, queue, Kafka, WebSocket, and JDBC schemes.
-    $out = [regex]::Replace($out, '(?i)\b((?:jdbc:[a-z][a-z0-9+.-]*|https?|ftp|ldap|ldaps|smb|wss?|postgres(?:ql)?|mysql|mssql|sqlserver|redis|mongodb(?:\+srv)?|amqps?|kafka))://([^/\s"'',;]+)', {
-        param($m)
-        $scheme = $m.Groups[1].Value
-        $auth = $m.Groups[2].Value
-        $user = ''
-        $hostport = $auth
-        if ($auth -match '^([^@]+)@(.+)$') { $user = $matches[1]; $hostport = $matches[2] }
-        $hp = $hostport; $port = ''
-        if ($hostport -match '^(.+):(\d+)$') { $hp = $matches[1]; $port = ':' + $matches[2] }
-        $userTok = if ($user) { (Get-Token -Value $user -Prefix "PRINCIPAL") + '@' } else { '' }
-        $hostTok = $hp
-        if (-not (Is-AlreadyToken -Value $hp) -and -not (Test-AllowedDomain -Value $hp) -and -not (Test-PreserveDetectedValue -Value $hp -Detector 'URL host' -Prefix 'DNS' -Text $out -Index $m.Groups[2].Index -Length $auth.Length)) {
-            $hostTok = Get-Token -Value $hp -Prefix "DNS"
-            Add-DetectionTrace -Detector 'URL host' -Action 'Tokenized' -Value $hp -Token $hostTok -Reason 'URL authority host' -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
-        }
-        return $scheme + '://' + $userTok + $hostTok + $port
-    })
+    if ($out.IndexOf('://') -ge 0) {
+        $out = [regex]::Replace($out, '(?i)\b((?:jdbc:[a-z][a-z0-9+.-]*|https?|ftp|ldap|ldaps|smb|wss?|postgres(?:ql)?|mysql|mssql|sqlserver|redis|mongodb(?:\+srv)?|amqps?|kafka))://([^/\s"'',;]+)', {
+            param($m)
+            $scheme = $m.Groups[1].Value
+            $auth = $m.Groups[2].Value
+            $user = ''
+            $hostport = $auth
+            if ($auth -match '^([^@]+)@(.+)$') { $user = $matches[1]; $hostport = $matches[2] }
+            $hp = $hostport; $port = ''
+            if ($hostport -match '^(.+):(\d+)$') { $hp = $matches[1]; $port = ':' + $matches[2] }
+            $userTok = if ($user) { (Get-Token -Value $user -Prefix "PRINCIPAL") + '@' } else { '' }
+            $hostTok = $hp
+            if (-not (Is-AlreadyToken -Value $hp) -and -not (Test-AllowedDomain -Value $hp) -and -not (Test-PreserveDetectedValue -Value $hp -Detector 'URL host' -Prefix 'DNS' -Text $out -Index $m.Groups[2].Index -Length $auth.Length)) {
+                $hostTok = Get-Token -Value $hp -Prefix "DNS"
+                Add-DetectionTrace -Detector 'URL host' -Action 'Tokenized' -Value $hp -Token $hostTok -Reason 'URL authority host' -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
+            }
+            return $scheme + '://' + $userTok + $hostTok + $port
+        })
+    }
 
     # The simple Common-flagged detectors (JWT, ARN, AWS key, instance id, MAC, IPv6, base64).
     foreach ($d in ($script:ShapeDetectors | Where-Object { $_.Common })) {
+        if ($d.Sentinel -and ($out.IndexOf([string]$d.Sentinel, $oic) -lt 0)) { continue }
         $skip = $d.Skip
         $prefix = $d.Prefix
         $out = [regex]::Replace($out, $d.Rx, {
@@ -1529,6 +1746,21 @@ function New-ScrubTokenMapRow {
     }
 }
 
+function Test-UlsShouldMapDiscoveredIdentifier {
+    param(
+        [string]$Raw,
+        [string]$Prefix,
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Raw) -or [string]::IsNullOrWhiteSpace($Prefix)) { return $false }
+    if ($ScrubPolicy -ne 'Strict') {
+        if (Test-UlsWellKnownSid -Value $Raw) { return $false }
+        if (Test-UlsWellKnownWindowsPrincipal -Value $Raw) { return $false }
+    }
+    return $true
+}
+
 function Export-ScrubTokenMapRows {
     param([Parameter(Mandatory)]$Rows, [Parameter(Mandatory)][string]$TokenMapCsv)
     $out = Resolve-OutPath -Path $TokenMapCsv
@@ -1640,7 +1872,21 @@ function New-ScrubTokenMap {
         [string[]]$SeedTerms = @(),
         [switch]$NoCorrelate,
         [ValidateSet('Merge','Replace')][string]$TokenMapMode = 'Merge',
-        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [string]$ProfileName = '',
+        [string]$WorkDir = '',
+        [string[]]$AllowlistFile = @(),
+        [switch]$ParallelDiscovery,
+        [switch]$NoParallelDiscovery,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [int]$LargeFileThresholdMB = 100,
+        [switch]$KeepIntermediate,
+        [string]$WorkerProgressFile,
+        [int]$WorkerProgressRowsTotal = 0,
+        [int]$WorkerProgressChunk = 0,
+        [int]$WorkerProgressIntervalRows = 1000,
+        [int]$WorkerProgressIntervalSeconds = 1
     )
     $script:ScrubPolicy = $ScrubPolicy
     [void](Get-SessionSalt)
@@ -1682,6 +1928,21 @@ function New-ScrubTokenMap {
     # every alias of that identity collapses to ONE token. Disable with -NoCorrelate.
     $correlate = -not $NoCorrelate
     $parent = @{}
+    if ($WorkerProgressIntervalRows -lt 1) { $WorkerProgressIntervalRows = 1000 }
+    if ($WorkerProgressIntervalSeconds -lt 1) { $WorkerProgressIntervalSeconds = 1 }
+    $ulsDiscoverProgressLastRows = -1
+    $ulsDiscoverProgressLastUtc = [DateTime]::UtcNow.AddSeconds(-10)
+    $updateDiscoverWorkerProgress = {
+        param([int]$RowsDone, [string]$Status, [switch]$Force)
+        if ([string]::IsNullOrWhiteSpace($WorkerProgressFile)) { return }
+        $now = [DateTime]::UtcNow
+        if ($Force -or $RowsDone -eq 0 -or (($RowsDone - $ulsDiscoverProgressLastRows) -ge $WorkerProgressIntervalRows) -or (($now - $ulsDiscoverProgressLastUtc).TotalSeconds -ge $WorkerProgressIntervalSeconds)) {
+            Write-UlsWorkerProgressFile -Path $WorkerProgressFile -Chunk $WorkerProgressChunk -RowsDone $RowsDone -RowsTotal $WorkerProgressRowsTotal -Status $Status
+            Set-Variable -Name ulsDiscoverProgressLastRows -Scope 1 -Value $RowsDone
+            Set-Variable -Name ulsDiscoverProgressLastUtc -Scope 1 -Value $now
+        }
+    }
+    try { & $updateDiscoverWorkerProgress 0 'Starting' -Force } catch { }
     function _CorrFind {
         param($x)
         if (-not $parent.ContainsKey($x)) { $parent[$x] = $x }
@@ -1710,76 +1971,193 @@ function New-ScrubTokenMap {
         $isCsv = ([System.IO.Path]::GetExtension($file)).ToLowerInvariant() -eq '.csv'
         $hits = 0
         if ($isCsv) {
-            $rows = @(Import-Csv $file)
-            $total = $rows.Count
+            $fileLength = 0
+            try { $fileLength = (Get-Item -LiteralPath $file).Length } catch { }
+            $reader = [System.IO.StreamReader]::new($file)
+            $headers = @()
+            $discoverScanColumns = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $discoverSkipColumns = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $rn = 0
-            foreach ($row in $rows) {
-                $rn++
-                if ($rn % 250 -eq 0) {
-                    Write-Progress -Activity "Discovering identifiers in $name" -Status "Row $rn of $total ($($seen.Count) unique so far)" -PercentComplete ([int](($rn / [Math]::Max($total,1)) * 100))
+            $ulsPerfDiscover = New-UlsPerfStopwatch
+            $discoverCache = @{}
+            $ulsPerfDiscoverCells = 0
+            $ulsPerfDiscoverSkippedCells = 0
+            try {
+                $headerRecord = Read-UlsDelimitedRecord -Reader $reader -Delimiter ','
+                if ($null -ne $headerRecord) {
+                    $headers = [string[]]$headerRecord
+                    if ($headers.Count -gt 0) { $headers[0] = ([string]$headers[0]).TrimStart([char]0xFEFF) }
+                    foreach ($h in $headers) {
+                        if (Test-UlsDiscoveryShouldScanColumn -Profile $script:CurrentProfile -ColumnName $h) { [void]$discoverScanColumns.Add($h) }
+                        else { [void]$discoverSkipColumns.Add($h) }
+                    }
+                    if ($discoverSkipColumns.Count -gt 0) {
+                        Write-Detail ("Discovery skipped pass-through column(s): {0}" -f (($discoverSkipColumns | Sort-Object) -join ', '))
+                    }
                 }
-                $rowPrincipals = @{}   # localpart -> list of norms seen in THIS row
-                foreach ($prop in $row.PSObject.Properties) {
-                    $cell = [string]$prop.Value
-                    if ([string]::IsNullOrWhiteSpace($cell)) { continue }
-                    foreach ($id in (Find-Identifiers -Text $cell)) {
+
+                while ($true) {
+                    $record = Read-UlsDelimitedRecord -Reader $reader -Delimiter ','
+                    if ($null -eq $record) { break }
+                    $rn++
+                    try { & $updateDiscoverWorkerProgress $rn 'Running' } catch { }
+                    if ($rn % 250 -eq 0) {
+                        $pct = -1
+                        try {
+                            if ($fileLength -gt 0) { $pct = [Math]::Min(99, [Math]::Max(0, [int](([int64]$reader.BaseStream.Position * 100.0) / [double]$fileLength))) }
+                        } catch { }
+                        Write-Progress -Activity "Discovering identifiers in $name" -Status "Row $rn ($($seen.Count) unique so far)" -PercentComplete $pct
+                    }
+                    $rowPrincipals = @{}   # localpart -> list of norms seen in THIS row
+                    for ($ci = 0; $ci -lt $headers.Count; $ci++) {
+                        $propName = [string]$headers[$ci]
+                        if (-not $discoverScanColumns.Contains($propName)) { $ulsPerfDiscoverSkippedCells++; continue }
+                        $ulsPerfDiscoverCells++
+                        $cell = if ($ci -lt $record.Count) { [string]$record[$ci] } else { '' }
+                        if ([string]::IsNullOrWhiteSpace($cell)) { continue }
+                        if ($discoverCache.ContainsKey($cell)) { $cellIds = $discoverCache[$cell] }
+                        else { $cellIds = @(Find-Identifiers -Text $cell); $discoverCache[$cell] = $cellIds }
+                        foreach ($id in $cellIds) {
+                            if (-not (Test-UlsShouldMapDiscoveredIdentifier -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -ScrubPolicy $ScrubPolicy)) { continue }
+                            $norm = Normalize-TokenKey -Value $id.Raw
+                            if (-not $norm) { continue }
+                            if (-not $seen.ContainsKey($norm)) {
+                                $tok = Get-Token -Value $id.Raw -Prefix $id.Prefix
+                                $seen[$norm] = New-ScrubTokenMapRow -InputValue $id.Raw -NormalizedValue $norm -Token $tok -TokenType $id.Prefix -Source $source -SourcePathHash $fileHash
+                                $hits++
+                            }
+                            else {
+                                $seen[$norm].LastSeenSource = $source
+                                if (-not $seen[$norm].SourcePathHash) { $seen[$norm].SourcePathHash = $fileHash }
+                            }
+                            if ($correlate) {
+                                $lp = _LocalPart -Raw $id.Raw -Prefix $id.Prefix
+                                if ($lp -and $lp.Length -ge 3) {
+                                    if (-not $rowPrincipals.ContainsKey($lp)) { $rowPrincipals[$lp] = New-Object System.Collections.Generic.List[string] }
+                                    if (-not $rowPrincipals[$lp].Contains($norm)) { $rowPrincipals[$lp].Add($norm) }
+                                }
+                            }
+                        }
+                    }
+                    if ($correlate) {
+                        foreach ($lp in $rowPrincipals.Keys) {
+                            $members = @($rowPrincipals[$lp])
+                            for ($mi = 1; $mi -lt $members.Count; $mi++) { _CorrUnion $members[0] $members[$mi] }
+                        }
+                    }
+                }
+            }
+            finally {
+                try { $reader.Close() } catch { }
+                Write-Progress -Activity "Discovering identifiers in $name" -Completed
+            }
+            $ulsPerfDiscoverNotes = 'CSV cell identifier scan'
+            if ($discoverSkipColumns.Count -gt 0) {
+                $ulsPerfDiscoverNotes = ('CSV cell identifier scan; scanned={0}; skipped={1}; skippedColumns={2}' -f $ulsPerfDiscoverCells, $ulsPerfDiscoverSkippedCells, (($discoverSkipColumns | Sort-Object) -join ','))
+            }
+            Add-UlsPerfPhase -Phase 'Read CSV' -Seconds 0 -File $name -Rows $rn -Notes 'CSV streaming read interleaved with discovery'
+            Add-UlsPerfPhase -Phase 'Discover identifiers' -Stopwatch $ulsPerfDiscover -File $name -Rows $rn -Cells $ulsPerfDiscoverCells -Notes $ulsPerfDiscoverNotes
+        }
+        else {
+            # Large text/KV/web logs must not be loaded with ReadAllText. A multi-GB access.log
+            # can exceed available string/object memory before discovery even starts. Stream one
+            # line at a time, preserve the same token-map semantics, and keep only the discovered
+            # unique identifiers in memory.
+            $fileLength = 0
+            try { $fileLength = (Get-Item -LiteralPath $file).Length } catch { }
+            $thresholdBytes = [long]([Math]::Max($LargeFileThresholdMB, 1) * 1MB)
+            $autoParallelDiscoveryCandidate = (-not $NoParallelDiscovery -and -not [string]::IsNullOrWhiteSpace($WorkDir) -and -not [string]::IsNullOrWhiteSpace($ProfileName) -and ($fileLength -ge $thresholdBytes -and $ThrottleLimit -gt 1))
+            # Large line-oriented discovery can now use true streaming parallel batches: no physical input chunks.
+            $useParallelDiscovery = (-not $NoParallelDiscovery -and -not [string]::IsNullOrWhiteSpace($WorkDir) -and -not [string]::IsNullOrWhiteSpace($ProfileName) -and ($ParallelDiscovery -or $autoParallelDiscoveryCandidate))
+            if ($autoParallelDiscoveryCandidate -and -not $ParallelDiscovery) {
+                Write-Info ("Auto streaming-parallel discovery ({0} MB; throttle={1}; batchSize={2}; no input chunk files). Use -NoParallelDiscovery to disable." -f [Math]::Round(($fileLength / 1MB),1), $ThrottleLimit, $(if ($ChunkSize -gt 0) { $ChunkSize } else { 5000 }))
+            }
+            if ($useParallelDiscovery) {
+                $workerRows = @(Invoke-DiscoverFileParallelText -InputPath $file -TokenMapCsv $out -WorkDir $WorkDir -ProfileName $ProfileName -SensitiveTerms $SeedTerms -AllowlistFile $AllowlistFile -ScrubPolicy $ScrubPolicy -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -NoCorrelate:$NoCorrelate -KeepIntermediate:$KeepIntermediate)
+                foreach ($wr in $workerRows) {
+                    $inputCol = Get-MapColumnName -Row $wr -Candidates @("InputValue", "OriginalValue", "Value", "SourceValue")
+                    $normCol  = Get-MapColumnName -Row $wr -Candidates @("NormalizedValue", "Normalized", "NormalizedKey")
+                    $tokenCol = Get-MapColumnName -Row $wr -Candidates @("Token", "ScrubbedValue", "Replacement")
+                    if (-not $tokenCol -or [string]::IsNullOrWhiteSpace([string]$wr.$tokenCol)) { continue }
+                    $inputValue = if ($inputCol) { [string]$wr.$inputCol } else { "" }
+                    $norm = if ($normCol -and $wr.$normCol) { Normalize-TokenKey -Value ([string]$wr.$normCol) } else { Normalize-TokenKey -Value $inputValue }
+                    if (-not $norm) { continue }
+                    if (-not $seen.ContainsKey($norm)) {
+                        $tokenType = if ($wr.TokenType) { [string]$wr.TokenType } else { "OBJECT" }
+                        if (-not (Test-UlsShouldMapDiscoveredIdentifier -Raw $inputValue -Prefix $tokenType -ScrubPolicy $ScrubPolicy)) { continue }
+                        $tok = [string]$wr.$tokenCol
+                        $seen[$norm] = New-ScrubTokenMapRow -InputValue $inputValue -NormalizedValue $norm -Token $tok -TokenType $tokenType -Source $source -SourcePathHash $fileHash
+                        $hits++
+                    }
+                    else {
+                        $seen[$norm].LastSeenSource = $source
+                        if (-not $seen[$norm].SourcePathHash) { $seen[$norm].SourcePathHash = $fileHash }
+                    }
+                }
+                Write-Detail ("Parallel discovery merged {0} worker map row(s)." -f $workerRows.Count)
+            }
+            else {
+            $ulsPerfReadText = New-UlsPerfStopwatch
+            $ulsPerfDiscoverText = New-UlsPerfStopwatch
+            $lineNo = 0
+            $candidateNo = 0
+            $lastProgress = [DateTime]::UtcNow.AddSeconds(-10)
+            $activity = "Discovering identifiers in $name"
+            Write-Progress -Activity $activity -Status "Streaming $fileLength bytes" -PercentComplete -1
+            $reader = [System.IO.StreamReader]::new($file)
+            try {
+                while (-not $reader.EndOfStream) {
+                    $line = $reader.ReadLine()
+                    if ($null -eq $line) { break }
+                    $lineNo++
+                    try { & $updateDiscoverWorkerProgress $lineNo 'Running' } catch { }
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+                    $now = [DateTime]::UtcNow
+                    if (($lineNo % 10000 -eq 0) -or (($now - $lastProgress).TotalSeconds -ge 2)) {
+                        $pct = -1
+                        try {
+                            if ($fileLength -gt 0) { $pct = [Math]::Min(99, [int](($reader.BaseStream.Position / [double]$fileLength) * 100)) }
+                        } catch { $pct = -1 }
+                        $status = "Line $lineNo; $($seen.Count) unique so far"
+                        if ($fileLength -gt 0) { $status = "$status; $([Math]::Round(($reader.BaseStream.Position / 1MB),1)) MB / $([Math]::Round(($fileLength / 1MB),1)) MB" }
+                        Write-Progress -Activity $activity -Status $status -PercentComplete $pct
+                        $lastProgress = $now
+                    }
+
+                    foreach ($id in (Find-Identifiers -Text $line)) {
+                        $candidateNo++
+                        if (-not (Test-UlsShouldMapDiscoveredIdentifier -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -ScrubPolicy $ScrubPolicy)) { continue }
                         $norm = Normalize-TokenKey -Value $id.Raw
-                        if (-not $norm) { continue }
-                        if (-not $seen.ContainsKey($norm)) {
+                        if ($norm -and -not $seen.ContainsKey($norm)) {
                             $tok = Get-Token -Value $id.Raw -Prefix $id.Prefix
                             $seen[$norm] = New-ScrubTokenMapRow -InputValue $id.Raw -NormalizedValue $norm -Token $tok -TokenType $id.Prefix -Source $source -SourcePathHash $fileHash
                             $hits++
                         }
-                        else {
+                        elseif ($norm) {
                             $seen[$norm].LastSeenSource = $source
                             if (-not $seen[$norm].SourcePathHash) { $seen[$norm].SourcePathHash = $fileHash }
                         }
-                        if ($correlate) {
-                            $lp = _LocalPart -Raw $id.Raw -Prefix $id.Prefix
-                            if ($lp -and $lp.Length -ge 3) {
-                                if (-not $rowPrincipals.ContainsKey($lp)) { $rowPrincipals[$lp] = New-Object System.Collections.Generic.List[string] }
-                                if (-not $rowPrincipals[$lp].Contains($norm)) { $rowPrincipals[$lp].Add($norm) }
-                            }
-                        }
-                    }
-                }
-                if ($correlate) {
-                    foreach ($lp in $rowPrincipals.Keys) {
-                        $members = @($rowPrincipals[$lp])
-                        for ($mi = 1; $mi -lt $members.Count; $mi++) { _CorrUnion $members[0] $members[$mi] }
                     }
                 }
             }
-            Write-Progress -Activity "Discovering identifiers in $name" -Completed
-        }
-        else {
-            $fileLength = 0
-            try { $fileLength = (Get-Item -LiteralPath $file).Length } catch { }
-            Write-Progress -Activity "Discovering identifiers in $name" -Status "Reading $fileLength bytes" -PercentComplete -1
-            $text = [System.IO.File]::ReadAllText($file)
-            Write-Progress -Activity "Discovering identifiers in $name" -Status "Scanning text/KV content" -PercentComplete -1
-            $ids = @(Find-Identifiers -Text $text)
-            $idNo = 0
-            foreach ($id in $ids) {
-                $idNo++
-                if ($idNo % 500 -eq 0) {
-                    Write-Progress -Activity "Discovering identifiers in $name" -Status "Candidate $idNo of $($ids.Count) ($($seen.Count) unique so far)" -PercentComplete ([int](($idNo / [Math]::Max($ids.Count,1)) * 100))
-                }
-                $norm = Normalize-TokenKey -Value $id.Raw
-                if ($norm -and -not $seen.ContainsKey($norm)) {
-                    $tok = Get-Token -Value $id.Raw -Prefix $id.Prefix
-                    $seen[$norm] = New-ScrubTokenMapRow -InputValue $id.Raw -NormalizedValue $norm -Token $tok -TokenType $id.Prefix -Source $source -SourcePathHash $fileHash
-                    $hits++
-                }
-                elseif ($norm) {
-                    $seen[$norm].LastSeenSource = $source
-                    if (-not $seen[$norm].SourcePathHash) { $seen[$norm].SourcePathHash = $fileHash }
-                }
+            finally {
+                try { $reader.Close() } catch { }
+                Write-Progress -Activity $activity -Completed
             }
-            Write-Progress -Activity "Discovering identifiers in $name" -Completed
+            if ($ulsPerfReadText) { $ulsPerfReadText.Stop() }
+            if ($ulsPerfDiscoverText) { $ulsPerfDiscoverText.Stop() }
+            # For streaming text discovery, reading and scanning are interleaved. Keep summary labels
+            # stable: report zero/near-zero Read CSV and put the work in Discover identifiers.
+            Add-UlsPerfPhase -Phase 'Read CSV' -Seconds 0 -File $name -Rows $lineNo -Notes 'Text/KV streaming read interleaved with discovery'
+            Add-UlsPerfPhase -Phase 'Discover identifiers' -Seconds $ulsPerfDiscoverText.Elapsed.TotalSeconds -File $name -Rows $lineNo -Notes ("Text/KV streaming identifier scan; candidates={0}; bytes={1}" -f $candidateNo, $fileLength)
+            }
         }
         Write-Detail "$hits new identifier(s) from $name"
     }
+    try { & $updateDiscoverWorkerProgress $WorkerProgressRowsTotal 'Completed' -Force } catch { }
+
+    $ulsPerfBuildMap = New-UlsPerfStopwatch
 
     # Seed terms: shapeless secrets (org / host prefixes / project codenames) the
     # detectors cannot recognise. Mapped here so they tokenize consistently.
@@ -1832,6 +2210,7 @@ function New-ScrubTokenMap {
     Write-Ok "Token map written: $out  ($($seen.Count) entries)"
     Write-Warn "DO NOT upload this token map -- it re-identifies everything."
     [void](Import-ScrubTokenMap -TokenMapCsv $out)
+    Add-UlsPerfPhase -Phase 'Build/correlate map' -Stopwatch $ulsPerfBuildMap -File ([System.IO.Path]::GetFileName($out)) -Rows $seen.Count -Notes ('NoCorrelate={0}; Mode={1}' -f [bool]$NoCorrelate, $TokenMapMode)
     return $out
 }
 
@@ -2021,16 +2400,23 @@ function Get-ScrubProfile {
         Name = 'WindowsEventCsv'
         Description = 'Windows event logs exported to CSV.'
         Format = 'Csv'
-        PassThroughRegex = '^(Id|EventID|Level|LevelDisplayName|TimeCreated|RecordId|LogName|ProviderName|Task|Opcode|Keywords|ProcessId|ThreadId)$'
+        PassThroughRegex = '^(Id|EventID|Level|LevelDisplayName|TimeCreated|RecordId|LogName|ProviderName|ProviderId|ProviderGuid|Version|Qualifiers|Task|TaskDisplayName|Opcode|OpcodeDisplayName|Keywords|KeywordsDisplayNames|ProcessId|ThreadId|ActivityId|RelatedActivityId)$'
         ColumnPrefix = @(
-            @{ Pattern = 'account|user|subject|target|caller'; Prefix = 'PRINCIPAL'; DollarComputer = $true },
-            @{ Pattern = 'domain'; Prefix = 'X500' },
-            @{ Pattern = 'computer|host|workstation|machine'; Prefix = 'DNS' },
+            @{ Pattern = 'sid'; Prefix = 'SID' },
             @{ Pattern = 'address|ip'; Prefix = 'IP' },
-            @{ Pattern = 'sid'; Prefix = 'SID' }
+            @{ Pattern = 'computer|host|workstation|machine'; Prefix = 'DNS' },
+            @{ Pattern = 'account|user|subject|target|caller'; Prefix = 'PRINCIPAL'; DollarComputer = $true },
+            @{ Pattern = 'domain'; Prefix = 'X500' }
         )
-        FreeTextRegex = 'Message|Account|User|Subject|Target|Caller|Domain|Computer|Host|Workstation|Address|Process|Path|Command'
-        DenyByDefault = $true
+        FreeTextRegex = '^(Message|EventDataJson)$'
+        DenyByDefault = $false
+        SchemaColumns = ConvertTo-ProfileColumnRules -Rules @(
+            [pscustomobject]@{ Regex = '^(Message|EventDataJson)$'; Action = 'Scan'; Prefix = 'OBJECT' },
+            [pscustomobject]@{ Regex = '^(Id|EventID|Level|LevelDisplayName|TimeCreated|RecordId|LogName|ProviderName|ProviderId|ProviderGuid|Version|Qualifiers|Task|TaskDisplayName|Opcode|OpcodeDisplayName|Keywords|KeywordsDisplayNames|ProcessId|ThreadId|ActivityId|RelatedActivityId)$'; Action = 'PassThrough'; Prefix = 'OBJECT' }
+        ) -DefaultAction 'Scan' -DefaultPrefix 'OBJECT' -Context 'WindowsEventCsv SchemaColumns'
+        WholeColumnRules = ConvertTo-ProfileColumnRules -Rules @(
+            [pscustomobject]@{ Regex = '^(MachineName|ComputerName)$'; Action = 'Scrub'; Prefix = 'COMPUTER' }
+        ) -DefaultAction 'Scrub' -DefaultPrefix 'COMPUTER' -Context 'WindowsEventCsv WholeColumnRules'
     }
 
     # Free-form text logs (syslog, application logs, JSON lines, key=value).
@@ -2979,8 +3365,10 @@ function Get-FallbackPrefix {
     # Defer multi-valued cells to the caller's list branch.
     if ($Value -match ';|\|') { return $null }
     # Universal pass-through shapes (never tokenize these).
-    if ($col -match 'requestid|date|time|when|disposition|validity|count|number|status|flag|enabled|required|approval|candidate') { return $null }
+    if ($col -notmatch 'serial|certificate|cert|hash|thumbprint' -and $col -match 'requestid|date|time|when|disposition|validity|count|number|status|flag|enabled|required|approval|candidate') { return $null }
     if ($col -match 'eku|oid|authcapable|published') { return $null }
+
+    if ($Value -match '^S-1-\d+(?:-\d+)+$') { return 'SID' }
 
     foreach ($rule in $Profile.ColumnPrefix) {
         if ($col -match $rule.Pattern) {
@@ -3002,6 +3390,8 @@ function Get-TokenForAtomicValue {
     if (Test-ScrubAllowlist -Value $clean) { return $clean }
     $norm = Normalize-TokenKey -Value $clean
     if ($norm -and $script:TokenByNorm.ContainsKey($norm)) { return $script:TokenByNorm[$norm] }
+    if ($script:ScrubPolicy -ne 'Strict' -and (Test-UlsWellKnownSid -Value $clean)) { return $clean }
+    if ($script:ScrubPolicy -ne 'Strict' -and (Test-UlsWellKnownWindowsPrincipal -Value $clean)) { return $clean }
     $known = Get-CanonicalKnownLabelByValue -Value $clean
     if ($known) { return $known }
     if (Test-PreserveDottedDecimal -Value $clean) { return $clean }   # OID / version (not an IP)
@@ -3011,6 +3401,9 @@ function Get-TokenForAtomicValue {
     if (($ColumnName -match 'date|time|when|notbefore|notafter') -and [datetime]::TryParse($clean, [ref]$date)) { return $clean }
     $prefix = Get-FallbackPrefix -ColumnName $ColumnName -Value $clean -Profile $Profile
     if ($prefix) {
+        $atomicContext = ("{0}: {1}" -f $ColumnName, $clean)
+        $atomicIndex = [Math]::Max(0, $atomicContext.Length - $clean.Length)
+        if (Test-PreserveDetectedValue -Value $clean -Detector 'AtomicValue' -Prefix $prefix -Text $atomicContext -Index $atomicIndex -Length $clean.Length) { return $clean }
         $token = Invoke-HmacToken -Value $clean -Prefix $prefix
         if ($token) { return $token }
     }
@@ -3027,6 +3420,27 @@ function Get-MatchingProfileColumnRule {
         if ($rule.RegexObject.IsMatch($ColumnName)) { return $rule }
     }
     return $null
+}
+
+function Test-UlsDiscoveryShouldScanColumn {
+    param($Profile, [string]$ColumnName)
+    if (-not $Profile -or [string]::IsNullOrWhiteSpace($ColumnName)) { return $true }
+
+    # Discovery should not spend regex time on columns that the active profile already
+    # treats as analytical/pass-through metadata. This is deliberately profile-aware and
+    # mirrors Scrub-FieldCore's pass-through logic for non-Strict policy. It does NOT skip
+    # whole-column scrub rules such as MachineName/ComputerName, and it does NOT skip
+    # Message/EventDataJson scan columns.
+    try {
+        $schemaRule = Get-MatchingProfileColumnRule -Profile $Profile -ColumnName $ColumnName -RuleSet 'SchemaColumns'
+        if ($schemaRule -and $schemaRule.Action -eq 'PassThrough' -and $script:ScrubPolicy -ne 'Strict') { return $false }
+    } catch { }
+
+    try {
+        if ($Profile.PassThroughRegex -and ($ColumnName -match $Profile.PassThroughRegex) -and $script:ScrubPolicy -ne 'Strict') { return $false }
+    } catch { }
+
+    return $true
 }
 
 function Invoke-TokenizeWholeValue {
@@ -3053,6 +3467,280 @@ function Invoke-TokenizeWholeValue {
     return (Get-Token -Value $clean -Prefix $Prefix)
 }
 
+function Test-UlsWindowsEventCsvProfile {
+    param($Profile)
+    try { return ($Profile -and ([string]$Profile.Name -ieq 'WindowsEventCsv')) } catch { return $false }
+}
+
+function Test-UlsValidIpv6Address {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $trimChars = [char[]]@('[',']','(',')','{','}','"',[char]39,',',';')
+    $v = ([string]$Value).Trim().Trim($trimChars)
+    if ($v -notmatch ':') { return $false }
+    $addr = [System.Net.IPAddress]::None
+    if (-not [System.Net.IPAddress]::TryParse($v, [ref]$addr)) { return $false }
+    return ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6)
+}
+
+function Test-UlsWellKnownSid {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = ([string]$Value).Trim()
+    return (
+        $v -match '^S-1-0-0$' -or
+        $v -match '^S-1-1-0$' -or
+        $v -match '^S-1-[23]-' -or
+        $v -match '^S-1-5-(18|19|20|113|114)$' -or
+        $v -match '^S-1-5-(32|80|90|96)-' -or
+        $v -match '^S-1-15-' -or
+        $v -match '^S-1-16-'
+    )
+}
+
+function Test-UlsWellKnownWindowsPrincipal {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = ([string]$Value).Trim().Trim('"', "'", '.', ',', ';', ':', '}', ']', ')')
+    return (
+        $v -match '(?i)^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE|ANONYMOUS LOGON|Guest|DefaultAccount|WDAGUtilityAccount|DWM-\d+|UMFD-\d+)$' -or
+        $v -match '(?i)^(NT AUTHORITY|BUILTIN|WORKGROUP|Window Manager|Font Driver Host)$' -or
+        $v -match '(?i)^(NT AUTHORITY|BUILTIN|Window Manager|Font Driver Host)\\'
+    )
+}
+
+function Get-UlsDetectorContext {
+    param([string]$Text, [int]$Index = -1, [int]$Length = 0, [int]$Radius = 80)
+    if ([string]::IsNullOrEmpty($Text) -or $Index -lt 0) { return '' }
+    $start = [Math]::Max(0, $Index - $Radius)
+    $end = [Math]::Min($Text.Length, $Index + [Math]::Max($Length, 1) + $Radius)
+    return (($Text.Substring($start, $end - $start)) -replace "`r|`n", " ")
+}
+
+function Test-UlsGuidHasSensitiveContext {
+    param([string]$Text, [int]$Index = -1, [int]$Length = 0)
+    $ctx = Get-UlsDetectorContext -Text $Text -Index $Index -Length $Length
+    return ($ctx -match '(?i)\b(logon\s*guid|logonguid|client\s*request\s*id|clientrequestid|request\s*id|requestid|correlation\s*id|correlationid|trace\s*id|traceid|session\s*id|sessionid|transaction\s*id|transactionid|operation\s*id|operationid|object\s*id|objectid|tenant\s*id|tenantid|application\s*id|applicationid)\b')
+}
+
+function Test-UlsLongHexHasSensitiveContext {
+    param([string]$Text, [int]$Index = -1, [int]$Length = 0)
+    $ctx = Get-UlsDetectorContext -Text $Text -Index $Index -Length $Length
+    return ($ctx -match '(?i)\b(thumbprint|hash|sha1|sha256|certificate|cert|serial|serialnumber|serial\s*number|signature|token|secret|key|password|credential)\b')
+}
+
+function Get-UlsConnectionHostPrefix {
+    param([string]$HostValue)
+    if ([string]::IsNullOrWhiteSpace($HostValue)) { return $null }
+    $h = ([string]$HostValue).Trim().Trim('[',']')
+    if ($h -match '(?i)^(yes|no|true|false|null|none|unknown|default|failed|success|succeeded|error|warning|info|localhost)$') { return $null }
+    if ($h -match '^\d{1,3}(\.\d{1,3}){3}$') { return 'IP' }
+    if ($h -match ':' -and (Test-UlsValidIpv6Address -Value $h)) { return 'IP6' }
+    if ($h.Length -lt 3) { return $null }
+    if ($h -match '^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$') { return 'DNS' }
+    return $null
+}
+
+function Invoke-UlsConnectionHostHardening {
+    param([Parameter(Mandatory)][string]$Text, [string]$ColumnName)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    if ($Text.IndexOf('://') -lt 0 -and $Text -notmatch '(?i)\b(server|host|address|bootstrap\.servers|broker\.list|data source)\s*=') { return $Text }
+
+    $out = [regex]::Replace($Text, '(?i)(?<prefix>\b(?:jdbc:[a-z0-9+.-]+:)?(?:postgres(?:ql)?|mysql|mariadb|sqlserver|oracle|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|kafka|zookeeper|ws|wss|http|https)://(?:[^@\s/;,?]+@)?)(?<host>\[[^\]\s]+\]|[A-Za-z0-9][A-Za-z0-9_.-]{0,252}|\d{1,3}(?:\.\d{1,3}){3})(?<suffix>(?::\d{1,5})?)', {
+        param($m)
+        $rawHost = $m.Groups['host'].Value
+        $host = $rawHost.Trim('[',']')
+        if ((Is-AlreadyToken -Value $host) -or (Test-ScrubAllowlist -Value $host) -or (Test-AllowedDomain -Value $host)) { return $m.Value }
+        $prefix = Get-UlsConnectionHostPrefix -HostValue $host
+        if (-not $prefix) { return $m.Value }
+        $tok = Get-Token -Value $host -Prefix $prefix
+        if ($rawHost.StartsWith('[') -and $rawHost.EndsWith(']')) { $tok = "[$tok]" }
+        Add-DetectionTrace -Detector 'ConnectionHost' -Action 'Tokenized' -Value $host -Token $tok -Reason 'URL/connection string host' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
+        return $m.Groups['prefix'].Value + $tok + $m.Groups['suffix'].Value
+    })
+
+    $out = [regex]::Replace($out, '(?i)(?<prefix>\b(?:server|host|address|bootstrap\.servers|broker\.list|data source)\s*=\s*)(?<host>[A-Za-z0-9][A-Za-z0-9_.-]{1,252}|\d{1,3}(?:\.\d{1,3}){3})(?<suffix>(?::\d{1,5})?)', {
+        param($m)
+        $host = $m.Groups['host'].Value
+        if ((Is-AlreadyToken -Value $host) -or (Test-ScrubAllowlist -Value $host) -or (Test-AllowedDomain -Value $host)) { return $m.Value }
+        $prefix = Get-UlsConnectionHostPrefix -HostValue $host
+        if (-not $prefix) { return $m.Value }
+        $tok = Get-Token -Value $host -Prefix $prefix
+        Add-DetectionTrace -Detector 'ConnectionHost' -Action 'Tokenized' -Value $host -Token $tok -Reason 'Connection string host key' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
+        return $m.Groups['prefix'].Value + $tok + $m.Groups['suffix'].Value
+    })
+
+    return $out
+}
+
+function Get-UlsWindowsEventKeyPrefix {
+    param([string]$KeyName, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($KeyName) -or [string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $k = ([string]$KeyName).Trim()
+    $v = ([string]$Value).Trim().Trim('"', "'", '.', ',', ';', ':', '}', ']', ')')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    if (Test-UlsWellKnownSid -Value $v) { return $null }
+    if (Test-UlsWellKnownWindowsPrincipal -Value $v) { return $null }
+    if ($v -match '^(?:-|N/A|NULL|\(null\)|0x[0-9a-fA-F]+|\d+)$') { return $null }
+    if ($k -match '(?i)(process\s*id|processid|thread\s*id|threadid|logon\s*id|logonid|record\s*id|recordid|event\s*id|eventid|provider\s*guid|providerguid|activity\s*id|activityid|opcode|keywords|level|time|date)') { return $null }
+    if ($k -match '(?i)(path|process\s*name|processname|image|filename|file\s*name|commandline|command\s*line)$') { return $null }
+    if ($k -match '(?i)(sid|security\s*id)$' -or $v -match '^S-1-\d+(?:-\d+)+$') { return 'SID' }
+    if ($k -match '(?i)(ip|address|network\s*address|client\s*address|source\s*address|destination\s*address)') {
+        if ($v -match ':' -and (Test-UlsValidIpv6Address -Value $v)) { return 'IP6' }
+        return 'IP'
+    }
+    # line 3258 — allow the trailing " Name" / "Name" suffix that Windows event keys use
+    if ($k -match '(?i)(computer|machine|workstation|hostname|host|server)(\s*name)?$') { return 'COMPUTER' }
+    # if ($k -match '(?i)(computer|machine|workstation|hostname|host\s*name|host)$') { return 'COMPUTER' }
+    if ($k -match '(?i)(domain|realm)$') { return 'COMPUTER' }
+    if ($k -match '(?i)(user|account|subject|target|caller|member|identity|principal|service)') {
+        if ($v -match '\$$') { return 'COMPUTER' }
+        return 'PRINCIPAL'
+    }
+    if ($k -match '(?i)(logon\s*guid|logonguid|correlation\s*id|correlationid|request\s*id|requestid|trace\s*id|traceid|session\s*id|sessionid)$' -and $v -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$') { return 'GUID' }
+    return $null
+}
+
+function Invoke-UlsWindowsEventKeyValueToken {
+    param(
+        [string]$KeyName,
+        [string]$Value,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    $raw = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $Value }
+    if ((Is-AlreadyToken -Value $raw) -or (Test-ScrubAllowlist -Value $raw)) { return $Value }
+    $prefix = Get-UlsWindowsEventKeyPrefix -KeyName $KeyName -Value $raw
+    if (-not $prefix) { return $Value }
+    if (Test-PreserveDetectedValue -Value $raw -Detector 'WindowsEventKey' -Prefix $prefix -Text $Text -Index $Index -Length $Length) { return $Value }
+    return (Get-Token -Value $raw -Prefix $prefix)
+}
+
+function Invoke-UlsWindowsEventLabeledHardening {
+    param([Parameter(Mandatory)][string]$Text, [string]$ColumnName)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    $labelPattern = '(?i)(?<prefix>\b(?:Security ID|Account Name|Account Domain|Caller Workstation|Workstation Name|Source Network Address|Client Address|IP Address|Computer Name|Server Name|Target User Name|Target Domain Name|Subject User Name|Subject Domain Name|TargetSid|SubjectUserSid|TargetUserName|SubjectUserName|TargetDomainName|SubjectDomainName|WorkstationName|IpAddress)\s*:\s*)(?<value>[^\s,;]+)'
+    return [regex]::Replace($Text, $labelPattern, {
+        param($m)
+        $labelText = $m.Groups['prefix'].Value
+        $key = ($labelText -replace '[:\s]+$', '').Trim()
+        $value = $m.Groups['value'].Value
+        $tok = Invoke-UlsWindowsEventKeyValueToken -KeyName $key -Value $value -Text $Text -Index $m.Groups['value'].Index -Length $m.Groups['value'].Length
+        if ($tok -eq $value) { return $m.Value }
+        Add-DetectionTrace -Detector 'WindowsEventKey' -Action 'Tokenized' -Value $value -Token $tok -Reason $key -ColumnName $ColumnName -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
+        return $labelText + $tok
+    })
+}
+
+function Invoke-UlsWindowsEventFlatJsonScrub {
+    param([Parameter(Mandatory)][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    if ($Text -notmatch '^\s*[\{\[]') { return $Text }
+    $pattern = '(?<prefix>"(?<key>[^"\\]+)"\s*:\s*")(?<value>[^"\\]*(?:\\.[^"\\]*)*)(?<suffix>")'
+    return [regex]::Replace($Text, $pattern, {
+        param($m)
+        $key = $m.Groups['key'].Value
+        $value = $m.Groups['value'].Value
+        $tok = Invoke-UlsWindowsEventKeyValueToken -KeyName $key -Value $value -Text $Text -Index $m.Groups['value'].Index -Length $m.Groups['value'].Length
+        if ($tok -eq $value) { return $m.Value }
+        Add-DetectionTrace -Detector 'WindowsEventJsonKey' -Action 'Tokenized' -Value $value -Token $tok -Reason $key -ColumnName 'EventDataJson' -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
+        return $m.Groups['prefix'].Value + $tok + $m.Groups['suffix'].Value
+    })
+}
+
+function Invoke-UlsWindowsEventMessageHardening {
+    param([Parameter(Mandatory)][string]$Text, [string]$ColumnName)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+
+    $out = $Text
+    $out = Invoke-SecretHardening -Text $out -ColumnName $ColumnName
+    $out = Invoke-CustomRegexHardening -Text $out -ColumnName $ColumnName
+    $out = Invoke-UlsConnectionHostHardening -Text $out -ColumnName $ColumnName
+    $out = Invoke-UlsWindowsEventLabeledHardening -Text $out -ColumnName $ColumnName
+    $out = Invoke-WindowsPathUserHardening -Text $out
+
+    if ($out.IndexOf('S-1-', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $out = [regex]::Replace($out, 'S-1-\d+(?:-\d+)+', {
+            param($m)
+            if (Test-PreserveDetectedValue -Value $m.Value -Detector 'SID' -Prefix 'SID' -Text $out -Index $m.Index -Length $m.Length) { return $m.Value }
+            return (Get-Token -Value $m.Value -Prefix 'SID')
+        })
+    }
+    if ($out.IndexOf('\') -ge 0) {
+        $out = [regex]::Replace($out, '(?<![A-Za-z0-9_.\-:\\/?])[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+', {
+            param($m)
+            if (Test-PreserveDetectedValue -Value $m.Value -Detector 'DOMAIN\user' -Prefix 'PRINCIPAL' -Text $out -Index $m.Index -Length $m.Length) { return $m.Value }
+            return (Get-Token -Value $m.Value -Prefix 'PRINCIPAL')
+        })
+    }
+    if ($out.IndexOf('@') -ge 0) {
+        $out = [regex]::Replace($out, '\b[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', {
+            param($m)
+            if ((Is-AlreadyToken -Value $m.Value) -or (Test-AllowedDomain -Value $m.Value)) { return $m.Value }
+            return (Get-Token -Value $m.Value -Prefix 'UNMAPPED_UPN')
+        })
+    }
+    $out = [regex]::Replace($out, '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)', {
+        param($m)
+        if (Test-PreserveDetectedValue -Value $m.Value -Detector 'IPv4' -Prefix 'IP' -Text $out -Index $m.Index -Length $m.Length) { return $m.Value }
+        return (Get-Token -Value $m.Value -Prefix 'IP')
+    })
+    if ($out.IndexOf(':') -ge 0) {
+        $out = [regex]::Replace($out, '(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{1,4}|::(?:[A-Fa-f0-9]{1,4}:){0,6}[A-Fa-f0-9]{1,4}|(?:[A-Fa-f0-9]{1,4}:){1,7}:', {
+            param($m)
+            if (Test-PreserveDetectedValue -Value $m.Value -Detector 'IPv6' -Prefix 'IP6' -Text $out -Index $m.Index -Length $m.Length) { return $m.Value }
+            return (Get-Token -Value $m.Value -Prefix 'IP6')
+        })
+    }
+    if ($out.IndexOf('.') -ge 0) {
+        $out = [regex]::Replace($out, '\b(?=[A-Za-z0-9.-]*[A-Za-z])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b', {
+            param($m)
+            $value = $m.Value
+            if ((Is-AlreadyToken -Value $value) -or (Test-AllowedDomain -Value $value) -or (Test-PreserveDetectedValue -Value $value -Detector 'FQDN' -Prefix 'DNS' -Text $out -Index $m.Index -Length $m.Length)) { return $value }
+            return (Get-Token -Value $value -Prefix 'DNS')
+        })
+    }
+
+    if ($script:ScrubPolicy -eq 'Strict') {
+        $out = Invoke-CommonDetectors -Text $out
+    }
+    else {
+        $out = [regex]::Replace($out, '(?i)\b(?:(?:logon\s*guid|client\s*request\s*id|correlation\s*id|trace\s*id|session\s*id|transaction\s*id|operation\s*id)\s*[:=]\s*)\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?', {
+            param($m)
+            $guid = [regex]::Match($m.Value, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}').Value
+            if ([string]::IsNullOrWhiteSpace($guid)) { return $m.Value }
+            return ($m.Value -replace [regex]::Escape($guid), (Get-Token -Value $guid -Prefix 'GUID'))
+        })
+    }
+    return $out
+}
+
+function Invoke-UlsWindowsEventDataJsonScrub {
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)]$Profile)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    $trim = ([string]$Text).Trim().TrimStart([char]0xFEFF)
+    if ($trim -match '^[\{\[]') {
+        $fast = Invoke-UlsWindowsEventFlatJsonScrub -Text $Text
+        $fast = Invoke-WindowsPathUserHardening -Text $fast
+        if ($fast -ne $Text) { return $fast }
+        if ([regex]::IsMatch($Text, '"[^"\\]+"\s*:\s*"')) { return $fast }
+        try {
+            $obj = $trim | ConvertFrom-Json -ErrorAction Stop
+            $scrubbed = Invoke-JsonNodeScrub -Node $obj -Profile $Profile -KeyName '' -Changes $null -MaxDepth 40 -Seen @{}
+            $jsonOut = $scrubbed | ConvertTo-Json -Depth 40 -Compress
+            $jsonOut = Invoke-JsonSerializedKeyValueHardening -Text $jsonOut -Profile $Profile -Changes $null
+            return (Invoke-WindowsPathUserHardening -Text $jsonOut)
+        }
+        catch { }
+    }
+    # Invoke-UlsWindowsEventMessageHardening already runs Invoke-WindowsPathUserHardening.
+    # Avoid a duplicate scan on fallback EventDataJson values.
+    return (Invoke-UlsWindowsEventMessageHardening -Text $Text -ColumnName 'EventDataJson')
+}
+
 # Per-field free-text hardening (the fuller set; safe because it runs on ONE cell,
 # not across the whole CSV). Every match routes through Get-Token.
 function __ULS_Legacy_Invoke_FreeTextHardening_3040 {
@@ -3063,32 +3751,46 @@ function __ULS_Legacy_Invoke_FreeTextHardening_3040 {
     $out = Invoke-CustomRegexHardening -Text $out -ColumnName $ColumnName
     $out = Invoke-CommonDetectors -Text $out
     $out = Invoke-UniversalLabelHardening -Text $out -ColumnName $ColumnName
-    $out = [regex]::Replace($out, 'S-1-\d+(?:-\d+)+', { param($m) Get-Token -Value $m.Value -Prefix "SID" })
-    $out = [regex]::Replace($out, '(?im)(\bCertificateTemplate\s*:\s*)([A-Za-z0-9_.\-]+)', {
-        param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "TEMPLATE") } })
+    # ULS perf patch 4: skip an inline pass when its regex's required literal substring is absent
+    # from the current text. Byte-identical -- hardening replaces identifiers with tokens (which
+    # contain none of these sentinels) and never adds one, so a skipped pass could not have matched.
+    $oic = [System.StringComparison]::OrdinalIgnoreCase
+    if ($out.IndexOf('S-1-', $oic) -ge 0) {
+        $out = [regex]::Replace($out, 'S-1-\d+(?:-\d+)+', { param($m) Get-Token -Value $m.Value -Prefix "SID" })
+    }
+    if ($out.IndexOf('CertificateTemplate', $oic) -ge 0) {
+        $out = [regex]::Replace($out, '(?im)(\bCertificateTemplate\s*:\s*)([A-Za-z0-9_.\-]+)', {
+            param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "TEMPLATE") } })
+    }
     $out = [regex]::Replace($out, '(?im)(\b(?:cdc|rmd|ccm)\s*:\s*)([A-Za-z0-9_.\-]+)', {
         param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "DNS") } })
-    $out = [regex]::Replace($out, '(?im)(\b(?:DNS Name|Principal Name|RFC822 Name|URL|URI|IP Address)\s*=\s*)([^,;\r\n]+)', {
-        param($m)
-        $label = $m.Groups[1].Value
-        $rawVal = $m.Groups[2].Value.Trim()
-        if (Is-AlreadyToken -Value $rawVal) { return $label + $rawVal }
-        if ($label -match '(?i)IP Address') { return $label + (Get-Token -Value $rawVal -Prefix "IP") }
-        if ($label -match '(?i)Principal Name|RFC822 Name') { return $label + (Get-Token -Value $rawVal -Prefix "UNMAPPED_UPN") }
-        if ($label -match '(?i)URL|URI') { return $label + (Get-Token -Value $rawVal -Prefix "URI") }
-        return $label + (Get-Token -Value $rawVal -Prefix "DNS") })
-    $out = [regex]::Replace($out, '(?<![A-Za-z0-9_.\-:\\/?])[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+', {
-        param($m)
-        if (Test-PreserveDetectedValue -Value $m.Value -Detector 'DOMAIN\user' -Prefix 'PRINCIPAL' -Text $out -Index $m.Index -Length $m.Length) {
-            Add-DetectionTrace -Detector 'DOMAIN\user' -Action 'Preserved' -Value $m.Value -Token '' -Reason 'Windows path segment' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
-            return $m.Value
-        }
-        $tok = Get-Token -Value $m.Value -Prefix "PRINCIPAL"
-        Add-DetectionTrace -Detector 'DOMAIN\user' -Action 'Tokenized' -Value $m.Value -Token $tok -Reason 'Standalone DOMAIN\user' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
-        return $tok
-    })
-    $out = [regex]::Replace($out, '\b[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', {
-        param($m) if ((Is-AlreadyToken -Value $m.Value) -or (Test-AllowedDomain -Value $m.Value)) { return $m.Value } else { return Get-Token -Value $m.Value -Prefix "UNMAPPED_UPN" } })
+    if ($out.IndexOf('=') -ge 0) {
+        $out = [regex]::Replace($out, '(?im)(\b(?:DNS Name|Principal Name|RFC822 Name|URL|URI|IP Address)\s*=\s*)([^,;\r\n]+)', {
+            param($m)
+            $label = $m.Groups[1].Value
+            $rawVal = $m.Groups[2].Value.Trim()
+            if (Is-AlreadyToken -Value $rawVal) { return $label + $rawVal }
+            if ($label -match '(?i)IP Address') { return $label + (Get-Token -Value $rawVal -Prefix "IP") }
+            if ($label -match '(?i)Principal Name|RFC822 Name') { return $label + (Get-Token -Value $rawVal -Prefix "UNMAPPED_UPN") }
+            if ($label -match '(?i)URL|URI') { return $label + (Get-Token -Value $rawVal -Prefix "URI") }
+            return $label + (Get-Token -Value $rawVal -Prefix "DNS") })
+    }
+    if ($out.IndexOf('\') -ge 0) {
+        $out = [regex]::Replace($out, '(?<![A-Za-z0-9_.\-:\\/?])[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+', {
+            param($m)
+            if (Test-PreserveDetectedValue -Value $m.Value -Detector 'DOMAIN\user' -Prefix 'PRINCIPAL' -Text $out -Index $m.Index -Length $m.Length) {
+                Add-DetectionTrace -Detector 'DOMAIN\user' -Action 'Preserved' -Value $m.Value -Token '' -Reason 'Windows path segment' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
+                return $m.Value
+            }
+            $tok = Get-Token -Value $m.Value -Prefix "PRINCIPAL"
+            Add-DetectionTrace -Detector 'DOMAIN\user' -Action 'Tokenized' -Value $m.Value -Token $tok -Reason 'Standalone DOMAIN\user' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
+            return $tok
+        })
+    }
+    if ($out.IndexOf('@') -ge 0) {
+        $out = [regex]::Replace($out, '\b[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', {
+            param($m) if ((Is-AlreadyToken -Value $m.Value) -or (Test-AllowedDomain -Value $m.Value)) { return $m.Value } else { return Get-Token -Value $m.Value -Prefix "UNMAPPED_UPN" } })
+    }
     $out = [regex]::Replace($out, '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)', {
         param($m) if (Test-PreserveDetectedValue -Value $m.Value -Detector 'IPv4' -Prefix 'IP' -Text $out -Index $m.Index -Length $m.Length) { return $m.Value } else { return Get-Token -Value $m.Value -Prefix "IP" }
     })
@@ -3106,7 +3808,9 @@ function __ULS_Legacy_Invoke_FreeTextHardening_3040 {
         $tok = Get-Token -Value $value -Prefix "DNS"
         Add-DetectionTrace -Detector 'FQDN' -Action 'Tokenized' -Value $value -Token $tok -Reason 'Private or unknown dotted host' -ColumnName $ColumnName -Context (Get-DetectionContext -Text $out -Index $m.Index -Length $m.Length)
         return $tok })
-    $out = [regex]::Replace($out, '(?i)\b(?:CN|OU|DC|O|L|ST|C)=[^;,\r\n]+', { param($m) Get-Token -Value $m.Value -Prefix "X500" })
+    if ($out.IndexOf('=') -ge 0) {
+        $out = [regex]::Replace($out, '(?i)\b(?:CN|OU|DC|O|L|ST|C)=[^;,\r\n]+', { param($m) Get-Token -Value $m.Value -Prefix "X500" })
+    }
     $out = [regex]::Replace($out, '(?<![A-Za-z0-9_])[0-9a-fA-F]{20,}(?![A-Za-z0-9_])', {
         param($m)
         if (Test-PreserveDetectedValue -Value $m.Value -Detector 'LongHex' -Prefix 'CERT' -Text $out -Index $m.Index -Length $m.Length) {
@@ -3121,6 +3825,32 @@ function __ULS_Legacy_Invoke_FreeTextHardening_3040 {
 }
 
 function Scrub-Field {
+    # ULS perf patch 1: per-file memoization wrapper. Within a single file scrub the salt,
+    # the loaded token map, the scrub policy, the profile, and the allowlist are all fixed,
+    # and Get-Token never mutates the loaded map -- so an identical (column, value) cell
+    # always scrubs to the same string. Caching that result is byte-identical to recomputing
+    # it and removes the dominant cost on repetitive logs (e.g. Windows Security messages).
+    # The cache is created fresh per file in Invoke-ScrubFile; when $script:__cellCache is
+    # $null (direct callers, discovery) this wrapper simply forwards to Scrub-FieldCore.
+    #
+    # Disclosure: because duplicates are not recomputed, -DetectionSummaryReport counts and
+    # the fail-closed fallback tally become per-DISTINCT-value rather than per-occurrence.
+    # The scrubbed output file, the token map, and the leak-check verdict are UNCHANGED.
+    param([string]$ColumnName, $Value, $Profile)
+    if ($null -eq $Value) { return $null }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $text }
+    if ($null -eq $script:__cellCache) {
+        return (Scrub-FieldCore -ColumnName $ColumnName -Value $Value -Profile $Profile)
+    }
+    $cacheKey = ([string]$ColumnName) + ([char]0) + $text
+    if ($script:__cellCache.ContainsKey($cacheKey)) { return $script:__cellCache[$cacheKey] }
+    $result = Scrub-FieldCore -ColumnName $ColumnName -Value $Value -Profile $Profile
+    $script:__cellCache[$cacheKey] = $result
+    return $result
+}
+
+function Scrub-FieldCore {
     param([string]$ColumnName, $Value, $Profile)
     if ($null -eq $Value) { return $null }
     $text = [string]$Value
@@ -3138,8 +3868,19 @@ function Scrub-Field {
         }
         if ($schemaRule -and $schemaRule.Action -eq 'PassThrough') { return $text }
 
-        # Profile pass-through columns (analytical / non-identifying) survive intact.
-        if ($Profile.PassThroughRegex -and ($ColumnName -match $Profile.PassThroughRegex)) { return $text }
+        # Profile pass-through columns (analytical / non-identifying). In Balanced/Readable these are
+        # truly pass-through: provider names, event ids, timestamps, record ids, and similar metadata
+        # are not identifiers by default. Strict keeps the older fail-closed hardening behavior.
+        if ($Profile.PassThroughRegex -and ($ColumnName -match $Profile.PassThroughRegex)) {
+            if ($script:ScrubPolicy -ne 'Strict') { return $text }
+            if (($text -match '^[0-9]+$') -or ($text -match '^\d{4}-\d{2}-\d{2}[T ]')) { return $text }
+            return [string](Invoke-LeakHardeningText -Text $text)
+        }
+
+        if (Test-UlsWindowsEventCsvProfile -Profile $Profile) {
+            if ($ColumnName -ieq 'EventDataJson') { return [string](Invoke-UlsWindowsEventDataJsonScrub -Text $text -Profile $Profile) }
+            if ($ColumnName -ieq 'Message') { return [string](Invoke-UlsWindowsEventMessageHardening -Text $text -ColumnName $ColumnName) }
+        }
 
         # Multi-valued cells: split on ; or | and tokenize EACH element on its own, so
         # a principal list never collapses to a single token.
@@ -3192,21 +3933,30 @@ function __ULS_Legacy_Invoke_LeakHardeningText_3170 {
     $out = Invoke-CustomRegexHardening -Text $out
     $out = Invoke-CommonDetectors -Text $out
     $out = Invoke-UniversalLabelHardening -Text $out
-    $out = [regex]::Replace($out, '(?im)(\bCertificateTemplate\s*:\s*)([A-Za-z0-9_.\-]+)', {
-        param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "TEMPLATE") } })
+    # ULS perf patch 4: skip an inline pass when its required literal substring is absent from
+    # the current text. Byte-identical -- hardening never introduces these sentinels.
+    $oic = [System.StringComparison]::OrdinalIgnoreCase
+    if ($out.IndexOf('CertificateTemplate', $oic) -ge 0) {
+        $out = [regex]::Replace($out, '(?im)(\bCertificateTemplate\s*:\s*)([A-Za-z0-9_.\-]+)', {
+            param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "TEMPLATE") } })
+    }
     $out = [regex]::Replace($out, '(?im)(\b(?:cdc|rmd|ccm)\s*:\s*)([A-Za-z0-9_.\-]+)', {
         param($m) if (Is-AlreadyToken -Value $m.Groups[2].Value) { return $m.Value } else { return $m.Groups[1].Value + (Get-Token -Value $m.Groups[2].Value -Prefix "DNS") } })
-    $out = [regex]::Replace($out, '(?im)(\b(?:DNS Name|Principal Name|RFC822 Name|URL|URI|IP Address)\s*=\s*)([A-Za-z0-9_.@:\-/]+)', {
-        param($m)
-        $label = $m.Groups[1].Value
-        $value = $m.Groups[2].Value
-        if (Is-AlreadyToken -Value $value) { return $m.Value }
-        if ($label -match '(?i)IP Address') { return $label + (Get-Token -Value $value -Prefix "IP") }
-        if ($label -match '(?i)Principal Name|RFC822 Name') { return $label + (Get-Token -Value $value -Prefix "UNMAPPED_UPN") }
-        if ($value -match '@') { return $label + (Get-Token -Value $value -Prefix "UNMAPPED_UPN") }
-        return $label + (Get-Token -Value $value -Prefix "DNS") })
-    $out = [regex]::Replace($out, '\b[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', {
-        param($m) if ((Is-AlreadyToken -Value $m.Value) -or (Test-AllowedDomain -Value $m.Value)) { return $m.Value } else { return Get-Token -Value $m.Value -Prefix "UNMAPPED_UPN" } })
+    if ($out.IndexOf('=') -ge 0) {
+        $out = [regex]::Replace($out, '(?im)(\b(?:DNS Name|Principal Name|RFC822 Name|URL|URI|IP Address)\s*=\s*)([A-Za-z0-9_.@:\-/]+)', {
+            param($m)
+            $label = $m.Groups[1].Value
+            $value = $m.Groups[2].Value
+            if (Is-AlreadyToken -Value $value) { return $m.Value }
+            if ($label -match '(?i)IP Address') { return $label + (Get-Token -Value $value -Prefix "IP") }
+            if ($label -match '(?i)Principal Name|RFC822 Name') { return $label + (Get-Token -Value $value -Prefix "UNMAPPED_UPN") }
+            if ($value -match '@') { return $label + (Get-Token -Value $value -Prefix "UNMAPPED_UPN") }
+            return $label + (Get-Token -Value $value -Prefix "DNS") })
+    }
+    if ($out.IndexOf('@') -ge 0) {
+        $out = [regex]::Replace($out, '\b[A-Za-z0-9._%+\-$]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', {
+            param($m) if ((Is-AlreadyToken -Value $m.Value) -or (Test-AllowedDomain -Value $m.Value)) { return $m.Value } else { return Get-Token -Value $m.Value -Prefix "UNMAPPED_UPN" } })
+    }
     $out = [regex]::Replace($out, '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)', {
         param($m) if ((Is-AlreadyToken -Value $m.Value) -or (Test-PreserveDetectedValue -Value $m.Value -Detector 'IPv4' -Prefix 'IP' -Text $out -Index $m.Index -Length $m.Length)) { return $m.Value } else { return Get-Token -Value $m.Value -Prefix "IP" } })
     $out = [regex]::Replace($out, '\b(?=[A-Za-z0-9.-]*[A-Za-z])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b', {
@@ -3240,6 +3990,7 @@ function __ULS_Legacy_Invoke_LeakHardeningText_3170 {
 # a literal resolved ONCE via the shared tokenizer so it collapses consistently.
 function Protect-SensitiveTerms {
     param([Parameter(Mandatory)][string]$Text, [string[]]$SensitiveTerms = @())
+    if (-not $SensitiveTerms -or @($SensitiveTerms).Count -eq 0) { return $Text }
     $out = $Text
     foreach ($term in $SensitiveTerms) {
         $t = ([string]$term).Trim()
@@ -3254,80 +4005,130 @@ function Protect-SensitiveTerms {
 function Test-ScrubbedForLeaks {
     param([Parameter(Mandatory)][string]$CsvPath, [string[]]$SensitiveTerms = @())
     Write-Work "Leak check: $([System.IO.Path]::GetFileName($CsvPath))"
-    $text = [System.IO.File]::ReadAllText($CsvPath)
     $findings = New-Object System.Collections.Generic.List[object]
 
+    $termCounts = @{}
     foreach ($term in $SensitiveTerms) {
         if ([string]::IsNullOrWhiteSpace($term)) { continue }
-        $count = ([regex]::Matches($text, [regex]::Escape($term.Trim()), 'IgnoreCase')).Count
-        if ($count -gt 0) { $findings.Add([pscustomobject]@{ Type = "SensitiveTerm '$($term.Trim())'"; Count = $count; Samples = "" }) }
+        $t = $term.Trim()
+        if ($t.Length -lt 3) { continue }
+        $termCounts[$t] = 0
     }
-    $labeledLeaks = @(Find-UniversalLabeledLeaks -Text $text)
-    if ($labeledLeaks.Count -gt 0) {
-        $findings.Add([pscustomobject]@{ Type = "Universal labeled value"; Count = $labeledLeaks.Count; Samples = (($labeledLeaks | Select-Object -First 5) -join ", ") })
-    }
-    $customLeaks = @(Find-CustomRegexIdentifiers -Text $text | ForEach-Object { $_.Raw } | Select-Object -Unique)
-    if ($customLeaks.Count -gt 0) {
-        $findings.Add([pscustomobject]@{ Type = "Custom regex value"; Count = $customLeaks.Count; Samples = (($customLeaks | Select-Object -First 5) -join ", ") })
-    }
-    $secretLeaks = @(Find-SecretIdentifiers -Text $text | ForEach-Object { $_.Raw } | Select-Object -Unique)
-    if ($secretLeaks.Count -gt 0) {
-        $findings.Add([pscustomobject]@{ Type = "Secret-like value"; Count = $secretLeaks.Count; Samples = (($secretLeaks | Select-Object -First 5) -join ", ") })
-    }
-
+    # ULS perf patch 3 / 3b: run BOTH the finders AND the shape-pattern battery PER PHYSICAL
+    # LINE, memoized by line. No identifier, label value, or shape pattern spans a newline, so
+    # per-line detection finds the same values -- and it avoids two failure modes on a ~19 MB
+    # single string: (a) the timeout-compiled label/custom finders throwing RegexMatchTimeout,
+    # and (b) the FQDN/Email shape patterns catastrophically backtracking. A static [regex]::Matches
+    # has no timeout, so (b) does not crash -- it just grinds for minutes (the non-stream "hang").
+    # The streaming path already detects per line; this brings the non-stream check in line with it.
+    $labeledSet = [ordered]@{}; $customSet = [ordered]@{}; $secretSet = [ordered]@{}; $seenLeakLine = @{}
     $patterns = @(
-        [pscustomobject]@{ Type = "Email/UPN";   Rx = '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b' },
+        [pscustomobject]@{ Type = "Email/UPN";   Sentinel = '@';    Rx = '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b' },
         [pscustomobject]@{ Type = "IPv4";        Rx = '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)' },
         [pscustomobject]@{ Type = "IPv6";        Skip = '^\d{1,5}(:\d{1,5}){1,7}$'; Rx = '(?:[A-Fa-f0-9]{1,4}:){3,7}[A-Fa-f0-9]{1,4}|::(?:[A-Fa-f0-9]{1,4}:){0,6}[A-Fa-f0-9]{1,4}' },
         [pscustomobject]@{ Type = "MAC";         Rx = '\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b' },
-        [pscustomobject]@{ Type = "SID";         Rx = 'S-1-\d+(?:-\d+)+' },
-        [pscustomobject]@{ Type = "DOMAIN\user"; Rx = '(?<![A-Za-z0-9_.\-])[A-Za-z0-9_.\-]+\\[A-Za-z0-9_.\-$]+' },
+        [pscustomobject]@{ Type = "SID";         Sentinel = 'S-1-'; Rx = 'S-1-\d+(?:-\d+)+' },
+        [pscustomobject]@{ Type = "Windows user profile path"; Sentinel = '\Users\'; Rx = '(?i)(?:\\\?\\)?[A-Za-z]:\\Users\\([^\\/"'',;:\r\n]+)'; Group = 1 },
+        [pscustomobject]@{ Type = "Windows user profile path (escaped)"; Sentinel = '\\Users\\'; Rx = '(?i)(?:\\\\\\\?\\\\)?[A-Za-z]:\\\\Users\\\\([^\\/"'',;:\r\n]+)'; Group = 1 },
+        [pscustomobject]@{ Type = "DOMAIN\user"; Sentinel = '\';    Rx = '(?<![A-Za-z0-9_.\-])[A-Za-z0-9_.\-]+\\[A-Za-z0-9_.\-$]+' },
         [pscustomobject]@{ Type = "Bare FQDN";   Rx = '\b(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}\b' }
     )
-    foreach ($p in $patterns) {
-        $leaks = @()
-        foreach ($m in [regex]::Matches($text, $p.Rx)) {
-            $v = $m.Value
-            if (Is-AlreadyToken -Value $v) { continue }
-            if (Test-PreserveDottedDecimal -Value $v) { continue }   # OID / version (not an IP)
-            if ($p.Skip -and ($v -match $p.Skip)) { continue }
-            if (($p.Type -eq 'Bare FQDN' -or $p.Type -eq 'Email/UPN') -and (Test-AllowedDomain -Value $v)) { continue }
-            $prefixForLeak = switch ($p.Type) {
-                'Bare FQDN' { 'DNS' }
-                'DOMAIN\user' { 'PRINCIPAL' }
-                'Email/UPN' { 'UNMAPPED_UPN' }
-                'IPv4' { 'IP' }
-                'IPv6' { 'IP6' }
-                'MAC' { 'MAC' }
-                'SID' { 'SID' }
-                default { '' }
-            }
-            if (Test-PreserveDetectedValue -Value $v -Detector $p.Type -Prefix $prefixForLeak -Text $text -Index $m.Index -Length $m.Length) { continue }
-            if ($p.Type -eq 'DOMAIN\user') {
-                # A 'word\word' is NOT a credential leak when it is really a file path.
-                $skipDU = $false
-                #  (a) a backslash between two already-scrubbed tokens (PRINCIPAL_x\PRINCIPAL_y)
-                foreach ($seg in ($v -split '\\')) { if (Is-AlreadyToken -Value $seg) { $skipDU = $true; break } }
-                if (-not $skipDU) {
-                    #  (b) bordered by a path separator -> it's inside a path
-                    $before = if ($m.Index -gt 0) { [string]$text[$m.Index - 1] } else { '' }
-                    $aft = $m.Index + $m.Length
-                    $after = if ($aft -lt $text.Length) { [string]$text[$aft] } else { '' }
-                    if ((@('\', '/', ':') -contains $before) -or (@('\', '/') -contains $after)) { $skipDU = $true }
-                    #  (c) a drive root (C:\) or another path segment sits just before it
-                    elseif ($m.Index -gt 0) {
-                        $cs = [Math]::Max(0, $m.Index - 24)
-                        $ctx = $text.Substring($cs, $m.Index - $cs)
-                        if (($ctx -match '[A-Za-z]:\\') -or ($ctx -match '\\[^\\"'',;]*$')) { $skipDU = $true }
-                    }
-                    #  (d) well-known Windows path roots
-                    if (-not $skipDU -and ($v -match '(?i)^(windows|winnt|system32|syswow64|sysnative|systemroot|drivers|users|public|default|programdata|appdata|microsoft|program files( \(x86\))?|inf|temp|tmp|config|fonts|assembly|servicing|winsxs|tasks|spool|wbem|registry|device|harddiskvolume\d*)\\')) { $skipDU = $true }
-                }
-                if ($skipDU) { continue }
-            }
-            $leaks += $v
+    $patternSets = [ordered]@{}
+    foreach ($p in $patterns) { $patternSets[$p.Type] = [ordered]@{} }
+    # ULS patch 7: progress + literal short-circuits. The leak check is a full verification scan of the
+    # output -- give it a progress bar (it was silent), and skip a shape pattern when its required
+    # literal is absent from the line (byte-identical verdict: it could not have matched anyway).
+    $lcName = [System.IO.Path]::GetFileName($CsvPath)
+    $lcN = 0
+    $resolvedLeakPath = (Resolve-Path -Path $CsvPath).Path
+    foreach ($line in [System.IO.File]::ReadLines($resolvedLeakPath)) {
+        $lcN++
+        if ($lcN % 2000 -eq 0) { Write-Progress -Activity "Leak check $lcName" -Status "Line $lcN" -PercentComplete -1 }
+        foreach ($termKey in @($termCounts.Keys)) {
+            $termCounts[$termKey] = [int]$termCounts[$termKey] + ([regex]::Matches($line, [regex]::Escape($termKey), 'IgnoreCase')).Count
         }
-        $leaks = @($leaks | Select-Object -Unique)
+        if ([string]::IsNullOrEmpty($line) -or $seenLeakLine.ContainsKey($line)) { continue }
+        $seenLeakLine[$line] = $true
+        foreach ($v in (Find-UniversalLabeledLeaks -Text $line)) { if (-not $labeledSet.Contains($v)) { $labeledSet[$v] = $true } }
+        foreach ($v in (Find-CustomRegexIdentifiers -Text $line | ForEach-Object { $_.Raw })) { if (-not $customSet.Contains($v)) { $customSet[$v] = $true } }
+        foreach ($v in (Find-SecretIdentifiers -Text $line | ForEach-Object { $_.Raw })) { if (-not $secretSet.Contains($v)) { $secretSet[$v] = $true } }
+        foreach ($p in $patterns) {
+            if ($p.Sentinel -and ($line.IndexOf([string]$p.Sentinel, [System.StringComparison]::OrdinalIgnoreCase) -lt 0)) { continue }
+            $bucket = $patternSets[$p.Type]
+            foreach ($m in [regex]::Matches($line, $p.Rx)) {
+                $v = $m.Value
+                if ($p.PSObject.Properties['Group']) {
+                    $groupNum = [int]$p.Group
+                    if ($groupNum -gt 0 -and $groupNum -lt $m.Groups.Count -and $m.Groups[$groupNum].Success) {
+                        $profileLeak = $m.Groups[$groupNum].Value
+                        if ([string]::IsNullOrWhiteSpace($profileLeak)) { continue }
+                        if ($profileLeak -match '(?i)^(Public|Default|Default User|All Users)$') { continue }
+                        if (Is-AlreadyToken -Value $profileLeak) { continue }
+                        $v = $profileLeak
+                    }
+                }
+                if (Is-AlreadyToken -Value $v) { continue }
+                if (Test-PreserveDottedDecimal -Value $v) { continue }   # OID / version (not an IP)
+                if ($p.Skip -and ($v -match $p.Skip)) { continue }
+                if (($p.Type -eq 'Bare FQDN' -or $p.Type -eq 'Email/UPN') -and (Test-AllowedDomain -Value $v)) { continue }
+                $prefixForLeak = switch ($p.Type) {
+                    'Bare FQDN' { 'DNS' }
+                    'DOMAIN\user' { 'PRINCIPAL' }
+                    'Email/UPN' { 'UNMAPPED_UPN' }
+                    'IPv4' { 'IP' }
+                    'IPv6' { 'IP6' }
+                    'MAC' { 'MAC' }
+                    'SID' { 'SID' }
+                    'Windows user profile path' { 'PRINCIPAL' }
+                    'Windows user profile path (escaped)' { 'PRINCIPAL' }
+                    default { '' }
+                }
+                if (Test-PreserveDetectedValue -Value $v -Detector $p.Type -Prefix $prefixForLeak -Text $line -Index $m.Index -Length $m.Length) { continue }
+                if ($p.Type -eq 'DOMAIN\user') {
+                    # A 'word\word' is NOT a credential leak when it is really a file path.
+                    $skipDU = $false
+                    #  (a) a backslash between two already-scrubbed tokens (PRINCIPAL_x\PRINCIPAL_y)
+                    foreach ($seg in ($v -split '\\')) { if (Is-AlreadyToken -Value $seg) { $skipDU = $true; break } }
+                    if (-not $skipDU) {
+                        #  (b) bordered by a path separator -> it's inside a path
+                        $before = if ($m.Index -gt 0) { [string]$line[$m.Index - 1] } else { '' }
+                        $aft = $m.Index + $m.Length
+                        $after = if ($aft -lt $line.Length) { [string]$line[$aft] } else { '' }
+                        if ((@('\', '/', ':') -contains $before) -or (@('\', '/') -contains $after)) { $skipDU = $true }
+                        #  (c) a drive root (C:\) or another path segment sits just before it
+                        elseif ($m.Index -gt 0) {
+                            $cs = [Math]::Max(0, $m.Index - 24)
+                            $ctx = $line.Substring($cs, $m.Index - $cs)
+                            if (($ctx -match '[A-Za-z]:\\') -or ($ctx -match '\\[^\\"'',;]*$')) { $skipDU = $true }
+                        }
+                        #  (d) well-known Windows path roots
+                        if (-not $skipDU -and ($v -match '(?i)^(windows|winnt|system32|syswow64|sysnative|systemroot|drivers|users|public|default|programdata|appdata|microsoft|program files( \(x86\))?|inf|temp|tmp|config|fonts|assembly|servicing|winsxs|tasks|spool|wbem|registry|device|harddiskvolume\d*)\\')) { $skipDU = $true }
+                    }
+                    if ($skipDU) { continue }
+                }
+                if (-not $bucket.Contains($v)) { $bucket[$v] = $true }
+            }
+        }
+    }
+    Write-Progress -Activity "Leak check $lcName" -Completed
+    foreach ($termKey in @($termCounts.Keys)) {
+        $count = [int]$termCounts[$termKey]
+        if ($count -gt 0) { $findings.Add([pscustomobject]@{ Type = "SensitiveTerm '$termKey'"; Count = $count; Samples = "" }) }
+    }
+    $labeledLeaks = @($labeledSet.Keys)
+    if ($labeledLeaks.Count -gt 0) {
+        $findings.Add([pscustomobject]@{ Type = "Universal labeled value"; Count = $labeledLeaks.Count; Samples = (($labeledLeaks | Select-Object -First 5) -join ", ") })
+    }
+    $customLeaks = @($customSet.Keys)
+    if ($customLeaks.Count -gt 0) {
+        $findings.Add([pscustomobject]@{ Type = "Custom regex value"; Count = $customLeaks.Count; Samples = (($customLeaks | Select-Object -First 5) -join ", ") })
+    }
+    $secretLeaks = @($secretSet.Keys)
+    if ($secretLeaks.Count -gt 0) {
+        $findings.Add([pscustomobject]@{ Type = "Secret-like value"; Count = $secretLeaks.Count; Samples = (($secretLeaks | Select-Object -First 5) -join ", ") })
+    }
+    foreach ($p in $patterns) {
+        $leaks = @($patternSets[$p.Type].Keys)
         if ($leaks.Count -gt 0) {
             $findings.Add([pscustomobject]@{ Type = $p.Type; Count = $leaks.Count; Samples = (($leaks | Select-Object -First 5) -join ", ") })
         }
@@ -4705,6 +5506,194 @@ function ConvertFrom-XlsxToCsv {
 # =====================================================================
 # REGION: Streaming scrub (bounded memory, opt-in for very large files)
 # =====================================================================
+function ConvertTo-UlsDelimitedField {
+    param($Value)
+    if ($null -eq $Value) { return '""' }
+    $s = [string]$Value
+    return '"' + ($s -replace '"', '""') + '"'
+}
+
+function ConvertTo-UlsDelimitedLine {
+    param([object[]]$Values, [string]$Delimiter = ',')
+    $fields = foreach ($v in @($Values)) { ConvertTo-UlsDelimitedField -Value $v }
+    return ($fields -join $Delimiter)
+}
+
+function Read-UlsDelimitedRecord {
+    param(
+        [Parameter(Mandatory)][System.IO.StreamReader]$Reader,
+        [string]$Delimiter = ','
+    )
+
+    $fastDelim = if ([string]::IsNullOrEmpty($Delimiter)) { [char]',' } else { [char]$Delimiter[0] }
+    $fastQuote = [char]'"'
+    $fastText = $Reader.ReadLine()
+    if ($null -eq $fastText) { return $null }
+
+    $fastHasOpenQuote = {
+        param([string]$Value)
+        $inside = $false
+        for ($i = 0; $i -lt $Value.Length; $i++) {
+            if ($Value[$i] -eq $fastQuote) {
+                if ($inside -and ($i + 1) -lt $Value.Length -and $Value[$i + 1] -eq $fastQuote) {
+                    $i++
+                }
+                else {
+                    $inside = -not $inside
+                }
+            }
+        }
+        return $inside
+    }
+
+    while ((& $fastHasOpenQuote $fastText) -and -not $Reader.EndOfStream) {
+        $nextLine = $Reader.ReadLine()
+        if ($null -eq $nextLine) { break }
+        $fastText += "`r`n" + $nextLine
+    }
+
+    $fastFields = New-Object System.Collections.Generic.List[string]
+    $fastSb = New-Object System.Text.StringBuilder
+    $fastInQuotes = $false
+    $fastAtStart = $true
+    for ($i = 0; $i -lt $fastText.Length; $i++) {
+        $ch = $fastText[$i]
+        if ($fastInQuotes) {
+            if ($ch -eq $fastQuote) {
+                if (($i + 1) -lt $fastText.Length -and $fastText[$i + 1] -eq $fastQuote) {
+                    [void]$fastSb.Append($fastQuote)
+                    $i++
+                }
+                else {
+                    $fastInQuotes = $false
+                }
+            }
+            else {
+                [void]$fastSb.Append($ch)
+            }
+            continue
+        }
+
+        if ($fastAtStart -and $ch -eq $fastQuote) {
+            $fastInQuotes = $true
+            $fastAtStart = $false
+            continue
+        }
+        if ($ch -eq $fastDelim) {
+            [void]$fastFields.Add($fastSb.ToString())
+            $null = $fastSb.Clear()
+            $fastAtStart = $true
+            continue
+        }
+        [void]$fastSb.Append($ch)
+        $fastAtStart = $false
+    }
+    [void]$fastFields.Add($fastSb.ToString())
+    return [string[]]$fastFields.ToArray()
+
+    $delim = if ([string]::IsNullOrEmpty($Delimiter)) { [char]',' } else { [char]$Delimiter[0] }
+    $quote = [char]'"'
+    $cr = [char]"`r"
+    $lf = [char]"`n"
+    $fields = New-Object System.Collections.Generic.List[string]
+    $sb = New-Object System.Text.StringBuilder
+    $inQuotes = $false
+    $atStartOfField = $true
+    $sawAny = $false
+
+    while ($true) {
+        $next = $Reader.Read()
+        if ($next -lt 0) {
+            if (-not $sawAny -and $fields.Count -eq 0 -and $sb.Length -eq 0) { return $null }
+            [void]$fields.Add($sb.ToString())
+            return [string[]]$fields.ToArray()
+        }
+
+        $sawAny = $true
+        $ch = [char]$next
+
+        if ($inQuotes) {
+            if ($ch -eq $quote) {
+                if ($Reader.Peek() -eq [int]$quote) {
+                    [void]$Reader.Read()
+                    [void]$sb.Append($quote)
+                }
+                else {
+                    $inQuotes = $false
+                }
+            }
+            else {
+                [void]$sb.Append($ch)
+            }
+            continue
+        }
+
+        if ($ch -eq $quote -and $atStartOfField) {
+            $inQuotes = $true
+            $atStartOfField = $false
+            continue
+        }
+
+        if ($ch -eq $delim) {
+            [void]$fields.Add($sb.ToString())
+            [void]$sb.Clear()
+            $atStartOfField = $true
+            continue
+        }
+
+        if ($ch -eq $cr -or $ch -eq $lf) {
+            if ($ch -eq $cr -and $Reader.Peek() -eq [int]$lf) { [void]$Reader.Read() }
+            [void]$fields.Add($sb.ToString())
+            return [string[]]$fields.ToArray()
+        }
+
+        [void]$sb.Append($ch)
+        $atStartOfField = $false
+    }
+}
+
+function ConvertFrom-UlsDelimitedRecord {
+    param(
+        [Parameter(Mandatory)][string[]]$Headers,
+        [Parameter(Mandatory)][string[]]$Values
+    )
+    $row = [ordered]@{}
+    for ($i = 0; $i -lt $Headers.Count; $i++) {
+        $row[$Headers[$i]] = if ($i -lt $Values.Count) { [string]$Values[$i] } else { '' }
+    }
+    return [pscustomobject]$row
+}
+
+
+function Write-UlsWorkerProgressFile {
+    param(
+        [AllowNull()][string]$Path,
+        [int]$Chunk = 0,
+        [int]$RowsDone = 0,
+        [int]$RowsTotal = 0,
+        [string]$Status = 'Running'
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $obj = [pscustomobject]@{
+            Chunk      = $Chunk
+            RowsDone   = [int]$RowsDone
+            RowsTotal  = [int]$RowsTotal
+            Status     = [string]$Status
+            UpdatedUtc = ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))
+        }
+        $json = $obj | ConvertTo-Json -Compress
+        $tmp = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, [System.Text.Encoding]::UTF8)
+        if (Test-Path -LiteralPath $Path) { Move-Item -LiteralPath $tmp -Destination $Path -Force }
+        else { Move-Item -LiteralPath $tmp -Destination $Path -Force }
+    } catch {
+        # Progress reporting must never fail a scrub worker.
+    }
+}
+
 function Invoke-ScrubFileStreaming {
     param(
         [Parameter(Mandatory)][string]$InputPath,
@@ -4712,7 +5701,13 @@ function Invoke-ScrubFileStreaming {
         [Parameter(Mandatory)]$Profile,
         [string[]]$SensitiveTerms = @(),
         [Parameter(Mandatory)][string]$Format,
-        [string]$Delimiter = ','
+        [string]$Delimiter = ',',
+        [switch]$SkipLeakCheck,
+        [string]$WorkerProgressFile,
+        [int]$WorkerProgressRowsTotal = 0,
+        [int]$WorkerProgressChunk = 0,
+        [int]$WorkerProgressIntervalRows = 250,
+        [int]$WorkerProgressIntervalSeconds = 1
     )
     $name = [System.IO.Path]::GetFileName($InputPath)
     $outFull = Resolve-OutPath -Path $OutputPath
@@ -4720,10 +5715,11 @@ function Invoke-ScrubFileStreaming {
     $leakCounts = @{}
     $leakSamples = @{}
     $rx = @(
-        @{ T = 'Email/UPN';   R = '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b' },
+        @{ T = 'Email/UPN';   S = '@';    R = '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b' },
         @{ T = 'IPv4';        R = '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)' },
-        @{ T = 'SID';         R = 'S-1-\d+(?:-\d+)+' },
-        @{ T = 'DOMAIN\user'; R = '(?<![A-Za-z0-9_.\-])[A-Za-z0-9_.\-]+\\[A-Za-z0-9_.\-$]+' },
+        @{ T = 'IPv6';        S = ':';    R = '(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{1,4}|::(?:[A-Fa-f0-9]{1,4}:){0,6}[A-Fa-f0-9]{1,4}|(?:[A-Fa-f0-9]{1,4}:){1,7}:' },
+        @{ T = 'SID';         S = 'S-1-'; R = 'S-1-\d+(?:-\d+)+' },
+        @{ T = 'DOMAIN\user'; S = '\';    R = '(?<![A-Za-z0-9_.\-])[A-Za-z0-9_.\-]+\\[A-Za-z0-9_.\-$]+' },
         @{ T = 'Bare FQDN';   R = '\b(?=[A-Za-z0-9.\-]*[A-Za-z])[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}\b' }
     )
     $updateLeaks = {
@@ -4744,6 +5740,7 @@ function Invoke-ScrubFileStreaming {
             if ($leakSamples['Secret-like value'].Count -lt 5 -and -not $leakSamples['Secret-like value'].Contains($v)) { [void]$leakSamples['Secret-like value'].Add($v) }
         }
         foreach ($p in $rx) {
+            if ($p.S -and ($line.IndexOf([string]$p.S, [System.StringComparison]::OrdinalIgnoreCase) -lt 0)) { continue }
             foreach ($m in [regex]::Matches($line, $p.R)) {
                 $v = $m.Value
                 if (Is-AlreadyToken -Value $v) { continue }
@@ -4754,6 +5751,7 @@ function Invoke-ScrubFileStreaming {
                     'DOMAIN\user' { 'PRINCIPAL' }
                     'Email/UPN' { 'UNMAPPED_UPN' }
                     'IPv4' { 'IP' }
+                    'IPv6' { 'IP6' }
                     'SID' { 'SID' }
                     default { '' }
                 }
@@ -4764,23 +5762,85 @@ function Invoke-ScrubFileStreaming {
             }
         }
     }
+    # ULS perf patch 3: memoize the per-row secondary harden + leak detection by line text.
+    # Repetitive logs (e.g. Windows Security) have few distinct rows, so this collapses the
+    # ~25-pass hardening battery + leak scan from per-row to per-distinct-row. The written
+    # output is byte-identical to the unmemoized path; only -DetectionSummaryReport counts
+    # shift to per-distinct-value.
+    $lineHardenCache = @{}
+    $lineLeakSeen = @{}
     $writer = [System.IO.StreamWriter]::new($outFull, $false, [System.Text.Encoding]::UTF8)
     $n = 0
+    $ulsPerfStreamTotal = New-UlsPerfStopwatch
+    $ulsPerfScrubTicks = [long]0
+    $ulsPerfPostTicks = [long]0
+    $ulsPerfWriteTicks = [long]0
+    $ulsPerfLeakTicks = [long]0
+    $ulsPerfScrubColumnTicks = @{}
+    $ulsPerfScrubColumnCounts = @{}
+    if ($WorkerProgressIntervalRows -lt 1) { $WorkerProgressIntervalRows = 250 }
+    if ($WorkerProgressIntervalSeconds -lt 1) { $WorkerProgressIntervalSeconds = 1 }
+    $ulsWorkerProgressLastRows = -1
+    $ulsWorkerProgressLastUtc = [DateTime]::UtcNow.AddSeconds(-10)
+    $updateWorkerProgress = {
+        param([string]$Status, [switch]$Force)
+        if ([string]::IsNullOrWhiteSpace($WorkerProgressFile)) { return }
+        $now = [DateTime]::UtcNow
+        if ($Force -or $n -eq 0 -or (($n - $ulsWorkerProgressLastRows) -ge $WorkerProgressIntervalRows) -or (($now - $ulsWorkerProgressLastUtc).TotalSeconds -ge $WorkerProgressIntervalSeconds)) {
+            Write-UlsWorkerProgressFile -Path $WorkerProgressFile -Chunk $WorkerProgressChunk -RowsDone $n -RowsTotal $WorkerProgressRowsTotal -Status $Status
+            $script:__ulsWorkerProgressNoop = $null
+            Set-Variable -Name ulsWorkerProgressLastRows -Scope 1 -Value $n
+            Set-Variable -Name ulsWorkerProgressLastUtc -Scope 1 -Value $now
+        }
+    }
+    & $updateWorkerProgress 'Starting' -Force
     try {
         if ($Format -eq 'Csv' -or $Format -eq 'Tsv' -or $Format -eq 'Psv') {
-            $headerWritten = $false
+            $headers = $null
             Import-Csv -Path $InputPath -Delimiter $Delimiter | ForEach-Object {
                 $row = $_; $n++
+                & $updateWorkerProgress 'Running'
                 if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n rows" -PercentComplete -1 }
-                $new = [ordered]@{}
-                foreach ($prop in $row.PSObject.Properties) { $new[$prop.Name] = Scrub-Field -ColumnName $prop.Name -Value $prop.Value -Profile $Profile }
-                $csv = @(([pscustomobject]$new) | ConvertTo-Csv -NoTypeInformation -Delimiter $Delimiter)
-                if (-not $headerWritten) { $writer.WriteLine((Protect-SensitiveTerms -Text $csv[0] -SensitiveTerms $SensitiveTerms)); $headerWritten = $true }
-                $dataLine = if ($csv.Count -ge 2) { ($csv[1..($csv.Count - 1)] -join "`r`n") } else { '' }
-                $dataLine = Invoke-LeakHardeningText -Text $dataLine
+                if ($null -eq $headers) {
+                    $headers = @($row.PSObject.Properties | ForEach-Object { [string]$_.Name })
+                    if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
+                    $headerLine = Protect-SensitiveTerms -Text (ConvertTo-UlsDelimitedLine -Values $headers -Delimiter $Delimiter) -SensitiveTerms $SensitiveTerms
+                    if ($script:PerfReportEnabled) { $ulsPerfBlock.Stop(); $ulsPerfPostTicks += $ulsPerfBlock.ElapsedTicks }
+                    if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
+                    $writer.WriteLine($headerLine)
+                    if ($script:PerfReportEnabled) { $ulsPerfBlock.Stop(); $ulsPerfWriteTicks += $ulsPerfBlock.ElapsedTicks }
+                }
+                $values = New-Object System.Collections.Generic.List[object]
+                if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
+                foreach ($h in $headers) {
+                    $prop = $row.PSObject.Properties[$h]
+                    $rawValue = if ($null -ne $prop) { $prop.Value } else { $null }
+                    if ($script:PerfReportDetailedEnabled) {
+                        $ulsPerfColBlock = [System.Diagnostics.Stopwatch]::StartNew()
+                        $scrubbedValue = Scrub-Field -ColumnName $h -Value $rawValue -Profile $Profile
+                        $ulsPerfColBlock.Stop()
+                        if (-not $ulsPerfScrubColumnTicks.ContainsKey($h)) { $ulsPerfScrubColumnTicks[$h] = [long]0; $ulsPerfScrubColumnCounts[$h] = 0 }
+                        $ulsPerfScrubColumnTicks[$h] = [long]$ulsPerfScrubColumnTicks[$h] + [long]$ulsPerfColBlock.ElapsedTicks
+                        $ulsPerfScrubColumnCounts[$h] = [int]$ulsPerfScrubColumnCounts[$h] + 1
+                        [void]$values.Add($scrubbedValue)
+                    }
+                    else {
+                        [void]$values.Add((Scrub-Field -ColumnName $h -Value $rawValue -Profile $Profile))
+                    }
+                }
+                if ($script:PerfReportEnabled) { $ulsPerfBlock.Stop(); $ulsPerfScrubTicks += $ulsPerfBlock.ElapsedTicks }
+                if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
+                $dataLine = ConvertTo-UlsDelimitedLine -Values $values.ToArray() -Delimiter $Delimiter
                 $dataLine = Protect-SensitiveTerms -Text $dataLine -SensitiveTerms $SensitiveTerms
+                if ($script:PerfReportEnabled) { $ulsPerfBlock.Stop(); $ulsPerfPostTicks += $ulsPerfBlock.ElapsedTicks }
+                if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
                 $writer.WriteLine($dataLine)
-                & $updateLeaks $dataLine
+                if ($script:PerfReportEnabled) { $ulsPerfBlock.Stop(); $ulsPerfWriteTicks += $ulsPerfBlock.ElapsedTicks }
+                if (-not $SkipLeakCheck -and -not $lineLeakSeen.ContainsKey($dataLine)) {
+                    if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
+                    $lineLeakSeen[$dataLine] = $true; & $updateLeaks $dataLine
+                    if ($script:PerfReportEnabled) { $ulsPerfBlock.Stop(); $ulsPerfLeakTicks += $ulsPerfBlock.ElapsedTicks }
+                }
             }
         }
         elseif ($Format -eq 'Json') {
@@ -4789,10 +5849,11 @@ function Invoke-ScrubFileStreaming {
                 while (-not $reader.EndOfStream) {
                     $line = $reader.ReadLine(); if ($null -eq $line) { break }
                     $t = $line.Trim(); if ($t -eq '') { continue }
-                    $n++; if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n lines" -PercentComplete -1 }
+                    $n++; try { & $updateWorkerProgress 'Running' } catch { }; if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n lines" -PercentComplete -1 }
                     $scr = Invoke-ScrubJsonText -Text $t -IsNdjson -Profile $Profile
                     $scr = Protect-SensitiveTerms -Text $scr -SensitiveTerms $SensitiveTerms
-                    $writer.WriteLine($scr); & $updateLeaks $scr
+                    $writer.WriteLine($scr)
+                    if (-not $SkipLeakCheck) { & $updateLeaks $scr }
                 }
             }
             finally { $reader.Close() }
@@ -4802,25 +5863,1199 @@ function Invoke-ScrubFileStreaming {
             try {
                 while (-not $reader.EndOfStream) {
                     $line = $reader.ReadLine(); if ($null -eq $line) { break }
-                    $n++; if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n lines" -PercentComplete -1 }
+                    $n++; try { & $updateWorkerProgress 'Running' } catch { }; if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n lines" -PercentComplete -1 }
                     $h = if ($Format -eq 'Kv') { Invoke-KvValueOnlyText -Text $line } else { $line }
                     $h = Invoke-LeakHardeningText -Text $h
                     $h = Protect-SensitiveTerms -Text $h -SensitiveTerms $SensitiveTerms
-                    $writer.WriteLine($h); & $updateLeaks $h
+                    $writer.WriteLine($h)
+                    if (-not $SkipLeakCheck) { & $updateLeaks $h }
                 }
             }
             finally { $reader.Close() }
         }
     }
-    finally { $writer.Close(); Write-Progress -Activity "Streaming $name" -Completed }
-    $clean = ($leakCounts.Keys.Count -eq 0)
-    if ($clean) { Write-Ok "Leak check PASSED (streaming): $name" }
+    finally {
+        try { & $updateWorkerProgress 'Completed' -Force } catch { }
+        $writer.Close(); Write-Progress -Activity "Streaming $name" -Completed
+    }
+    if ($ulsPerfStreamTotal) { $ulsPerfStreamTotal.Stop() }
+    if ($script:PerfReportEnabled) {
+        $freq = [double][System.Diagnostics.Stopwatch]::Frequency
+        $scrubSec = [double]$ulsPerfScrubTicks / $freq
+        $postSec = [double]$ulsPerfPostTicks / $freq
+        $writeSec = [double]$ulsPerfWriteTicks / $freq
+        $leakSec = [double]$ulsPerfLeakTicks / $freq
+        $residual = [Math]::Max(0, $ulsPerfStreamTotal.Elapsed.TotalSeconds - $scrubSec - $postSec - $writeSec - $leakSec)
+        Add-UlsPerfPhase -Phase 'Read CSV' -Seconds $residual -File $name -Rows $n -Notes 'Streaming Import-Csv/parser/pipeline residual'
+        Add-UlsPerfPhase -Phase 'Scrub fields' -Seconds $scrubSec -File $name -Rows $n -Notes 'Streaming row/cell scrub'
+        if ($script:PerfReportDetailedEnabled) {
+            foreach ($col in ($ulsPerfScrubColumnTicks.Keys | Sort-Object)) {
+                Add-UlsPerfPhase -Phase 'Scrub column' -Seconds ([double]$ulsPerfScrubColumnTicks[$col] / $freq) -File $name -Rows $n -Cells ([int]$ulsPerfScrubColumnCounts[$col]) -Notes ("Column=$col")
+            }
+        }
+        Add-UlsPerfPhase -Phase 'Post hardening' -Seconds $postSec -File $name -Rows $n -Notes 'Streaming row render + sensitive terms'
+        Add-UlsPerfPhase -Phase 'Write output' -Seconds $writeSec -File $name -Rows $n -Notes 'Streaming writer'
+        Add-UlsPerfPhase -Phase 'Leak check' -Seconds $leakSec -File $name -Rows $n -Notes 'Streaming per-distinct-line leak scan'
+    }
+    $clean = $true
+    if ($SkipLeakCheck) { Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified." }
+    else { $clean = ($leakCounts.Keys.Count -eq 0) }
+    if ($clean -and -not $SkipLeakCheck) { Write-Ok "Leak check PASSED (streaming): $name" }
     else {
-        Write-Fail "Leak check found residue (streaming) -- review:"
-        foreach ($k in $leakCounts.Keys) { Write-Detail ("{0}: {1}  e.g. {2}" -f $k, $leakCounts[$k], (($leakSamples[$k]) -join ', ')) }
+        if (-not $SkipLeakCheck) {
+            Write-Fail "Leak check found residue (streaming) -- review:"
+            foreach ($k in $leakCounts.Keys) { Write-Detail ("{0}: {1}  e.g. {2}" -f $k, $leakCounts[$k], (($leakSamples[$k]) -join ', ')) }
+        }
     }
     Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
-    return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $clean }
+    return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $clean; Rows = $n; Streamed = $true; LeakCheckSkipped = [bool]$SkipLeakCheck }
+}
+
+
+function ConvertTo-UlsPowerShellSingleQuotedLiteral {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '$null' }
+    return "'" + ([string]$Value -replace "'", "''") + "'"
+}
+
+function ConvertTo-UlsPowerShellStringArrayLiteral {
+    param([string[]]$Values)
+    $items = @($Values | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($items.Count -eq 0) { return '@()' }
+    return '@(' + (($items | ForEach-Object { ConvertTo-UlsPowerShellSingleQuotedLiteral -Value ([string]$_) }) -join ',') + ')'
+}
+
+function Get-UlsCurrentModulePath {
+    $modulePath = $null
+    if ($PSCommandPath -and ([System.IO.Path]::GetExtension($PSCommandPath) -ieq '.psm1')) { $modulePath = $PSCommandPath }
+    try {
+        if (-not $modulePath -and $MyInvocation.MyCommand.Module -and $MyInvocation.MyCommand.Module.Path) {
+            $candidate = $MyInvocation.MyCommand.Module.Path
+            if ([System.IO.Path]::GetExtension($candidate) -ieq '.psm1') { $modulePath = $candidate }
+            elseif ([System.IO.Path]::GetExtension($candidate) -ieq '.psd1') {
+                $candidateModule = Join-Path (Split-Path -Parent $candidate) 'UniversalLogScrubber.psm1'
+                if (Test-Path -LiteralPath $candidateModule) { $modulePath = $candidateModule }
+            }
+        }
+    } catch { }
+    if (-not $modulePath) { $modulePath = Join-Path $PSScriptRoot 'UniversalLogScrubber.psm1' }
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($modulePath)
+}
+
+
+function Invoke-UlsDiscoverTextBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$BatchIndex,
+        [Parameter(Mandatory)][string[]]$Lines,
+        [Parameter(Mandatory)][string]$ProfileName,
+        [Parameter(Mandatory)][string]$Salt,
+        [int]$HmacLength = 24,
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
+        [string[]]$AllowlistFile = @(),
+        [string]$Source = 'StreamingParallelDiscovery',
+        [string]$SourcePathHash = ''
+    )
+    $script:Salt = $Salt
+    $script:HmacLength = $HmacLength
+    $script:ScrubPolicy = $ScrubPolicy
+    $prof = Get-ScrubProfile -Name $ProfileName
+    Initialize-ScrubProfileRuntime -Profile $prof -AllowlistFiles $AllowlistFile
+    $seen = @{}
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($line in @($Lines)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        foreach ($id in (Find-Identifiers -Text ([string]$line))) {
+            if (-not (Test-UlsShouldMapDiscoveredIdentifier -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -ScrubPolicy $ScrubPolicy)) { continue }
+            $norm = Normalize-TokenKey -Value ([string]$id.Raw)
+            if (-not $norm -or $seen.ContainsKey($norm)) { continue }
+            $seen[$norm] = $true
+            $tok = Get-Token -Value ([string]$id.Raw) -Prefix ([string]$id.Prefix)
+            [void]$rows.Add((New-ScrubTokenMapRow -InputValue ([string]$id.Raw) -NormalizedValue $norm -Token $tok -TokenType ([string]$id.Prefix) -Source $Source -SourcePathHash $SourcePathHash))
+        }
+    }
+    return [pscustomobject]@{ BatchIndex = $BatchIndex; Rows = @($rows.ToArray()); LineCount = @($Lines).Count }
+}
+
+function Invoke-UlsScrubTextBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$BatchIndex,
+        [Parameter(Mandatory)][string[]]$Lines,
+        [Parameter(Mandatory)][ValidateSet('Text','Kv','Json')][string]$Format,
+        [Parameter(Mandatory)][string]$ProfileName,
+        [Parameter(Mandatory)][string]$Salt,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [int]$HmacLength = 24,
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @()
+    )
+    $script:Salt = $Salt
+    $script:HmacLength = $HmacLength
+    $script:ScrubPolicy = $ScrubPolicy
+    $prof = Get-ScrubProfile -Name $ProfileName
+    Initialize-ScrubProfileRuntime -Profile $prof -AllowlistFiles $AllowlistFile
+    if (-not [string]::IsNullOrWhiteSpace($TokenMapCsv)) { [void](Import-ScrubTokenMap -TokenMapCsv $TokenMapCsv) }
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($lineObj in @($Lines)) {
+        $line = [string]$lineObj
+        if ($Format -eq 'Json') {
+            $t = $line.Trim()
+            if ($t -eq '') { continue }
+            $h = Invoke-ScrubJsonText -Text $t -IsNdjson -Profile $prof
+        }
+        elseif ($Format -eq 'Kv') {
+            $h = Invoke-KvValueOnlyText -Text $line
+            $h = Invoke-LeakHardeningText -Text $h
+        }
+        else {
+            $h = Invoke-LeakHardeningText -Text $line
+        }
+        $h = Protect-SensitiveTerms -Text $h -SensitiveTerms $SensitiveTerms
+        [void]$out.Add([string]$h)
+    }
+    return [pscustomobject]@{ BatchIndex = $BatchIndex; Lines = [string[]]$out.ToArray(); Rows = $out.Count }
+}
+
+function Invoke-UlsScrubCsvBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$BatchIndex,
+        [Parameter(Mandatory)][object[]]$Rows,
+        [Parameter(Mandatory)][string[]]$Headers,
+        [string]$Delimiter = ',',
+        [Parameter(Mandatory)][string]$ProfileName,
+        [Parameter(Mandatory)][string]$Salt,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [int]$HmacLength = 24,
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @()
+    )
+    $script:Salt = $Salt
+    $script:HmacLength = $HmacLength
+    $script:ScrubPolicy = $ScrubPolicy
+    $script:__scrubFallback = 0
+    $script:__scrubFallbackCol = ''
+    $script:__cellCache = @{}
+    $script:__hmacTokenCache = @{}
+    $prof = Get-ScrubProfile -Name $ProfileName
+    if (-not $prof) { throw "Unknown profile for CSV batch worker: $ProfileName" }
+    Initialize-ScrubProfileRuntime -Profile $prof -AllowlistFiles $AllowlistFile
+    if (-not [string]::IsNullOrWhiteSpace($TokenMapCsv)) { [void](Import-ScrubTokenMap -TokenMapCsv $TokenMapCsv) }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($rowObj in @($Rows)) {
+        $values = New-Object System.Collections.Generic.List[object]
+        $rowValues = if ($rowObj -and ($rowObj.PSObject.Properties.Name -contains 'Values')) { [string[]]$rowObj.Values } else { [string[]]$rowObj }
+        for ($hi = 0; $hi -lt $Headers.Count; $hi++) {
+            $rawValue = if ($hi -lt $rowValues.Count) { $rowValues[$hi] } else { '' }
+            [void]$values.Add((Scrub-Field -ColumnName $Headers[$hi] -Value $rawValue -Profile $prof))
+        }
+        $line = ConvertTo-UlsDelimitedLine -Values $values.ToArray() -Delimiter $Delimiter
+        $line = Protect-SensitiveTerms -Text $line -SensitiveTerms $SensitiveTerms
+        [void]$out.Add([string]$line)
+    }
+
+    return [pscustomobject]@{
+        BatchIndex        = $BatchIndex
+        Lines             = [string[]]$out.ToArray()
+        Rows              = $out.Count
+        FallbackCount     = [int]$script:__scrubFallback
+        FallbackFirstHint = [string]$script:__scrubFallbackCol
+    }
+}
+
+function Invoke-UlsRunspaceBatchPool {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$WorkerScript,
+        [Parameter(Mandatory)][scriptblock]$ReadBatch,
+        [Parameter(Mandatory)][scriptblock]$HandleResult,
+        [int]$ThrottleLimit = 4,
+        [string]$Activity = 'Streaming parallel work',
+        [long]$TotalBytes = 0
+    )
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit)
+    $pool.ApartmentState = 'MTA'
+    $pool.Open()
+
+    # Mutable state is stored in hashtable keys and updated through the indexer.
+    # Avoid $state.Completed++ / $state.CompletedRows += ... here: under nested
+    # scriptblocks and hashtable dot-notation, progress counters can appear to
+    # reset or stop moving even though runspaces are doing work.
+    $state = @{
+        Running = (New-Object System.Collections.Generic.List[object])
+        Submitted = [int64]0
+        Completed = [int64]0
+        SubmittedRows = [int64]0
+        CompletedRows = [int64]0
+        SubmittedBytes = [int64]0
+        CompletedBytes = [int64]0
+        LastProgressUpdate = [datetime]::UtcNow.AddSeconds(-10)
+    }
+
+    $writeProgress = {
+        param([switch]$Force)
+        $nowProgress = [datetime]::UtcNow
+        $last = [datetime]$state['LastProgressUpdate']
+        if (-not $Force -and (($nowProgress - $last).TotalMilliseconds -lt 500)) { return }
+
+        $percent = -1
+        $mbStatus = ''
+        if ($TotalBytes -gt 0) {
+            $basisBytes = [Math]::Max([int64]$state['CompletedBytes'], [int64]0)
+            $percent = [Math]::Min(99, [Math]::Max(0, [int](($basisBytes * 100.0) / [double]$TotalBytes)))
+            $mbDone = [Math]::Round(($basisBytes / 1MB), 1)
+            $mbTotal = [Math]::Round(($TotalBytes / 1MB), 1)
+            $mbStatus = ("; {0}/{1} MB" -f $mbDone,$mbTotal)
+        }
+
+        $runningCount = 0
+        try { $runningCount = $state['Running'].Count } catch { $runningCount = 0 }
+        Write-Progress -Activity $Activity -Status ("completed={0} submitted={1} running={2}; rowsDone={3}; rowsSubmitted={4}{5}" -f ([int64]$state['Completed']),([int64]$state['Submitted']),$runningCount,([int64]$state['CompletedRows']),([int64]$state['SubmittedRows']),$mbStatus) -PercentComplete $percent
+        $state['LastProgressUpdate'] = $nowProgress
+    }
+
+    $drainOne = {
+        param([switch]$Wait)
+        while ($true) {
+            $running = $state['Running']
+            $readyIndex = -1
+            for ($i = 0; $i -lt $running.Count; $i++) {
+                if ($running[$i].Async.IsCompleted) { $readyIndex = $i; break }
+            }
+            if ($readyIndex -lt 0) {
+                if ($Wait -and $running.Count -gt 0) {
+                    & $writeProgress
+                    Start-Sleep -Milliseconds 50
+                    continue
+                }
+                return $false
+            }
+
+            $item = $running[$readyIndex]
+            $running.RemoveAt($readyIndex)
+            try {
+                try {
+                    $resultCollection = $item.PowerShell.EndInvoke($item.Async)
+                }
+                catch {
+                    throw ("Streaming parallel batch {0} failed: {1}" -f $item.BatchIndex, $_.Exception.Message)
+                }
+                foreach ($r in @($resultCollection)) { & $HandleResult $r }
+
+                $state['Completed'] = [int64]$state['Completed'] + 1
+                $state['CompletedRows'] = [int64]$state['CompletedRows'] + [int64]$item.Rows
+                $state['CompletedBytes'] = [int64]$state['CompletedBytes'] + [int64]$item.Bytes
+                & $writeProgress -Force
+            }
+            finally {
+                try { $item.PowerShell.Dispose() } catch { }
+            }
+            return $true
+        }
+    }
+
+    try {
+        while ($true) {
+            while ($state['Running'].Count -lt $ThrottleLimit) {
+                $batch = & $ReadBatch
+                if ($null -eq $batch) { break }
+
+                $ps = [powershell]::Create()
+                $ps.RunspacePool = $pool
+                [void]$ps.AddScript($WorkerScript.ToString())
+                foreach ($arg in ([object[]]$batch.Args)) { [void]$ps.AddArgument($arg) }
+                $async = $ps.BeginInvoke()
+
+                $batchRows = 0L; try { $batchRows = [int64]$batch.Rows } catch { }
+                $batchBytes = 0L; try { $batchBytes = [int64]$batch.Bytes } catch { }
+                [void]$state['Running'].Add([pscustomobject]@{ PowerShell = $ps; Async = $async; BatchIndex = $batch.Index; Rows = $batchRows; Bytes = $batchBytes })
+                $state['Submitted'] = [int64]$state['Submitted'] + 1
+                $state['SubmittedRows'] = [int64]$state['SubmittedRows'] + $batchRows
+                $state['SubmittedBytes'] = [int64]$state['SubmittedBytes'] + $batchBytes
+                & $writeProgress
+            }
+
+            if ($state['Running'].Count -eq 0) { break }
+            [void](& $drainOne -Wait)
+        }
+        # Force a final 100% completion state before clearing the progress record.
+        if ($TotalBytes -gt 0) { $state['CompletedBytes'] = [Math]::Max([int64]$state['CompletedBytes'], [int64]$TotalBytes) }
+        & $writeProgress -Force
+        Write-Progress -Activity $Activity -Completed
+    }
+    finally {
+        try {
+            foreach ($item in @($state['Running'])) {
+                try { $item.PowerShell.Stop() } catch { }
+                try { $item.PowerShell.Dispose() } catch { }
+            }
+        } catch { }
+        try { $pool.Close() } catch { }
+        try { $pool.Dispose() } catch { }
+    }
+}
+
+function Invoke-DiscoverFileStreamingParallelText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @(),
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$HmacLength = $script:HmacLength,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [switch]$NoCorrelate,
+        [switch]$KeepIntermediate
+    )
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    $batchSize = if ($ChunkSize -gt 0) { $ChunkSize } else { 5000 }
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    $modulePath = Get-UlsCurrentModulePath
+    $saltValue = Get-SessionSalt
+    $fileHash = Get-PathFingerprint -Path $InputPath -Length 12
+    $source = "Discovery:$name"
+    Write-Work ("Streaming parallel discovery (Text): {0}  throttle={1} batchSize={2}" -f $name, $ThrottleLimit, $batchSize)
+    $reader = [System.IO.StreamReader]::new($InputPath)
+    $allRows = New-Object System.Collections.Generic.List[object]
+    $batchIndex = 0
+    $totalLines = 0
+    $worker = {
+        param($ModulePath,$BatchIndex,$Lines,$ProfileName,$Salt,$HmacLength,$ScrubPolicy,$AllowlistFile,$Source,$FileHash)
+        if (-not (Get-Module -Name UniversalLogScrubber)) { Import-Module $ModulePath -Force }
+        Invoke-UlsDiscoverTextBatch -BatchIndex $BatchIndex -Lines ([string[]]$Lines) -ProfileName $ProfileName -Salt $Salt -HmacLength $HmacLength -ScrubPolicy $ScrubPolicy -AllowlistFile ([string[]]$AllowlistFile) -Source $Source -SourcePathHash $FileHash
+    }
+    $readBatch = {
+        if ($reader.EndOfStream) { return $null }
+        $bytesBefore = 0L; try { $bytesBefore = [int64]$reader.BaseStream.Position } catch { }
+        $lines = New-Object System.Collections.Generic.List[string]
+        while ($lines.Count -lt $batchSize -and -not $reader.EndOfStream) {
+            $l = $reader.ReadLine()
+            if ($null -eq $l) { break }
+            [void]$lines.Add($l)
+        }
+        if ($lines.Count -eq 0) { return $null }
+        $idx = $batchIndex; Set-Variable -Name batchIndex -Scope 1 -Value ($batchIndex + 1)
+        Set-Variable -Name totalLines -Scope 1 -Value ($totalLines + $lines.Count)
+        $argsList = New-Object System.Collections.Generic.List[object]
+        [void]$argsList.Add($modulePath)
+        [void]$argsList.Add($idx)
+        [void]$argsList.Add([string[]]$lines.ToArray())
+        [void]$argsList.Add($ProfileName)
+        [void]$argsList.Add($saltValue)
+        [void]$argsList.Add($HmacLength)
+        [void]$argsList.Add($ScrubPolicy)
+        [void]$argsList.Add([string[]]$AllowlistFile)
+        [void]$argsList.Add($source)
+        [void]$argsList.Add($fileHash)
+        $bytesAfter = $bytesBefore; try { $bytesAfter = [int64]$reader.BaseStream.Position } catch { }
+        $batchBytes = [Math]::Max(0L, ($bytesAfter - $bytesBefore))
+        return [pscustomobject]@{ Index=$idx; Args=[object[]]$argsList.ToArray(); Rows=$lines.Count; Bytes=$batchBytes }
+    }
+    $handle = {
+        param($Result)
+        if ($null -eq $Result) { return }
+        foreach ($r in @($Result.Rows)) { [void]$allRows.Add($r) }
+    }
+    $sw = New-UlsPerfStopwatch
+    $totalBytes = 0L; try { $totalBytes = [int64](Get-Item -LiteralPath $InputPath).Length } catch { }
+    try { Invoke-UlsRunspaceBatchPool -WorkerScript $worker -ReadBatch $readBatch -HandleResult $handle -ThrottleLimit $ThrottleLimit -Activity ("Streaming parallel discovery $name") -TotalBytes $totalBytes }
+    finally { try { $reader.Close() } catch { } }
+    Add-UlsPerfPhase -Phase 'Discover identifiers' -Stopwatch $sw -File $name -Rows $totalLines -Notes ("Streaming parallel discovery batches={0}; throttle={1}; batchSize={2}; no input chunk files" -f $batchIndex,$ThrottleLimit,$batchSize)
+    return @($allRows.ToArray())
+}
+
+function Invoke-ScrubFileStreamingParallelText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @(),
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$HmacLength = $script:HmacLength,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [switch]$SkipLeakCheck,
+        [switch]$KeepIntermediate
+    )
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    if (-not (Test-Path -LiteralPath $TokenMapCsv)) { throw "ParallelScrub requires an existing token map after map setup. Not found: $TokenMapCsv" }
+    $batchSize = if ($ChunkSize -gt 0) { $ChunkSize } else { 5000 }
+    $name = [System.IO.Path]::GetFileName($InputPath); $outFull = Resolve-OutPath -Path $OutputPath
+    $profileName = $null; try { $profileName = [string]$Profile.Name } catch { }
+    if ([string]::IsNullOrWhiteSpace($profileName)) { throw "Streaming ParallelScrub currently requires a named/built-in profile." }
+    $format = $Profile.Format
+    if ($format -eq 'Auto') { $format = 'Text' }
+    if ($format -ne 'Text' -and $format -ne 'Kv' -and $format -ne 'Json') { throw "Streaming ParallelScrub text path supports Text/Kv/Json formats only; got $format." }
+    $modulePath = Get-UlsCurrentModulePath
+    $saltValue = Get-SessionSalt
+    $tokenMapFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenMapCsv)
+    Write-Work ("Streaming parallel scrub (Text): {0}  throttle={1} batchSize={2}" -f $name, $ThrottleLimit, $batchSize)
+    $reader = [System.IO.StreamReader]::new($InputPath)
+    $writer = [System.IO.StreamWriter]::new($outFull, $false, [System.Text.Encoding]::UTF8)
+    $batchIndex = 0; $totalLines = 0; $writtenLines = 0; $nextWrite = 0
+    $ready = @{}
+    $worker = {
+        param($ModulePath,$BatchIndex,$Lines,$Format,$ProfileName,$Salt,$TokenMapCsv,$HmacLength,$ScrubPolicy,$SensitiveTerms,$AllowlistFile)
+        if (-not (Get-Module -Name UniversalLogScrubber)) { Import-Module $ModulePath -Force }
+        Invoke-UlsScrubTextBatch -BatchIndex $BatchIndex -Lines ([string[]]$Lines) -Format $Format -ProfileName $ProfileName -Salt $Salt -TokenMapCsv $TokenMapCsv -HmacLength $HmacLength -ScrubPolicy $ScrubPolicy -SensitiveTerms ([string[]]$SensitiveTerms) -AllowlistFile ([string[]]$AllowlistFile)
+    }
+    $readBatch = {
+        if ($reader.EndOfStream) { return $null }
+        $bytesBefore = 0L; try { $bytesBefore = [int64]$reader.BaseStream.Position } catch { }
+        $lines = New-Object System.Collections.Generic.List[string]
+        while ($lines.Count -lt $batchSize -and -not $reader.EndOfStream) {
+            $l = $reader.ReadLine()
+            if ($null -eq $l) { break }
+            [void]$lines.Add($l)
+        }
+        if ($lines.Count -eq 0) { return $null }
+        $idx = $batchIndex; Set-Variable -Name batchIndex -Scope 1 -Value ($batchIndex + 1)
+        Set-Variable -Name totalLines -Scope 1 -Value ($totalLines + $lines.Count)
+        $argsList = New-Object System.Collections.Generic.List[object]
+        [void]$argsList.Add($modulePath)
+        [void]$argsList.Add($idx)
+        [void]$argsList.Add([string[]]$lines.ToArray())
+        [void]$argsList.Add($format)
+        [void]$argsList.Add($profileName)
+        [void]$argsList.Add($saltValue)
+        [void]$argsList.Add($tokenMapFull)
+        [void]$argsList.Add($HmacLength)
+        [void]$argsList.Add($ScrubPolicy)
+        [void]$argsList.Add([string[]]$SensitiveTerms)
+        [void]$argsList.Add([string[]]$AllowlistFile)
+        $bytesAfter = $bytesBefore; try { $bytesAfter = [int64]$reader.BaseStream.Position } catch { }
+        $batchBytes = [Math]::Max(0L, ($bytesAfter - $bytesBefore))
+        return [pscustomobject]@{ Index=$idx; Args=[object[]]$argsList.ToArray(); Rows=$lines.Count; Bytes=$batchBytes }
+    }
+    $handle = {
+        param($Result)
+        if ($null -eq $Result) { return }
+        $ready[[int]$Result.BatchIndex] = $Result
+        while ($ready.ContainsKey($nextWrite)) {
+            $r = $ready[$nextWrite]
+            foreach ($line in @($r.Lines)) { $writer.WriteLine([string]$line); $writtenLines++ }
+            $ready.Remove($nextWrite)
+            Set-Variable -Name nextWrite -Scope 1 -Value ($nextWrite + 1)
+            Write-Progress -Activity "Streaming parallel scrub $name" -Status "written=$writtenLines read=$totalLines batchesDone=$nextWrite" -PercentComplete -1
+        }
+    }
+    $sw = New-UlsPerfStopwatch
+    $totalBytes = 0L; try { $totalBytes = [int64](Get-Item -LiteralPath $InputPath).Length } catch { }
+    try { Invoke-UlsRunspaceBatchPool -WorkerScript $worker -ReadBatch $readBatch -HandleResult $handle -ThrottleLimit $ThrottleLimit -Activity ("Streaming parallel scrub $name") -TotalBytes $totalBytes }
+    finally { try { $writer.Close() } catch { }; try { $reader.Close() } catch { } }
+    Add-UlsPerfPhase -Phase 'Scrub fields' -Stopwatch $sw -File $name -Rows $writtenLines -Notes ("Streaming parallel in-memory batches; throttle={0}; batchSize={1}; no input chunk files" -f $ThrottleLimit,$batchSize)
+    $ulsPerfLeak = New-UlsPerfStopwatch
+    if ($SkipLeakCheck) { Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified."; $clean = $true }
+    else { $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms }
+    Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $writtenLines -Notes ('Streaming parallel final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
+    Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
+    return [pscustomobject]@{ Input=$InputPath; Output=$outFull; Clean=$clean; Rows=$writtenLines; Parallel=$true; Streamed=$true; StreamingParallel=$true; LeakCheckSkipped=[bool]$SkipLeakCheck }
+}
+
+function Invoke-ScrubFileStreamingParallelCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @(),
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$HmacLength = $script:HmacLength,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [switch]$SkipLeakCheck,
+        [switch]$KeepIntermediate,
+        [string]$Delimiter = ','
+    )
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    if (-not (Test-Path -LiteralPath $TokenMapCsv)) { throw "ParallelScrub requires an existing token map after map setup. Not found: $TokenMapCsv" }
+    $batchSize = if ($ChunkSize -gt 0) { $ChunkSize } else { 2000 }
+    if ($batchSize -lt 1) { $batchSize = 1 }
+
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    $outFull = Resolve-OutPath -Path $OutputPath
+    $profileName = $null
+    try { $profileName = [string]$Profile.Name } catch { }
+    if ([string]::IsNullOrWhiteSpace($profileName)) { throw "Streaming ParallelScrub currently requires a named/built-in profile." }
+
+    $modulePath = Get-UlsCurrentModulePath
+    $saltValue = Get-SessionSalt
+    $tokenMapFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenMapCsv)
+    Write-Work ("Streaming parallel scrub (CSV): {0}  throttle={1} batchSize={2}" -f $name, $ThrottleLimit, $batchSize)
+
+    $reader = [System.IO.StreamReader]::new($InputPath)
+    $writer = [System.IO.StreamWriter]::new($outFull, $false, [System.Text.Encoding]::UTF8)
+    $csvParallelState = @{
+        BatchIndex        = 0
+        TotalRows         = 0
+        WrittenRows       = 0
+        NextWrite         = 0
+        FallbackCount     = 0
+        FallbackFirstHint = ''
+    }
+    $ready = @{}
+    $headers = $null
+
+    $worker = {
+        param($Context)
+        if (-not (Get-Module -Name UniversalLogScrubber)) { Import-Module ([string]$Context.ModulePath) -Force }
+        Invoke-UlsScrubCsvBatch `
+            -BatchIndex ([int]$Context.BatchIndex) `
+            -Rows ([object[]]$Context.Rows) `
+            -Headers ([string[]]$Context.Headers) `
+            -Delimiter ([string]$Context.Delimiter) `
+            -ProfileName ([string]$Context.ProfileName) `
+            -Salt ([string]$Context.Salt) `
+            -TokenMapCsv ([string]$Context.TokenMapCsv) `
+            -HmacLength ([int]$Context.HmacLength) `
+            -ScrubPolicy ([string]$Context.ScrubPolicy) `
+            -SensitiveTerms ([string[]]$Context.SensitiveTerms) `
+            -AllowlistFile ([string[]]$Context.AllowlistFile)
+    }
+
+    $readBatch = {
+        if ($null -eq $headers) {
+            $headerRecord = Read-UlsDelimitedRecord -Reader $reader -Delimiter $Delimiter
+            if ($null -eq $headerRecord) { return $null }
+            Set-Variable -Name headers -Scope 1 -Value ([string[]]$headerRecord)
+            $headerLine = Protect-SensitiveTerms -Text (ConvertTo-UlsDelimitedLine -Values ([object[]]$headerRecord) -Delimiter $Delimiter) -SensitiveTerms $SensitiveTerms
+            $writer.WriteLine($headerLine)
+        }
+
+        $bytesBefore = 0L; try { $bytesBefore = [int64]$reader.BaseStream.Position } catch { }
+        $rows = New-Object System.Collections.Generic.List[object]
+        while ($rows.Count -lt $batchSize) {
+            $record = Read-UlsDelimitedRecord -Reader $reader -Delimiter $Delimiter
+            if ($null -eq $record) { break }
+            [void]$rows.Add([string[]]$record)
+        }
+        if ($rows.Count -eq 0) { return $null }
+
+        $idx = [int]$csvParallelState['BatchIndex']
+        $csvParallelState['BatchIndex'] = $idx + 1
+        $csvParallelState['TotalRows'] = [int]$csvParallelState['TotalRows'] + [int]$rows.Count
+
+        $context = [pscustomobject]@{
+            ModulePath     = $modulePath
+            BatchIndex     = $idx
+            Rows           = [object[]]$rows.ToArray()
+            Headers        = [string[]]$headers
+            Delimiter      = $Delimiter
+            ProfileName    = $profileName
+            Salt           = $saltValue
+            TokenMapCsv    = $tokenMapFull
+            HmacLength     = $HmacLength
+            ScrubPolicy    = $ScrubPolicy
+            SensitiveTerms = [string[]]$SensitiveTerms
+            AllowlistFile  = [string[]]$AllowlistFile
+        }
+
+        $bytesAfter = $bytesBefore; try { $bytesAfter = [int64]$reader.BaseStream.Position } catch { }
+        $batchBytes = [Math]::Max(0L, ($bytesAfter - $bytesBefore))
+        return [pscustomobject]@{ Index=$idx; Args=[object[]]@($context); Rows=$rows.Count; Bytes=$batchBytes }
+    }
+
+    $handle = {
+        param($Result)
+        if ($null -eq $Result) { return }
+        $ready[[int]$Result.BatchIndex] = $Result
+        while ($ready.ContainsKey([int]$csvParallelState['NextWrite'])) {
+            $nextWrite = [int]$csvParallelState['NextWrite']
+            $r = $ready[$nextWrite]
+            foreach ($line in @($r.Lines)) {
+                $writer.WriteLine([string]$line)
+                $csvParallelState['WrittenRows'] = [int]$csvParallelState['WrittenRows'] + 1
+            }
+            if ($r.FallbackCount) {
+                $csvParallelState['FallbackCount'] = [int]$csvParallelState['FallbackCount'] + [int]$r.FallbackCount
+                if ([string]::IsNullOrWhiteSpace([string]$csvParallelState['FallbackFirstHint']) -and -not [string]::IsNullOrWhiteSpace([string]$r.FallbackFirstHint)) {
+                    $csvParallelState['FallbackFirstHint'] = [string]$r.FallbackFirstHint
+                }
+            }
+            $ready.Remove($nextWrite)
+            $csvParallelState['NextWrite'] = $nextWrite + 1
+            Write-Progress -Activity "Streaming parallel scrub $name" -Status "written=$($csvParallelState['WrittenRows']) read=$($csvParallelState['TotalRows']) batchesDone=$($csvParallelState['NextWrite']) ready=$($ready.Count)" -PercentComplete -1
+        }
+    }
+
+    $sw = New-UlsPerfStopwatch
+    $totalBytes = 0L; try { $totalBytes = [int64](Get-Item -LiteralPath $InputPath).Length } catch { }
+    try {
+        Invoke-UlsRunspaceBatchPool -WorkerScript $worker -ReadBatch $readBatch -HandleResult $handle -ThrottleLimit $ThrottleLimit -Activity ("Streaming parallel CSV scrub $name") -TotalBytes $totalBytes
+    }
+    finally {
+        try { $writer.Close() } catch { }
+        try { $reader.Close() } catch { }
+    }
+    if ($ready.Count -gt 0) { throw "Streaming parallel CSV scrub completed with unwritten out-of-order batch(es): $($ready.Count)" }
+    $writtenRows = [int]$csvParallelState['WrittenRows']
+    Add-UlsPerfPhase -Phase 'Scrub fields' -Stopwatch $sw -File $name -Rows $writtenRows -Notes ("Streaming parallel CSV in-memory batches; throttle={0}; batchSize={1}; no input chunk files" -f $ThrottleLimit,$batchSize)
+
+    $ulsPerfLeak = New-UlsPerfStopwatch
+    if ($SkipLeakCheck) {
+        Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified."
+        $clean = $true
+    }
+    else {
+        Write-Progress -Activity "Verifying $name" -Status "Final streaming leak check" -PercentComplete -1
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+        Write-Progress -Activity "Verifying $name" -Completed
+    }
+    Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $writtenRows -Notes ('Streaming parallel CSV final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
+    if ([int]$csvParallelState['FallbackCount'] -gt 0) {
+        Write-Warn "$($csvParallelState['FallbackCount']) cell(s) required fail-closed fallback inside CSV workers. First column: '$($csvParallelState['FallbackFirstHint'])'."
+    }
+    Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
+    return [pscustomobject]@{ Input=$InputPath; Output=$outFull; Clean=$clean; Rows=$writtenRows; Parallel=$true; Streamed=$true; StreamingParallel=$true; LeakCheckSkipped=[bool]$SkipLeakCheck }
+}
+
+
+function Remove-UlsParallelWorkingFolder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$Retries = 5,
+        [int]$DelayMilliseconds = 250
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    for ($attempt = 1; $attempt -le [Math]::Max($Retries, 1); $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return $true
+        } catch {
+            if ($attempt -ge [Math]::Max($Retries, 1)) {
+                Write-Warn "Could not remove parallel working folder '$Path': $($_.Exception.Message)"
+                return $false
+            }
+            Start-Sleep -Milliseconds ([Math]::Max($DelayMilliseconds, 50) * $attempt)
+        }
+    }
+    return $false
+}
+
+function Remove-UlsStaleParallelWorkingFolders {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)][string]$InputPath,
+        [int]$OlderThanHours = 24
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $WorkDir)) { return }
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
+        if ([string]::IsNullOrWhiteSpace($base)) { return }
+        $cutoff = (Get-Date).AddHours(-[Math]::Max($OlderThanHours, 1))
+        Get-ChildItem -LiteralPath $WorkDir -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like ("_parallel_{0}_*" -f $base) -and $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object { [void](Remove-UlsParallelWorkingFolder -Path $_.FullName -Retries 2 -DelayMilliseconds 100) }
+    } catch {
+        # Stale cleanup is best-effort only; never fail the scrub because cleanup failed.
+    }
+}
+
+
+function New-UlsLineChunks {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$ChunkRoot,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [string]$Extension = '.log'
+    )
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    if ($ChunkSize -lt 0) { throw "-ChunkSize must be 0 for auto/equal chunks, or a positive integer." }
+    if ([string]::IsNullOrWhiteSpace($Extension)) { $Extension = '.log' }
+    if (-not $Extension.StartsWith('.')) { $Extension = '.' + $Extension }
+    New-Item -ItemType Directory -Path $ChunkRoot -Force | Out-Null
+
+    $fileInfo = Get-Item -LiteralPath $InputPath
+    $fileLength = [long]$fileInfo.Length
+    $autoChunkSize = ($ChunkSize -le 0)
+    $targetBytes = if ($autoChunkSize) { [long][Math]::Ceiling($fileLength / [double]$ThrottleLimit) } else { [long]0 }
+    if ($targetBytes -lt 1) { $targetBytes = 1 }
+
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $reader = [System.IO.StreamReader]::new($InputPath)
+    $writer = $null
+    $chunkIndex = 0
+    $chunkRows = 0
+    $totalRows = 0
+    $nextBoundary = $targetBytes
+    try {
+        while (-not $reader.EndOfStream) {
+            if ($null -eq $writer) {
+                $chunkIndex++
+                $chunkRows = 0
+                $chunkFile = Join-Path $ChunkRoot ("chunk_{0:D6}{1}" -f $chunkIndex, $Extension)
+                $writer = [System.IO.StreamWriter]::new($chunkFile, $false, [System.Text.Encoding]::UTF8)
+            }
+            $line = $reader.ReadLine()
+            if ($null -eq $line) { break }
+            $writer.WriteLine($line)
+            $chunkRows++
+            $totalRows++
+
+            $shouldRoll = $false
+            if ($autoChunkSize) {
+                try { if ($reader.BaseStream.Position -ge $nextBoundary -and $chunkIndex -lt $ThrottleLimit) { $shouldRoll = $true } } catch { }
+            }
+            elseif ($chunkRows -ge $ChunkSize) { $shouldRoll = $true }
+
+            if ($shouldRoll) {
+                $writer.Close(); $writer = $null
+                [void]$chunks.Add([pscustomobject]@{ Index=$chunkIndex; Input=$chunkFile; Rows=$chunkRows; Bytes=0; WorkDir=$null; Script=$null; StdOut=$null; StdErr=$null; Progress=$null; Process=$null; Output=$null; TokenMap=$null })
+                if ($autoChunkSize) { $nextBoundary += $targetBytes }
+            }
+        }
+    }
+    finally {
+        if ($writer) {
+            $writer.Close()
+            [void]$chunks.Add([pscustomobject]@{ Index=$chunkIndex; Input=$chunkFile; Rows=$chunkRows; Bytes=0; WorkDir=$null; Script=$null; StdOut=$null; StdErr=$null; Progress=$null; Process=$null; Output=$null; TokenMap=$null })
+        }
+        try { $reader.Close() } catch { }
+    }
+    foreach ($c in $chunks) { try { $c.Bytes = (Get-Item -LiteralPath $c.Input).Length } catch { } }
+    return [pscustomobject]@{ Chunks=$chunks; Rows=$totalRows; Bytes=$fileLength; Auto=$autoChunkSize; TargetBytes=$targetBytes }
+}
+
+function Invoke-UlsChunkWorkerPool {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Chunks,
+        [Parameter(Mandatory)][string]$PwshPath,
+        [Parameter(Mandatory)][string]$Activity,
+        [int]$ThrottleLimit = 4,
+        [switch]$KeepIntermediate
+    )
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    $pending = New-Object System.Collections.Queue
+    foreach ($c in $Chunks) { $pending.Enqueue($c) }
+    $running = New-Object System.Collections.Generic.List[object]
+    $completed = New-Object System.Collections.Generic.List[object]
+    $totalRows = 0
+    foreach ($c in $Chunks) { $totalRows += [int]$c.Rows }
+    if ($totalRows -lt 1) { $totalRows = 1 }
+    $progressState = [pscustomobject]@{ LastPercent = -1; LastCompleted = -1; LastRowsDone = -1; LastUpdateUtc = [DateTime]::UtcNow.AddSeconds(-2) }
+    $readWorkerProgress = {
+        param($Chunk)
+        $done = 0; $total = [int]$Chunk.Rows; $status = 'Pending'
+        try {
+            if ($Chunk.Progress -and (Test-Path -LiteralPath $Chunk.Progress)) {
+                $raw = [System.IO.File]::ReadAllText($Chunk.Progress)
+                if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                    $j = $raw | ConvertFrom-Json -ErrorAction Stop
+                    if ($null -ne $j.RowsDone) { $done = [int]$j.RowsDone }
+                    if ($null -ne $j.RowsTotal -and [int]$j.RowsTotal -gt 0) { $total = [int]$j.RowsTotal }
+                    if ($null -ne $j.Status) { $status = [string]$j.Status }
+                }
+            }
+        } catch { }
+        if ($done -lt 0) { $done = 0 }
+        if ($total -lt 1) { $total = [int]$Chunk.Rows }
+        if ($done -gt $total) { $done = $total }
+        return [pscustomobject]@{ RowsDone=$done; RowsTotal=$total; Status=$status }
+    }
+    $updateProgress = {
+        param([switch]$Force)
+        $doneChunks = $completed.Count
+        $rowsDone = 0
+        foreach ($cc in $completed) { $rowsDone += [int]$cc.Rows }
+        foreach ($rc in $running) { $rp = & $readWorkerProgress $rc; $rowsDone += [int]$rp.RowsDone }
+        if ($rowsDone -gt $totalRows) { $rowsDone = $totalRows }
+        $pct = [Math]::Min(100, [Math]::Max(0, [int](($rowsDone / [double]$totalRows) * 100)))
+        $now = [DateTime]::UtcNow
+        if ($Force -or $pct -ne $progressState.LastPercent -or $doneChunks -ne $progressState.LastCompleted -or $rowsDone -ne $progressState.LastRowsDone -or (($now - $progressState.LastUpdateUtc).TotalSeconds -ge 1.0)) {
+            $runningBits = @()
+            foreach ($rc in ($running | Sort-Object Index)) { $rp = & $readWorkerProgress $rc; $runningBits += ("{0}:{1}/{2}" -f $rc.Index, [int]$rp.RowsDone, [int]$rp.RowsTotal) }
+            $status = "Rows $rowsDone/$totalRows; chunks $doneChunks/$($Chunks.Count); running=$($running.Count); pending=$($pending.Count)"
+            if ($runningBits.Count -gt 0) { $status += "; active=" + (($runningBits | Select-Object -First 6) -join ',') }
+            Write-Progress -Activity $Activity -Status $status -PercentComplete $pct
+            $progressState.LastPercent = $pct; $progressState.LastCompleted = $doneChunks; $progressState.LastRowsDone = $rowsDone; $progressState.LastUpdateUtc = $now
+        }
+    }
+    & $updateProgress -Force
+    while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+        while ($pending.Count -gt 0 -and $running.Count -lt $ThrottleLimit) {
+            $c = $pending.Dequeue()
+            Write-Detail ("Starting parallel chunk {0}/{1} ({2} rows)" -f $c.Index, $Chunks.Count, $c.Rows)
+            $scriptArg = '"' + ([string]$c.Script -replace '"','\"') + '"'
+            $argLine = ('-NoProfile -ExecutionPolicy Bypass -File {0}' -f $scriptArg)
+            $startParams = @{ FilePath=$PwshPath; ArgumentList=$argLine; RedirectStandardOutput=$c.StdOut; RedirectStandardError=$c.StdErr; PassThru=$true }
+            if ($IsWindows -or $env:OS -eq 'Windows_NT') { $startParams['WindowStyle'] = 'Hidden' }
+            try { $proc = Start-Process @startParams }
+            catch {
+                if ($startParams.ContainsKey('WindowStyle')) { [void]$startParams.Remove('WindowStyle') }
+                if ($IsWindows -or $env:OS -eq 'Windows_NT') { $startParams['NoNewWindow'] = $true }
+                try { $proc = Start-Process @startParams }
+                catch { if ($startParams.ContainsKey('NoNewWindow')) { [void]$startParams.Remove('NoNewWindow') }; $proc = Start-Process @startParams }
+            }
+            $c.Process = $proc; [void]$running.Add($c)
+        }
+        Start-Sleep -Milliseconds 200
+        for ($idx = $running.Count - 1; $idx -ge 0; $idx--) {
+            $c = $running[$idx]
+            if ($c.Process.HasExited) {
+                if ($c.Process.ExitCode -ne 0) {
+                    $errText = ''; try { if (Test-Path -LiteralPath $c.StdErr) { $errText = [System.IO.File]::ReadAllText($c.StdErr) } } catch { }
+                    throw ("Parallel worker chunk {0} failed with exit code {1}. {2}" -f $c.Index, $c.Process.ExitCode, $errText)
+                }
+                try { if ($c.Process) { $c.Process.Dispose() } } catch { }
+                if (-not $KeepIntermediate) { try { if ($c.Progress -and (Test-Path -LiteralPath $c.Progress)) { Remove-Item -LiteralPath $c.Progress -Force -ErrorAction SilentlyContinue } } catch { } }
+                [void]$completed.Add($c); $running.RemoveAt($idx)
+                Write-Detail ("Completed parallel chunk {0}/{1} ({2} rows)" -f $c.Index, $Chunks.Count, $c.Rows)
+                & $updateProgress -Force
+            }
+        }
+        & $updateProgress
+    }
+    Write-Progress -Activity $Activity -Completed
+    return @($completed | Sort-Object Index)
+}
+
+function Invoke-DiscoverFileParallelText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)][string]$ProfileName,
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @(),
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$HmacLength = $script:HmacLength,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [switch]$NoCorrelate,
+        [switch]$KeepIntermediate
+    )
+    return Invoke-DiscoverFileStreamingParallelText -InputPath $InputPath -TokenMapCsv $TokenMapCsv -WorkDir $WorkDir -ProfileName $ProfileName -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -ScrubPolicy $ScrubPolicy -HmacLength $HmacLength -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -NoCorrelate:$NoCorrelate -KeepIntermediate:$KeepIntermediate
+}
+
+function Invoke-ScrubFileParallelText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @(),
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$HmacLength = $script:HmacLength,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [switch]$SkipLeakCheck,
+        [switch]$KeepIntermediate
+    )
+    return Invoke-ScrubFileStreamingParallelText -InputPath $InputPath -OutputPath $OutputPath -Profile $Profile -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -TokenMapCsv $TokenMapCsv -WorkDir $WorkDir -ScrubPolicy $ScrubPolicy -HmacLength $HmacLength -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -SkipLeakCheck:$SkipLeakCheck -KeepIntermediate:$KeepIntermediate
+}
+
+function Invoke-ScrubFileParallelCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [string[]]$SensitiveTerms = @(),
+        [string[]]$AllowlistFile = @(),
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$HmacLength = $script:HmacLength,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [switch]$SkipLeakCheck,
+        [switch]$KeepIntermediate,
+        [string]$Delimiter = ','
+    )
+
+    # v4.14 keeps this legacy private entrypoint as a compatibility shim only.
+    # The implementation must stay streaming/runspace-based so -ParallelScrub never
+    # creates physical CSV input chunks or per-chunk scrubbed output files.
+    return Invoke-ScrubFileStreamingParallelCsv -InputPath $InputPath -OutputPath $OutputPath -Profile $Profile -TokenMapCsv $TokenMapCsv -WorkDir $WorkDir -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -ScrubPolicy $ScrubPolicy -HmacLength $HmacLength -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -SkipLeakCheck:$SkipLeakCheck -KeepIntermediate:$KeepIntermediate -Delimiter $Delimiter
+
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    $autoChunkSize = ($ChunkSize -le 0)
+    if ($ChunkSize -lt 0) { throw "-ChunkSize must be 0 for auto/equal chunks, or a positive integer." }
+    if ($ChunkSize -gt 0 -and $ChunkSize -lt 100) { $ChunkSize = 100 }
+    if (-not (Test-Path -LiteralPath $TokenMapCsv)) { throw "ParallelScrub requires an existing token map after map setup. Not found: $TokenMapCsv" }
+
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    $outFull = Resolve-OutPath -Path $OutputPath
+    $profileName = $null
+    try { $profileName = [string]$Profile.Name } catch { }
+    if ([string]::IsNullOrWhiteSpace($profileName)) { throw "ParallelScrub currently requires a named/built-in profile. Use the normal scrub path for anonymous profile objects." }
+
+    $modulePath = Get-UlsCurrentModulePath
+    if (-not (Test-Path -LiteralPath $modulePath)) { throw "Could not resolve module path for ParallelScrub workers: $modulePath" }
+
+    $pwshPath = $null
+    try { $pwshPath = (Get-Process -Id $PID).Path } catch { }
+    if (-not $pwshPath -or -not (Test-Path -LiteralPath $pwshPath)) {
+        $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+        if ($cmd) { $pwshPath = $cmd.Source }
+    }
+    if (-not $pwshPath -or -not (Test-Path -LiteralPath $pwshPath)) { throw "ParallelScrub requires pwsh/PowerShell executable discovery, but none was found." }
+
+    if (-not $KeepIntermediate) { Remove-UlsStaleParallelWorkingFolders -WorkDir $WorkDir -InputPath $InputPath -OlderThanHours 24 }
+
+    $parallelRoot = Join-Path $WorkDir ("_parallel_{0}_{1}" -f ([System.IO.Path]::GetFileNameWithoutExtension($InputPath)), ([System.IO.Path]::GetRandomFileName().Replace('.', '')))
+    $chunkInRoot = Join-Path $parallelRoot 'chunks'
+    $chunkOutRoot = Join-Path $parallelRoot 'workers'
+    New-Item -ItemType Directory -Path $chunkInRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $chunkOutRoot -Force | Out-Null
+
+    $chunkSizeLabel = if ($autoChunkSize) { 'auto/equal' } else { [string]$ChunkSize }
+    Write-Work ("Parallel scrub (Csv): {0}  throttle={1} chunkSize={2}" -f $name, $ThrottleLimit, $chunkSizeLabel)
+
+    $saltWorkerFile = Join-Path $parallelRoot 'worker_salt_DO_NOT_UPLOAD.txt'
+    [System.IO.File]::WriteAllText($saltWorkerFile, (Get-SessionSalt), [System.Text.Encoding]::UTF8)
+
+    $sensitiveTermsFileForWorkers = $null
+    if (@($SensitiveTerms).Count -gt 0) {
+        $sensitiveTermsFileForWorkers = Join-Path $parallelRoot 'worker_sensitive_terms.txt'
+        [System.IO.File]::WriteAllLines($sensitiveTermsFileForWorkers, [string[]]@($SensitiveTerms), [System.Text.Encoding]::UTF8)
+    }
+
+    $readSw = New-UlsPerfStopwatch
+    $rows = @(Import-Csv -Path $InputPath -Delimiter $Delimiter)
+    Add-UlsPerfPhase -Phase 'Read CSV' -Stopwatch $readSw -File $name -Rows $rows.Count -Notes 'Parallel chunk prep Import-Csv'
+    $totalRows = $rows.Count
+    if ($totalRows -eq 0) { throw "ParallelScrub found no CSV rows in: $InputPath" }
+    if ($autoChunkSize) {
+        $ChunkSize = [int][Math]::Ceiling($totalRows / [double]$ThrottleLimit)
+        if ($ChunkSize -lt 1) { $ChunkSize = 1 }
+        Write-Detail ("Auto chunk size resolved: {0} rows/chunk ({1} rows / throttle {2})" -f $ChunkSize, $totalRows, $ThrottleLimit)
+    }
+
+    $chunkPrepSw = New-UlsPerfStopwatch
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $chunkIndex = 0
+    for ($start = 0; $start -lt $totalRows; $start += $ChunkSize) {
+        $chunkIndex++
+        $endExclusive = [Math]::Min($start + $ChunkSize, $totalRows)
+        $chunkRows = New-Object System.Collections.Generic.List[object]
+        for ($ri = $start; $ri -lt $endExclusive; $ri++) { [void]$chunkRows.Add($rows[$ri]) }
+        $chunkFile = Join-Path $chunkInRoot ("chunk_{0:D6}.csv" -f $chunkIndex)
+        $chunkRows | Export-Csv -Path $chunkFile -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+        $workerDir = Join-Path $chunkOutRoot ("chunk_{0:D6}" -f $chunkIndex)
+        New-Item -ItemType Directory -Path $workerDir -Force | Out-Null
+        [void]$chunks.Add([pscustomobject]@{ Index = $chunkIndex; Input = $chunkFile; WorkDir = $workerDir; Rows = $chunkRows.Count; Script = $null; StdOut = $null; StdErr = $null; Progress = $null; Process = $null; Output = $null })
+    }
+    Add-UlsPerfPhase -Phase 'Parallel chunk prep' -Stopwatch $chunkPrepSw -File $name -Rows $totalRows -Cells $chunks.Count -Notes ("chunkSize={0}; auto={1}; throttle={2}" -f $ChunkSize, $autoChunkSize, $ThrottleLimit)
+
+    $tokenMapResolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TokenMapCsv)
+    $moduleLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $modulePath
+    $profileLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $profileName
+    $saltFileLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $saltWorkerFile
+    $tokenMapLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $tokenMapResolved
+    $policyLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $ScrubPolicy
+    $allowlistArg = ''
+    if (@($AllowlistFile).Count -gt 0) { $allowlistArg = ' -AllowlistFile ' + (ConvertTo-UlsPowerShellStringArrayLiteral -Values $AllowlistFile) }
+    $seedFileArg = ''
+    if ($sensitiveTermsFileForWorkers) { $seedFileArg = ' -SensitiveTermsFile ' + (ConvertTo-UlsPowerShellStringArrayLiteral -Values @($sensitiveTermsFileForWorkers)) }
+
+    foreach ($c in $chunks) {
+        $scriptPath = Join-Path $c.WorkDir 'worker.ps1'
+        $stdoutPath = Join-Path $c.WorkDir 'worker.out.txt'
+        $stderrPath = Join-Path $c.WorkDir 'worker.err.txt'
+        $progressPath = Join-Path $c.WorkDir 'worker.progress.json'
+        $pathLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $c.Input
+        $workLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $c.WorkDir
+        $progressLiteral = ConvertTo-UlsPowerShellSingleQuotedLiteral -Value $progressPath
+        $scriptText = @"
+`$ErrorActionPreference = 'Stop'
+Import-Module $moduleLiteral -Force
+Invoke-UniversalScrubber -Path $pathLiteral -WorkDir $workLiteral -Profile $profileLiteral -SaltFile $saltFileLiteral -HmacLength $HmacLength -MapSource ExistingMap -TokenMapCsv $tokenMapLiteral -TokenMapMode Merge -ScrubPolicy $policyLiteral$seedFileArg$allowlistArg -NonInteractive -Stream -SkipLeakCheck -NoParallelScrub -WorkerProgressFile $progressLiteral -WorkerProgressRowsTotal $($c.Rows) -WorkerProgressChunk $($c.Index) -WorkerProgressIntervalRows 250 -WorkerProgressIntervalSeconds 1 | Out-Null
+"@
+        [System.IO.File]::WriteAllText($scriptPath, $scriptText, [System.Text.Encoding]::UTF8)
+        $c.Script = $scriptPath; $c.StdOut = $stdoutPath; $c.StdErr = $stderrPath; $c.Progress = $progressPath
+    }
+
+    $workerSw = New-UlsPerfStopwatch
+    $pending = New-Object System.Collections.Queue
+    foreach ($c in $chunks) { $pending.Enqueue($c) }
+    $running = New-Object System.Collections.Generic.List[object]
+    $completed = New-Object System.Collections.Generic.List[object]
+
+    $progressActivity = "Parallel scrub $name"
+    $progressState = [pscustomobject]@{ LastPercent = -1; LastCompleted = -1; LastRowsDone = -1; LastUpdateUtc = [DateTime]::UtcNow.AddSeconds(-2) }
+    $readWorkerProgress = {
+        param($Chunk)
+        $done = 0
+        $total = [int]$Chunk.Rows
+        $status = 'Pending'
+        try {
+            if ($Chunk.Progress -and (Test-Path -LiteralPath $Chunk.Progress)) {
+                $raw = [System.IO.File]::ReadAllText($Chunk.Progress)
+                if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                    $j = $raw | ConvertFrom-Json -ErrorAction Stop
+                    if ($null -ne $j.RowsDone) { $done = [int]$j.RowsDone }
+                    if ($null -ne $j.RowsTotal -and [int]$j.RowsTotal -gt 0) { $total = [int]$j.RowsTotal }
+                    if ($null -ne $j.Status) { $status = [string]$j.Status }
+                }
+            }
+        } catch {
+            # Ignore partial JSON writes or transient file locks.
+        }
+        if ($done -lt 0) { $done = 0 }
+        if ($total -lt 1) { $total = [int]$Chunk.Rows }
+        if ($done -gt $total) { $done = $total }
+        return [pscustomobject]@{ RowsDone = $done; RowsTotal = $total; Status = $status }
+    }
+    $updateParallelProgress = {
+        param([switch]$Force)
+        $doneChunks = $completed.Count
+        $totalChunks = [Math]::Max($chunks.Count, 1)
+        $rowsDone = 0
+        $rowsTotal = [Math]::Max($totalRows, 1)
+        foreach ($cc in $completed) { $rowsDone += [int]$cc.Rows }
+        foreach ($rc in $running) {
+            $rp = & $readWorkerProgress $rc
+            $rowsDone += [int]$rp.RowsDone
+        }
+        if ($rowsDone -gt $rowsTotal) { $rowsDone = $rowsTotal }
+        $pct = [Math]::Min(100, [Math]::Max(0, [int](($rowsDone / [double]$rowsTotal) * 100)))
+        $now = [DateTime]::UtcNow
+        if ($Force -or $pct -ne $progressState.LastPercent -or $doneChunks -ne $progressState.LastCompleted -or $rowsDone -ne $progressState.LastRowsDone -or (($now - $progressState.LastUpdateUtc).TotalSeconds -ge 1.0)) {
+            $runningBits = @()
+            foreach ($rc in ($running | Sort-Object Index)) {
+                $rp = & $readWorkerProgress $rc
+                $runningBits += ("{0}:{1}/{2}" -f $rc.Index, [int]$rp.RowsDone, [int]$rp.RowsTotal)
+            }
+            $status = "Rows $rowsDone/$rowsTotal; chunks $doneChunks/$($chunks.Count); running=$($running.Count); pending=$($pending.Count)"
+            if ($runningBits.Count -gt 0) { $status += "; active=" + (($runningBits | Select-Object -First 6) -join ',') }
+            Write-Progress -Activity $progressActivity -Status $status -PercentComplete $pct
+            $progressState.LastPercent = $pct
+            $progressState.LastCompleted = $doneChunks
+            $progressState.LastRowsDone = $rowsDone
+            $progressState.LastUpdateUtc = $now
+        }
+    }
+    & $updateParallelProgress -Force
+
+    while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+        while ($pending.Count -gt 0 -and $running.Count -lt $ThrottleLimit) {
+            $c = $pending.Dequeue()
+            Write-Detail ("Starting parallel chunk {0}/{1} ({2} rows)" -f $c.Index, $chunks.Count, $c.Rows)
+            # Start-Process joins string[] arguments with spaces and may not quote paths with spaces reliably.
+            # Use one explicitly quoted argument string so worker.ps1 under paths such as
+            # "C:\Users\...\Universal Log Scrubber\..." is passed as one -File argument.
+            $scriptArg = '"' + ([string]$c.Script -replace '"','\"') + '"'
+            $argLine = ('-NoProfile -ExecutionPolicy Bypass -File {0}' -f $scriptArg)
+            $startParams = @{
+                FilePath = $pwshPath
+                ArgumentList = $argLine
+                RedirectStandardOutput = $c.StdOut
+                RedirectStandardError = $c.StdErr
+                PassThru = $true
+            }
+            if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+                # Keep parallel worker pwsh.exe consoles from flashing/popping up on Windows.
+                # This is cosmetic only; stdout/stderr still go to per-worker log files.
+                $startParams['WindowStyle'] = 'Hidden'
+            }
+            try {
+                $proc = Start-Process @startParams
+            } catch {
+                # Some hosts/PowerShell builds reject WindowStyle when output is redirected.
+                # Fall back to NoNewWindow first, then to the basic launch so the scrub can still run.
+                $hiddenStartError = $_
+                if ($startParams.ContainsKey('WindowStyle')) { [void]$startParams.Remove('WindowStyle') }
+                if ($IsWindows -or $env:OS -eq 'Windows_NT') { $startParams['NoNewWindow'] = $true }
+                try {
+                    $proc = Start-Process @startParams
+                } catch {
+                    if ($startParams.ContainsKey('NoNewWindow')) { [void]$startParams.Remove('NoNewWindow') }
+                    $proc = Start-Process @startParams
+                }
+            }
+            $c.Process = $proc
+            [void]$running.Add($c)
+        }
+        Start-Sleep -Milliseconds 200
+        for ($idx = $running.Count - 1; $idx -ge 0; $idx--) {
+            $c = $running[$idx]
+            if ($c.Process.HasExited) {
+                if ($c.Process.ExitCode -ne 0) {
+                    $errText = ''
+                    try { if (Test-Path -LiteralPath $c.StdErr) { $errText = [System.IO.File]::ReadAllText($c.StdErr) } } catch { }
+                    throw ("ParallelScrub worker chunk {0} failed with exit code {1}. {2}" -f $c.Index, $c.Process.ExitCode, $errText)
+                }
+                $childOut = @(Get-ChildItem -Path $c.WorkDir -Filter '*_scrubbed.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1)
+                if ($childOut.Count -eq 0) { throw ("ParallelScrub worker chunk {0} did not produce a *_scrubbed.csv output." -f $c.Index) }
+                $c.Output = $childOut[0].FullName
+                try { if ($c.Process) { $c.Process.Dispose() } } catch { }
+                if (-not $KeepIntermediate) {
+                    try { if ($c.Progress -and (Test-Path -LiteralPath $c.Progress)) { Remove-Item -LiteralPath $c.Progress -Force -ErrorAction SilentlyContinue } } catch { }
+                }
+                [void]$completed.Add($c)
+                $running.RemoveAt($idx)
+                Write-Detail ("Completed parallel chunk {0}/{1} ({2} rows)" -f $c.Index, $chunks.Count, $c.Rows)
+                & $updateParallelProgress -Force
+            }
+        }
+        & $updateParallelProgress
+    }
+    Write-Progress -Activity $progressActivity -Completed
+    Add-UlsPerfPhase -Phase 'Scrub fields' -Stopwatch $workerSw -File $name -Rows $totalRows -Notes ("Parallel child pwsh workers; chunks={0}; throttle={1}" -f $chunks.Count, $ThrottleLimit)
+
+    $mergeSw = New-UlsPerfStopwatch
+    $first = $true
+    $mergedRows = 0
+    foreach ($c in ($completed | Sort-Object Index)) {
+        $chunkRowsOut = @(Import-Csv -Path $c.Output -Delimiter $Delimiter)
+        if ($first) {
+            $chunkRowsOut | Export-Csv -Path $outFull -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+            $first = $false
+        }
+        else {
+            $chunkRowsOut | Export-Csv -Path $outFull -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter -Append
+        }
+        $mergedRows += $chunkRowsOut.Count
+    }
+    Add-UlsPerfPhase -Phase 'Write output' -Stopwatch $mergeSw -File $name -Rows $mergedRows -Notes 'Parallel chunk output merge'
+
+    $ulsPerfLeak = New-UlsPerfStopwatch
+    if ($SkipLeakCheck) {
+        Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified."
+        $clean = $true
+    }
+    else {
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+    }
+    Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $mergedRows -Notes ('Parallel final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
+
+    Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
+    if (-not $KeepIntermediate -and $clean) {
+        [void](Remove-UlsParallelWorkingFolder -Path $parallelRoot -Retries 8 -DelayMilliseconds 250)
+    }
+    else {
+        Write-Info "Parallel working folder kept: $parallelRoot"
+    }
+
+    return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $clean; Rows = $mergedRows; Parallel = $true; Chunks = $chunks.Count; LeakCheckSkipped = [bool]$SkipLeakCheck }
 }
 
 # =====================================================================
@@ -5113,7 +7348,7 @@ function Invoke-ScrubSelfTest {
             'dom=CORP\tdom',
             'fqdn=host.corp.local',
             'sid=S-1-5-21-9-8-7-1234',
-            'guid=11112222-3333-4444-5555-666677778888',
+            'correlation id: 11112222-3333-4444-5555-666677778888',
             'jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N',
             'arn=arn:aws:iam::123456789012:user/testuser',
             'awskey=AKIAIOSFODNN7EXAMPLE',
@@ -5170,6 +7405,32 @@ function Invoke-ScrubSelfTest {
             & $assert (-not ($wh -match [regex]::Escape($gone))) "WindowsEvent removed: $gone"
         }
         & $assert ($wh -match '\\\?\\C:\\WINDOWS\\LiveKernelReports\\WHEA\\') "WindowsEvent path separators preserved"
+
+        $wePath = Join-Path $dir 'windows-event-v414.csv'
+        @(
+            'RecordId,TimeCreated,ProviderName,MachineName,UserId,EventDataJson,Message',
+            '101,2026-01-01T00:00:00Z,Microsoft-Windows-Security-Auditing,WINHOST01,S-1-5-18,"{""SubjectUserSid"":""S-1-5-18"",""TargetUserName"":""realuser"",""IpAddress"":""10.12.13.14"",""ProviderGuid"":""{11112222-3333-4444-5555-666677778888}""}","Account Name: realuser Account Domain: CORP SubjectUserSid: S-1-5-18 TargetSid: S-1-5-21-1-2-3-1001 Address: 10.12.13.14 Provider {11112222-3333-4444-5555-666677778888} pos 01FF:0038:0268"'
+        ) | Set-Content -Path $wePath -Encoding UTF8
+        $weOut = Join-Path $dir 'windows-event-v414-scrubbed.csv'
+        $weRes = Invoke-ScrubFile -InputPath $wePath -OutputPath $weOut -Profile (Get-ScrubProfile -Name WindowsEventCsv) -ScrubPolicy Balanced -Stream
+        $weText = Get-Content -Path $weRes.Output -Raw
+        & $assert ($weRes.Clean -and $weRes.Streamed) "WindowsEventCsv streams and verifies clean"
+        foreach ($keep in @('Microsoft-Windows-Security-Auditing','101','2026-01-01T00:00:00Z','S-1-5-18','11112222-3333-4444-5555-666677778888','01FF:0038:0268')) {
+            & $assert ($weText -match [regex]::Escape($keep)) "WindowsEventCsv preserved default-readable value: $keep"
+        }
+        foreach ($gone in @('WINHOST01','realuser','10.12.13.14','S-1-5-21-1-2-3-1001')) {
+            & $assert (-not ($weText -match [regex]::Escape($gone))) "WindowsEventCsv removed sensitive value: $gone"
+        }
+        & $assert ($weText -match 'COMPUTER_[A-F0-9]+') "WindowsEventCsv MachineName uses COMPUTER token"
+
+        $edgeGuid = 'generic guid 99992222-3333-4444-5555-666677778888 and short colon 01FF:0038:0268'
+        $script:ScrubPolicy = 'Balanced'
+        $edgeBalanced = Invoke-FreeTextHardening -ColumnName 'Message' -Value $edgeGuid
+        $script:ScrubPolicy = 'Strict'
+        $edgeStrict = Invoke-FreeTextHardening -ColumnName 'Message' -Value $edgeGuid
+        $script:ScrubPolicy = 'Balanced'
+        & $assert ($edgeBalanced -match '99992222-3333-4444-5555-666677778888' -and $edgeBalanced -match '01FF:0038:0268') "Balanced preserves generic GUID and invalid IPv6-like fragment"
+        & $assert (-not ($edgeStrict -match '99992222-3333-4444-5555-666677778888')) "Strict tokenizes generic GUID"
 
         # ---- 5) BYOP schema v2 and universal detection ----
         Write-Rule "BYOP schema v2 and universal detection"
@@ -5311,6 +7572,64 @@ function Invoke-ScrubSelfTest {
         & $assert ($r1.Clean -and $r2.Clean) "stream: both modes leak-clean"
         & $assert ($hostTok -and ($t1 -match [regex]::Escape($hostTok)) -and ($t2 -match [regex]::Escape($hostTok))) "stream: identical token in both modes"
 
+        $pcsv = Join-Path $dir 'parallel-windows-event.csv'
+        $pHeaders = @('Message','RecordId','ProviderName','EventDataJson','MachineName','TimeCreated','LevelDisplayName','UserId')
+        $pRows = @(
+            @(
+                "Account Name: parallel.user, note ""quoted""`nSource Network Address: 10.21.22.23",
+                '201',
+                'Microsoft-Windows-Security-Auditing',
+                '{"TargetUserName":"parallel.user","IpAddress":"10.21.22.23","ProviderGuid":"{11112222-3333-4444-5555-666677778888}"}',
+                'PARHOST01',
+                '2026-01-01T00:00:00Z',
+                'Information',
+                'S-1-5-18'
+            ),
+            @(
+                'Account Name: second.user Account Domain: CORP Source Network Address: 10.21.22.24 url=https://db01.corp.local/app',
+                '202',
+                'Microsoft-Windows-Security-Auditing',
+                '{"TargetUserName":"second.user","IpAddress":"10.21.22.24"}',
+                'PARHOST02',
+                '2026-01-01T00:00:01Z',
+                'Information',
+                'S-1-5-19'
+            ),
+            @(
+                'Provider {11112222-3333-4444-5555-666677778888} pos 01FF:0038:0268',
+                '203',
+                'Microsoft-Windows-Kernel-General',
+                '{"ProviderGuid":"{11112222-3333-4444-5555-666677778888}","SubjectUserSid":"S-1-5-20"}',
+                'PARHOST03',
+                '2026-01-01T00:00:02Z',
+                'Information',
+                'S-1-5-20'
+            )
+        )
+        $pcsvLines = New-Object System.Collections.Generic.List[string]
+        [void]$pcsvLines.Add((ConvertTo-UlsDelimitedLine -Values $pHeaders -Delimiter ','))
+        foreach ($pr in $pRows) { [void]$pcsvLines.Add((ConvertTo-UlsDelimitedLine -Values $pr -Delimiter ',')) }
+        [System.IO.File]::WriteAllText($pcsv, (($pcsvLines.ToArray() -join "`r`n") + "`r`n"), [System.Text.Encoding]::UTF8)
+        $pProfile = Get-ScrubProfile -Name WindowsEventCsv
+        Initialize-ScrubProfileRuntime -Profile $pProfile -AllowlistFiles @()
+        $pmap = Join-Path $dir 'map_parallel_windows_event_DO_NOT_UPLOAD.csv'
+        [void](New-ScrubTokenMap -InputPath @($pcsv) -TokenMapCsv $pmap -ScrubPolicy Balanced)
+        $pNormal = Invoke-ScrubFile -InputPath $pcsv -OutputPath (Join-Path $dir 'parallel-normal.csv') -Profile $pProfile -ScrubPolicy Balanced -Stream
+        $parallelFolderCountBefore = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '_parallel_*' -ErrorAction SilentlyContinue).Count
+        $pParallel = Invoke-ScrubFileStreamingParallelCsv -InputPath $pcsv -OutputPath (Join-Path $dir 'parallel-streaming.csv') -Profile $pProfile -TokenMapCsv $pmap -WorkDir $dir -ScrubPolicy Balanced -ThrottleLimit 3 -ChunkSize 1
+        $parallelFolderCountAfter = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '_parallel_*' -ErrorAction SilentlyContinue).Count
+        $pNormalText = Get-Content -Path $pNormal.Output -Raw
+        $pParallelText = Get-Content -Path $pParallel.Output -Raw
+        & $assert ($pNormal.Clean -and $pParallel.Clean -and $pParallel.StreamingParallel) "parallel CSV: normal and streaming-parallel modes leak-clean"
+        & $assert ([string]::Equals($pNormalText, $pParallelText, [System.StringComparison]::Ordinal)) "parallel CSV: output equals normal streaming output"
+        & $assert ($parallelFolderCountAfter -eq $parallelFolderCountBefore) "parallel CSV: no _parallel chunk folders are created"
+        foreach ($gone in @('parallel.user','second.user','10.21.22.23','10.21.22.24','PARHOST01','PARHOST02','db01.corp.local')) {
+            & $assert (-not ($pParallelText -match [regex]::Escape($gone))) "parallel CSV removed: $gone"
+        }
+        foreach ($keep in @('Microsoft-Windows-Security-Auditing','Microsoft-Windows-Kernel-General','11112222-3333-4444-5555-666677778888','01FF:0038:0268','S-1-5-18','S-1-5-19','S-1-5-20')) {
+            & $assert ($pParallelText -match [regex]::Escape($keep)) "parallel CSV preserved: $keep"
+        }
+
         # ---- 7) Round-trip: scrub -> restore ----
         Write-Rule "Round-trip (scrub -> restore)"
         $rtPath = Join-Path $dir 'roundtrip_restored.csv'
@@ -5356,7 +7675,13 @@ function Invoke-ScrubFile {
         [switch]$ExplainDetections,
         [string]$FalsePositiveReport,
         [switch]$DryRun,
-        [switch]$Stream
+        [switch]$Stream,
+        [switch]$SkipLeakCheck,
+        [string]$WorkerProgressFile,
+        [int]$WorkerProgressRowsTotal = 0,
+        [int]$WorkerProgressChunk = 0,
+        [int]$WorkerProgressIntervalRows = 250,
+        [int]$WorkerProgressIntervalSeconds = 1
     )
     if (-not (Test-Path $InputPath)) { throw "Input not found: $InputPath" }
     $script:AdditionalBroadLabels = $AdditionalBroadLabels
@@ -5366,6 +7691,8 @@ function Invoke-ScrubFile {
     Initialize-ScrubProfileRuntime -Profile $Profile -AllowlistFiles $AllowlistFile
     [void](Get-SessionSalt)
     $script:__scrubFallback = 0; $script:__scrubFallbackCol = ''
+    $script:__cellCache = @{}   # ULS perf patch 1: fresh per-file (column,value)->scrubbed cache
+    $script:__hmacTokenCache = @{}   # low-risk perf patch: fresh per-file fallback HMAC token cache
 
     $name = [System.IO.Path]::GetFileName($InputPath)
     $ext = [System.IO.Path]::GetExtension($InputPath).ToLowerInvariant()
@@ -5387,7 +7714,7 @@ function Invoke-ScrubFile {
 
     # Streaming path (bounded memory) -- opt-in, skips the in-memory render.
     if ($Stream -and -not $DryRun) {
-        return Invoke-ScrubFileStreaming -InputPath $InputPath -OutputPath $outFull -Profile $Profile -SensitiveTerms $SensitiveTerms -Format $format -Delimiter $delim
+        return Invoke-ScrubFileStreaming -InputPath $InputPath -OutputPath $outFull -Profile $Profile -SensitiveTerms $SensitiveTerms -Format $format -Delimiter $delim -SkipLeakCheck:$SkipLeakCheck -WorkerProgressFile $WorkerProgressFile -WorkerProgressRowsTotal $WorkerProgressRowsTotal -WorkerProgressChunk $WorkerProgressChunk -WorkerProgressIntervalRows $WorkerProgressIntervalRows -WorkerProgressIntervalSeconds $WorkerProgressIntervalSeconds
     }
 
     # --- Dry run: report what WOULD change, write nothing. ---
@@ -5452,9 +7779,14 @@ function Invoke-ScrubFile {
 
     if ($format -eq 'Csv' -or $format -eq 'Tsv' -or $format -eq 'Psv') {
         Write-Work "Scrubbing ($format, profile '$($Profile.Name)'): $name"
+        $ulsPerfRead = New-UlsPerfStopwatch
         $raw = @(Import-Csv $InputPath -Delimiter $delim)
+        Add-UlsPerfPhase -Phase 'Read CSV' -Stopwatch $ulsPerfRead -File $name -Rows $raw.Count -Notes 'Scrub Import-Csv'
         $total = $raw.Count
         $rn = 0
+        $ulsPerfScrub = New-UlsPerfStopwatch
+        $ulsPerfScrubColumnTicks = @{}
+        $ulsPerfScrubColumnCounts = @{}
         $scrubbed = foreach ($row in $raw) {
             $rn++
             if ($rn % 250 -eq 0) {
@@ -5462,17 +7794,42 @@ function Invoke-ScrubFile {
             }
             $new = [ordered]@{}
             foreach ($prop in $row.PSObject.Properties) {
-                $new[$prop.Name] = Scrub-Field -ColumnName $prop.Name -Value $prop.Value -Profile $Profile
+                if ($script:PerfReportDetailedEnabled) {
+                    $ulsPerfColBlock = [System.Diagnostics.Stopwatch]::StartNew()
+                    $scrubbedValue = Scrub-Field -ColumnName $prop.Name -Value $prop.Value -Profile $Profile
+                    $ulsPerfColBlock.Stop()
+                    $colName = [string]$prop.Name
+                    if (-not $ulsPerfScrubColumnTicks.ContainsKey($colName)) { $ulsPerfScrubColumnTicks[$colName] = [long]0; $ulsPerfScrubColumnCounts[$colName] = 0 }
+                    $ulsPerfScrubColumnTicks[$colName] = [long]$ulsPerfScrubColumnTicks[$colName] + [long]$ulsPerfColBlock.ElapsedTicks
+                    $ulsPerfScrubColumnCounts[$colName] = [int]$ulsPerfScrubColumnCounts[$colName] + 1
+                    $new[$prop.Name] = $scrubbedValue
+                }
+                else {
+                    $new[$prop.Name] = Scrub-Field -ColumnName $prop.Name -Value $prop.Value -Profile $Profile
+                }
             }
             [pscustomobject]$new
         }
         Write-Progress -Activity "Scrubbing $name" -Completed
+        $ulsPerfCells = if ($total -gt 0) { $total * (@($raw[0].PSObject.Properties).Count) } else { 0 }
+        Add-UlsPerfPhase -Phase 'Scrub fields' -Stopwatch $ulsPerfScrub -File $name -Rows $total -Cells $ulsPerfCells -Notes 'In-memory row/cell scrub'
+        if ($script:PerfReportDetailedEnabled) {
+            $freq = [double][System.Diagnostics.Stopwatch]::Frequency
+            foreach ($col in ($ulsPerfScrubColumnTicks.Keys | Sort-Object)) {
+                Add-UlsPerfPhase -Phase 'Scrub column' -Seconds ([double]$ulsPerfScrubColumnTicks[$col] / $freq) -File $name -Rows $total -Cells ([int]$ulsPerfScrubColumnCounts[$col]) -Notes ("Column=$col")
+            }
+        }
 
-        # Render to delimited text, run the whole-file safety net, redact seed terms.
+        # ULS perf patch 5: per-cell hardening now covers EVERY column (pass-through metadata columns
+        # are hardened in Scrub-Field), so the redundant whole-row Invoke-LeakHardeningText pass is
+        # dropped. Render once, redact seed terms, write. The leak check below remains the guarantee.
+        $ulsPerfPost = New-UlsPerfStopwatch
         $csvText = (($scrubbed | ConvertTo-Csv -NoTypeInformation -Delimiter $delim) -join "`r`n") + "`r`n"
-        $csvText = Invoke-LeakHardeningText -Text $csvText
         $csvText = Protect-SensitiveTerms -Text $csvText -SensitiveTerms $SensitiveTerms
+        Add-UlsPerfPhase -Phase 'Post hardening' -Stopwatch $ulsPerfPost -File $name -Rows $total -Cells $ulsPerfCells -Notes 'ConvertTo-Csv + sensitive terms'
+        $ulsPerfWrite = New-UlsPerfStopwatch
         [System.IO.File]::WriteAllText($outFull, $csvText, [System.Text.Encoding]::UTF8)
+        Add-UlsPerfPhase -Phase 'Write output' -Stopwatch $ulsPerfWrite -File $name -Rows $total -Notes 'WriteAllText'
         Write-Detail "Rows: $total  ->  $([System.IO.Path]::GetFileName($outFull))"
     }
     elseif ($format -eq 'Json') {
@@ -5513,15 +7870,36 @@ function Invoke-ScrubFile {
     }
 
     # Verify, and auto re-harden once if anything slipped through.
-    $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
-    if (-not $clean) {
-        Write-Warn "Residue detected -- re-hardening in place once..."
-        $reText = [System.IO.File]::ReadAllText($outFull)
-        $reText = Invoke-LeakHardeningText -Text $reText
-        $reText = Protect-SensitiveTerms -Text $reText -SensitiveTerms $SensitiveTerms
-        [System.IO.File]::WriteAllText($outFull, $reText, [System.Text.Encoding]::UTF8)
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+    # ULS perf patch 8: -SkipLeakCheck skips this independent verification pass. Deliberate trade --
+    # the per-cell scrub still ran in full; only the separate re-scan is skipped. Use when you trust
+    # the scrub config for the data set (e.g. bulk re-runs of vetted log types).
+    $ulsPerfLeak = New-UlsPerfStopwatch
+    if ($SkipLeakCheck) {
+        Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified."
+        $clean = $true
     }
+    else {
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+        if (-not $clean) {
+            Write-Warn "Residue detected -- attempting one in-place re-harden..."
+            try {
+                $reText = [System.IO.File]::ReadAllText($outFull)
+                $reText = Invoke-LeakHardeningText -Text $reText
+                $reText = Protect-SensitiveTerms -Text $reText -SensitiveTerms $SensitiveTerms
+                [System.IO.File]::WriteAllText($outFull, $reText, [System.Text.Encoding]::UTF8)
+                $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+            }
+            catch {
+                # ULS perf patch 3: on a large file the whole-file re-harden can hit the regex timeout.
+                # Do not abort the run -- leave the per-cell-scrubbed output in place and report it as
+                # needing review (fail-loud; the per-cell pass already scrubbed every non-pass-through
+                # column, and the leak check above flagged exactly what remains).
+                Write-Warn "In-place re-harden could not complete ($($_.Exception.GetType().Name)); leaving output and flagging for review."
+                $clean = $false
+            }
+        }
+    }
+    Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Notes ('SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
     if ($script:__scrubFallback -gt 0) { Write-Warn "$($script:__scrubFallback) cell(s) couldn't be fully hardened and were replaced with a safe token (fail-closed, no leak). First column: '$($script:__scrubFallbackCol)'." }
     if ($FalsePositiveReport) { [void](Write-DetectionReport -Path $FalsePositiveReport) }
     return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $clean }
@@ -5550,7 +7928,14 @@ function Write-RunManifest {
         $bytes = -1; $rows = -1; $tokenCount = 0
         $fileName = if ($r.Output) { [System.IO.Path]::GetFileName($r.Output) } else { [System.IO.Path]::GetFileName($r.Input) }
         if ($r.Output) { try { $bytes = (Get-Item -Path $r.Output).Length } catch { } }
-        if (($r.Output -as [string]) -match '\.csv$') { try { $rows = @(Import-Csv $r.Output).Count } catch { $rows = -1 } }
+        try {
+            if ($null -ne $r.Rows -and [int]$r.Rows -ge 0) { $rows = [int]$r.Rows }
+            elseif (($r.Output -as [string]) -match '\.csv$') {
+                $lineCount = 0
+                foreach ($nullLine in [System.IO.File]::ReadLines((Resolve-Path -Path $r.Output).Path)) { $lineCount++ }
+                $rows = [Math]::Max(0, $lineCount - 1)
+            }
+        } catch { $rows = -1 }
         if ($r.Output) { $tokenCount = Get-TokenCountInFile -Path $r.Output }
         $entries += [pscustomobject]@{
             file           = $fileName
@@ -5627,10 +8012,34 @@ function Invoke-UniversalScrubber {
         [switch]$DryRun,
         [switch]$Stream,
         [switch]$NoCorrelate,
+        [switch]$SkipLeakCheck,
+        [switch]$PerfReport,
+        [switch]$PerfReportDetailed,
+        [switch]$ParallelScrub,
+        [switch]$NoParallelScrub,
+        [switch]$ParallelDiscovery,
+        [switch]$NoParallelDiscovery,
+        [switch]$DiscoveryOnly,
+        [int]$ThrottleLimit = 4,
+        [int]$ChunkSize = 0,
+        [int]$LargeFileThresholdMB = 100,
+        [string]$WorkerProgressFile,
+        [int]$WorkerProgressRowsTotal = 0,
+        [int]$WorkerProgressChunk = 0,
+        [int]$WorkerProgressIntervalRows = 250,
+        [int]$WorkerProgressIntervalSeconds = 1,
         [switch]$NonInteractive
     )
 
     if ($Version) { return Get-UniversalLogScrubberVersionInfo }
+
+    if ($ParallelScrub -and $NoParallelScrub) { throw "Use either -ParallelScrub or -NoParallelScrub, not both." }
+    if ($ParallelDiscovery -and $NoParallelDiscovery) { throw "Use either -ParallelDiscovery or -NoParallelDiscovery, not both." }
+    if ($LargeFileThresholdMB -lt 1) { $LargeFileThresholdMB = 100 }
+    if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    if ($ChunkSize -lt 0) { throw "-ChunkSize must be 0 for auto/equal chunks, or a positive integer." }
+    if ($ChunkSize -gt 0 -and $ChunkSize -lt 100) { $ChunkSize = 100 }
+    $chunkSizeLabel = if ($ChunkSize -le 0) { 'auto/equal' } else { [string]$ChunkSize }
 
     $script:HmacLength = $HmacLength
     $script:ScrubPolicy = $ScrubPolicy
@@ -5642,6 +8051,11 @@ function Invoke-UniversalScrubber {
     $script:DetectionTrace = New-Object System.Collections.Generic.List[object]
     $script:DetectionTraceSeen = @{}
     $script:DetectionCounts = @{}
+    $script:PerfReportEnabled = [bool]($PerfReport -or $PerfReportDetailed)
+    $script:PerfReportDetailedEnabled = [bool]$PerfReportDetailed
+    $script:PerfReportRows = New-Object System.Collections.Generic.List[object]
+    $script:PerfReportPath = $null
+    $script:PerfReportTextPath = $null
 
     Write-Banner "UNIVERSAL LOG SCRUBBER  v$script:ModuleVersion" "Token-map first, then scrub. Nothing leaves until it's clean."
     if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
@@ -5649,6 +8063,13 @@ function Invoke-UniversalScrubber {
     if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
     if ($DryRun) { Write-Info "DRY RUN mode -- nothing will be written." }
     if ($Stream) { Write-Info "STREAM mode -- bounded memory for very large files." }
+    if ($PerfReport -or $PerfReportDetailed) { Write-Info "PERF REPORT mode -- phase timings will be written locally." }
+    if ($PerfReportDetailed) { Write-Info "PERF REPORT DETAILED mode -- per-column timings add overhead and should not be used for baseline timings." }
+    if ($NoParallelScrub) { Write-Info "PARALLEL SCRUB disabled by -NoParallelScrub." }
+    elseif ($ParallelScrub) { Write-Info ("PARALLEL SCRUB mode -- streaming runspace batches; throttle={0}; batchSize={1}." -f $ThrottleLimit, $chunkSizeLabel) }
+    if ($NoParallelDiscovery) { Write-Info "PARALLEL DISCOVERY disabled by -NoParallelDiscovery." }
+    elseif ($ParallelDiscovery) { Write-Info ("PARALLEL DISCOVERY mode -- streaming runspace batches; throttle={0}; batchSize={1}." -f $ThrottleLimit, $chunkSizeLabel) }
+    Write-Info ("Large-file auto threshold: {0} MB." -f $LargeFileThresholdMB)
     Write-Info "Scrub policy: $script:ScrubPolicy"
 
     if ($RecommendOnly -or $SafeFirstRun) {
@@ -5928,13 +8349,15 @@ function Invoke-UniversalScrubber {
     else {
         switch ($MapSource) {
             'Discover' {
-                [void](New-ScrubTokenMap -InputPath @($targets | ForEach-Object { $_.FullName }) -TokenMapCsv $TokenMapCsv -SeedTerms $SensitiveTerms -NoCorrelate:$NoCorrelate -TokenMapMode $TokenMapMode -ScrubPolicy $script:ScrubPolicy)
+                [void](New-ScrubTokenMap -InputPath @($targets | ForEach-Object { $_.FullName }) -TokenMapCsv $TokenMapCsv -SeedTerms $SensitiveTerms -NoCorrelate:$NoCorrelate -TokenMapMode $TokenMapMode -ScrubPolicy $script:ScrubPolicy -ProfileName $prof.Name -WorkDir $WorkDir -AllowlistFile $AllowlistFile -ParallelDiscovery:$ParallelDiscovery -NoParallelDiscovery:$NoParallelDiscovery -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -LargeFileThresholdMB $LargeFileThresholdMB -KeepIntermediate:$KeepIntermediate -WorkerProgressFile $WorkerProgressFile -WorkerProgressRowsTotal $WorkerProgressRowsTotal -WorkerProgressChunk $WorkerProgressChunk -WorkerProgressIntervalRows $WorkerProgressIntervalRows -WorkerProgressIntervalSeconds $WorkerProgressIntervalSeconds)
             }
             'AD' {
+                $ulsPerfAd = New-UlsPerfStopwatch
                 $res = New-ScrubTokenMapFromAD -TokenMapCsv $TokenMapCsv -SeedTerms $SensitiveTerms
+                Add-UlsPerfPhase -Phase 'Build/correlate map' -Stopwatch $ulsPerfAd -File ([System.IO.Path]::GetFileName($TokenMapCsv)) -Notes 'AD map build'
                 if (-not $res) {
                     Write-Warn "Falling back to discovery (AD was unavailable)."
-                    [void](New-ScrubTokenMap -InputPath @($targets | ForEach-Object { $_.FullName }) -TokenMapCsv $TokenMapCsv -SeedTerms $SensitiveTerms -NoCorrelate:$NoCorrelate -TokenMapMode $TokenMapMode -ScrubPolicy $script:ScrubPolicy)
+                    [void](New-ScrubTokenMap -InputPath @($targets | ForEach-Object { $_.FullName }) -TokenMapCsv $TokenMapCsv -SeedTerms $SensitiveTerms -NoCorrelate:$NoCorrelate -TokenMapMode $TokenMapMode -ScrubPolicy $script:ScrubPolicy -ProfileName $prof.Name -WorkDir $WorkDir -AllowlistFile $AllowlistFile -ParallelDiscovery:$ParallelDiscovery -NoParallelDiscovery:$NoParallelDiscovery -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -LargeFileThresholdMB $LargeFileThresholdMB -KeepIntermediate:$KeepIntermediate -WorkerProgressFile $WorkerProgressFile -WorkerProgressRowsTotal $WorkerProgressRowsTotal -WorkerProgressChunk $WorkerProgressChunk -WorkerProgressIntervalRows $WorkerProgressIntervalRows -WorkerProgressIntervalSeconds $WorkerProgressIntervalSeconds)
                 }
             }
             'ExistingMap' {
@@ -5942,9 +8365,16 @@ function Invoke-UniversalScrubber {
                     if ($NonInteractive) { throw "Token map not found: $TokenMapCsv" }
                     $TokenMapCsv = Read-DefaultString -Prompt "Path to the existing token map CSV"
                 }
+                $ulsPerfImportMap = New-UlsPerfStopwatch
                 [void](Import-ScrubTokenMap -TokenMapCsv $TokenMapCsv)
+                Add-UlsPerfPhase -Phase 'Build/correlate map' -Stopwatch $ulsPerfImportMap -File ([System.IO.Path]::GetFileName($TokenMapCsv)) -Notes 'ExistingMap import'
             }
         }
+    }
+
+    if ($DiscoveryOnly) {
+        Write-Ok "Discovery-only complete. Token map written: $TokenMapCsv"
+        return [pscustomobject]@{ DiscoveryOnly = $true; TokenMapCsv = $TokenMapCsv }
     }
 
     # --- Scrub every target ---
@@ -5966,12 +8396,56 @@ function Invoke-UniversalScrubber {
         $candidateName = [System.IO.Path]::GetFileName((Get-ScrubbedOutPath -InputPath $t.FullName -OutDir $WorkDir))
         $outPath = Get-ScrubbedOutPath -InputPath $t.FullName -OutDir $WorkDir -UseHash:($scrubNameCounts[$candidateName.ToLowerInvariant()] -gt 1)
         $useStream = $Stream
-        if (-not $useStream -and -not $DryRun -and $t.Length -gt 50MB) {
-            if ($NonInteractive) { $useStream = $true; Write-Info "Large file ($([int]($t.Length / 1MB)) MB) -- streaming." }
-            else { $useStream = Read-YesNo -Prompt ("  $($t.Name) is $([int]($t.Length / 1MB)) MB. Stream it (lower memory)") -Default $true }
+        $streamThreshold = 5MB
+        $profileName = ''
+        try { $profileName = [string]$prof.Name } catch { }
+        $shouldAutoStream = (-not $DryRun -and (($t.Length -ge $streamThreshold) -or ($profileName -ieq 'WindowsEventCsv')))
+        if (-not $useStream -and $shouldAutoStream) {
+            $useStream = $true
+            $why = if ($profileName -ieq 'WindowsEventCsv') { 'Windows Event CSV profile' } else { "$([Math]::Round(($t.Length / 1MB), 1)) MB input" }
+            Write-Info "Auto-streaming ($why) for faster bounded-memory scrubbing."
         }
         try {
-            $results += Invoke-ScrubFile -InputPath $t.FullName -OutputPath $outPath -Profile $prof -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -ScrubPolicy $script:ScrubPolicy -ExplainDetections:$ExplainDetections -DryRun:$DryRun -Stream:$useStream
+            $parallelFormat = $prof.Format
+            if ($parallelFormat -eq 'Auto') {
+                $parallelExt = [System.IO.Path]::GetExtension($t.FullName).ToLowerInvariant()
+                if ($parallelExt -eq '.csv') { $parallelFormat = 'Csv' }
+                elseif ($parallelExt -eq '.tsv') { $parallelFormat = 'Tsv' }
+                elseif ($parallelExt -eq '.psv') { $parallelFormat = 'Psv' }
+            }
+            $parallelDelim = ','
+            try { if ($prof.Delimiter) { $parallelDelim = [string]$prof.Delimiter } } catch { }
+            if ($parallelFormat -eq 'Tsv') { $parallelDelim = "`t" }
+            elseif ($parallelFormat -eq 'Psv') { $parallelDelim = '|' }
+            # Treat worker-progress parameters as an internal worker-mode signal so helper
+            # paths can never recursively parallelize.
+            $parallelWorkerMode = ((-not [string]::IsNullOrWhiteSpace($WorkerProgressFile)) -or ($WorkerProgressRowsTotal -gt 0) -or ($WorkerProgressChunk -gt 0) -or $DiscoveryOnly)
+            $largeFileBytes = [long]([Math]::Max($LargeFileThresholdMB, 1) * 1MB)
+            $isLargeForWorkers = ($t.Length -ge $largeFileBytes)
+            $csvParallelEligible = ($parallelFormat -eq 'Csv' -or $parallelFormat -eq 'Tsv' -or $parallelFormat -eq 'Psv')
+            $textParallelEligible = ($parallelFormat -eq 'Text' -or $parallelFormat -eq 'Kv')
+            # Default behavior is streaming-first. ParallelScrub uses in-process runspace batches,
+            # not physical input chunks, for both line-oriented and CSV-family formats.
+            $autoParallelScrub = ((-not $parallelWorkerMode) -and (-not $NoParallelScrub) -and (-not $ParallelScrub) -and $isLargeForWorkers -and $textParallelEligible -and ($ThrottleLimit -gt 1))
+            if ($autoParallelScrub) {
+                Write-Info ("Auto streaming-parallel scrub ({0} MB; format={1}; throttle={2}; batchSize={3}; no input chunk files). Use -NoParallelScrub to disable." -f [Math]::Round(($t.Length / 1MB),1), $parallelFormat, $ThrottleLimit, $(if ($ChunkSize -gt 0) { $ChunkSize } else { 5000 }))
+            }
+            elseif ((-not $parallelWorkerMode) -and (-not $NoParallelScrub) -and (-not $ParallelScrub) -and $isLargeForWorkers -and $csvParallelEligible) {
+                Write-Info ("Large CSV-family input will stream without temp input chunks ({0} MB; format={1}; profile={2}). Use -ParallelScrub to opt into streaming runspace batches." -f [Math]::Round(($t.Length / 1MB),1), $parallelFormat, $profileName)
+            }
+            $useParallelScrub = (-not $parallelWorkerMode -and -not $NoParallelScrub -and -not $DryRun -and ($csvParallelEligible -or $textParallelEligible) -and ($ParallelScrub -or $autoParallelScrub))
+            if ($useParallelScrub -and $csvParallelEligible) {
+                if ($autoParallelScrub -and -not $ParallelScrub) { Write-Info ("Auto-parallel scrub ({0} MB input; format={1}); throttle={2}; chunkSize={3}. Use -NoParallelScrub to disable; use -ChunkSize to customize." -f [Math]::Round(($t.Length / 1MB),1), $parallelFormat, $ThrottleLimit, $chunkSizeLabel) }
+                $results += Invoke-ScrubFileStreamingParallelCsv -InputPath $t.FullName -OutputPath $outPath -Profile $prof -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -TokenMapCsv $TokenMapCsv -WorkDir $WorkDir -ScrubPolicy $script:ScrubPolicy -HmacLength $HmacLength -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -SkipLeakCheck:$SkipLeakCheck -KeepIntermediate:$KeepIntermediate -Delimiter $parallelDelim
+            }
+            elseif ($useParallelScrub -and $textParallelEligible) {
+                if ($autoParallelScrub -and -not $ParallelScrub) { Write-Info ("Auto-parallel scrub ({0} MB input; format={1}); throttle={2}; chunkSize={3}. Use -NoParallelScrub to disable; use -ChunkSize to customize." -f [Math]::Round(($t.Length / 1MB),1), $parallelFormat, $ThrottleLimit, $chunkSizeLabel) }
+                $results += Invoke-ScrubFileParallelText -InputPath $t.FullName -OutputPath $outPath -Profile $prof -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -TokenMapCsv $TokenMapCsv -WorkDir $WorkDir -ScrubPolicy $script:ScrubPolicy -HmacLength $HmacLength -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -SkipLeakCheck:$SkipLeakCheck -KeepIntermediate:$KeepIntermediate
+            }
+            else {
+                if ($ParallelScrub -and -not $DryRun -and -not $NoParallelScrub) { Write-Warn "ParallelScrub applies only to CSV/TSV/PSV and line-oriented Text/Kv scrub paths; using normal scrub for $($t.Name)." }
+                $results += Invoke-ScrubFile -InputPath $t.FullName -OutputPath $outPath -Profile $prof -SensitiveTerms $SensitiveTerms -AllowlistFile $AllowlistFile -ScrubPolicy $script:ScrubPolicy -ExplainDetections:$ExplainDetections -DryRun:$DryRun -Stream:$useStream -SkipLeakCheck:$SkipLeakCheck -WorkerProgressFile $WorkerProgressFile -WorkerProgressRowsTotal $WorkerProgressRowsTotal -WorkerProgressChunk $WorkerProgressChunk -WorkerProgressIntervalRows $WorkerProgressIntervalRows -WorkerProgressIntervalSeconds $WorkerProgressIntervalSeconds
+            }
         }
         catch {
             Write-Fail "Failed on $($t.Name): $($_.Exception.Message)"
@@ -5990,6 +8464,7 @@ function Invoke-UniversalScrubber {
         if ($script:DetectionSummaryReport) { [void](Write-DetectionSummaryReport -Path $script:DetectionSummaryReport) }
         Write-Ok "[DRY RUN] Complete. $tot value(s) across $($results.Count) file(s) would be tokenized."
         Write-Info "Nothing was written. Re-run without -DryRun to produce scrubbed files."
+        if ($script:PerfReportEnabled) { [void](Write-UlsPerfReport -WorkDir $WorkDir) }
         Write-Host ""
         return $results
     }
@@ -6022,6 +8497,7 @@ function Invoke-UniversalScrubber {
     Write-Host ""
     Write-Warn "NEVER upload: $TokenMapCsv"
     Write-Ok  "Safe to upload: the *_scrubbed.* files in $WorkDir"
+    if ($script:PerfReportEnabled) { [void](Write-UlsPerfReport -WorkDir $WorkDir) }
     Write-Host ""
     return $results
 }
@@ -6692,6 +9168,9 @@ function __ULS_Legacy_Find_Identifiers_6388 {
     }
 
     foreach ($d in $script:ShapeDetectors) {
+        # ULS perf patch 6: skip a shape detector when its required literal is absent (the same
+        # Sentinel guard the scrub path uses), so discovery short-circuits like the scrub.
+        if ($d.Sentinel -and ($Text.IndexOf([string]$d.Sentinel, [System.StringComparison]::OrdinalIgnoreCase) -lt 0)) { continue }
         foreach ($m in [regex]::Matches($Text, $d.Rx)) {
             $raw = $m.Value
 
@@ -6930,12 +9409,14 @@ function Invoke-FreeTextHardening {
     param([string]$ColumnName, [string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
     $pre = Invoke-OpenSshAuthHardening -Text $Value -ColumnName $ColumnName
+    $pre = Invoke-UlsConnectionHostHardening -Text $pre -ColumnName $ColumnName
     return [string](& $script:__ULS_InvokeFreeTextHardening_BeforeOpenSsh -ColumnName $ColumnName -Value $pre)
 }
 
 function Invoke-LeakHardeningText {
     param([Parameter(Mandatory)][string]$Text)
     $pre = Invoke-OpenSshAuthHardening -Text $Text -ColumnName ''
+    $pre = Invoke-UlsConnectionHostHardening -Text $pre -ColumnName ''
     return [string](& $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh -Text $pre)
 }
 
@@ -7449,6 +9930,20 @@ function Test-UlsRound3LowSignalUniversalLabel {
     # android/java exception/class symbols may be captured by broad principal/secret-ish rules.
     if ($v -match '(?i)^(?:android|java|javax|org|com)\.[A-Za-z0-9_.$]+(?:Exception|Error|RuntimeException)$') { return $true }
 
+    # ULS patch 9 (high-confidence label capture): a value after a label is only an identity if it
+    # LOOKS like one. Suppress common status/enum words, bare numbers, hex status codes, dotted
+    # version numbers, single chars, and capture artifacts (a match that ran across a newline). A real
+    # word-like identity (e.g. an account literally named "Test") should be caught by a BYOP seed term,
+    # not by tokenizing every dictionary word that follows a label. Shape-y values (@, \, S-1-, dotted
+    # host, etc.) and ordinary usernames (jdoe, glides) are unaffected. Privileged names (administrator,
+    # admin, guest, root) are deliberately NOT in this list. Strict policy already tokenizes everything.
+    $vp = $v.TrimEnd('.', ',', ';', ':', ')', ']', '}', '!', '?')
+    if ($vp -match '(?i)^(yes|no|y|n|true|false|none|null|n/?a|nil|enabled|disabled|on|off|success|succeeded|successful|failure|failed|error|errors|warning|warnings|info|information|critical|verbose|started|stopped|stopping|starting|running|complete|completed|pending|active|inactive|present|absent|valid|invalid|allow|allowed|deny|denied|block|blocked|security|application|system|setup|service|services|target|source|test|tests|unknown|default|public|private|local|global|normal|high|low|medium|read|write|create|update|delete|open|close|ok|done)$') { return $true }
+    if ($vp -match '^[+\-]?\d+(?:\.\d+)*$') { return $true }     # bare number, RID fragment, or dotted version
+    if ($vp -match '^0x[0-9A-Fa-f]+$') { return $true }          # hex status / error code
+    if ($v -match '[\r\n]') { return $true }                     # capture crossed a newline -> artifact
+    if ($vp.Length -le 2) { return $true }                       # too short to be a meaningful identifier
+
     return $false
 }
 
@@ -7506,6 +10001,13 @@ function Test-UlsRound3PreserveDetectedValue {
 
         # Very short :: fragments are almost always parser artifacts in these free-form logs.
         if ($v -match '(?i)^(?:::?[0-9a-f]{1,3}|[0-9a-f]{1,3}::)$') { return $true }
+
+        # ULS patch 9b: a colon-hex value with NO "::" and fewer than 8 groups is NOT a valid IPv6
+        # address (a full address is 8 groups; anything shorter must use "::" to compress). These are
+        # ESENT lgpos triplets (e.g. "01FF:0038:0268"), PCI/bus ids, and similar diagnostics. Preserving
+        # them cannot hide a real IPv6 -- a real compressed ("::") or full (8-group) address is unaffected
+        # and still tokenizes. Strict still tokenizes everything.
+        if (($v -notmatch '::') -and ($v -match '^[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})+$') -and ((@($v -split ':')).Count -lt 8)) { return $true }
     }
 
     return $false
@@ -7670,6 +10172,241 @@ function Test-PreserveDetectedValue {
 
 # END ULS v4.13 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
 
+# BEGIN ULS v4.14 performance and precision policy layer
+if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeV414 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_TestPreserveDetectedValue_BeforeV414 = ${function:Test-PreserveDetectedValue}
+}
+if (-not (Get-Variable -Name __ULS_TestPreserveUniversalLabeledValue_BeforeV414 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_TestPreserveUniversalLabeledValue_BeforeV414 = ${function:Test-PreserveUniversalLabeledValue}
+}
+if (-not (Get-Variable -Name __ULS_FindIdentifiers_BeforeV414 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_FindIdentifiers_BeforeV414 = ${function:Find-Identifiers}
+}
+
+function Test-UlsHighConfidenceUniversalLabelValue {
+    param($Rule, [string]$Label, [string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = ([string]$Value).Trim().Trim('"', "'", '.', ',', ';', ':', '}', ']', ')')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    if ($Rule -and ([string]$Rule.Name -match 'SecretLabels')) { return $true }
+    if ($Label -match '(?i)(key|secret|token|password|passwd|pwd|auth|authorization|credential)') { return $true }
+    if (Test-UlsWellKnownSid -Value $v) { return $false }
+    if (Test-UlsWellKnownWindowsPrincipal -Value $v) { return $false }
+    if ($v -match '^S-1-\d+(?:-\d+)+$') { return $true }
+    if ($v -match '^[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\-$]+$') { return $true }
+    if ($v -match '\$$') { return $true }
+    if ($v -match '^[^@\s]+@[^@\s]+\.[^@\s]+$') { return $true }
+    if ($v -match '^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$') { return -not (Test-PreserveIpAddress -Value $v) }
+    if ($v -match ':' -and (Test-UlsValidIpv6Address -Value $v)) { return -not (Test-PreserveIpAddress -Value $v) }
+    if ($v -match '^(CN|OU|DC|O|L|ST|C)=') { return $true }
+    if ($v -match '^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$') {
+        if (Test-AllowedDomain -Value $v) { return $false }
+        if (Test-WindowsDiagnosticDottedName -Value $v) { return $false }
+        return $true
+    }
+    if ($Label -match '(?i)(host|server|machine|computer|device|workstation|client name|node|instance)') {
+        return ($v -match '^[A-Za-z][A-Za-z0-9_-]{2,63}$' -and $v -notmatch '(?i)^(system|security|application|setup|default|unknown|localhost|workgroup)$')
+    }
+    if ($Label -match '(?i)(account|user|principal|subject|target|caller|login|identity|domain|tenant|realm)') {
+        return ($v.Length -ge 3 -and $v -notmatch '(?i)^(system|security|application|setup|default|unknown|localhost|workgroup|nt authority|builtin|local service|network service|anonymous logon)$')
+    }
+    if ($Label -match '(?i)(url|uri|endpoint|callback|redirect)') {
+        return ($v -match '^(?i)[a-z][a-z0-9+.-]*://')
+    }
+    if ($Label -match '(?i)(request|correlation|trace|session|transaction|object)') {
+        return ($v -match '^[0-9a-fA-F]{16,}$' -or $v -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$')
+    }
+    return $false
+}
+
+function Test-UlsV414PreserveUniversalLabeledValue {
+    param($Rule, [string]$Label, [string]$Value)
+
+    try {
+        if (& $script:__ULS_TestPreserveUniversalLabeledValue_BeforeV414 -Rule $Rule -Label $Label -Value $Value) { return $true }
+    }
+    catch { }
+
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+    if (-not (Test-UlsHighConfidenceUniversalLabelValue -Rule $Rule -Label $Label -Value $Value)) { return $true }
+    return $false
+}
+
+function Test-UlsV414PreserveDetectedValue {
+    param(
+        [string]$Value,
+        [string]$Detector,
+        [string]$Prefix,
+        [string]$Text,
+        [int]$Index = -1,
+        [int]$Length = 0
+    )
+
+    try {
+        if (& $script:__ULS_TestPreserveDetectedValue_BeforeV414 `
+            -Value $Value `
+            -Detector $Detector `
+            -Prefix $Prefix `
+            -Text $Text `
+            -Index $Index `
+            -Length $Length) {
+            return $true
+        }
+    }
+    catch { }
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    if ($script:ScrubPolicy -eq 'Strict') { return $false }
+
+    $v = ([string]$Value).Trim().Trim('"', "'", '.', ',', ';', ':', ')', ']', '}')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $true }
+
+    if ($Prefix -eq 'SID' -and (Test-UlsWellKnownSid -Value $v)) { return $true }
+    if ($Prefix -eq 'PRINCIPAL' -and (Test-UlsWellKnownWindowsPrincipal -Value $v)) { return $true }
+    if ($Prefix -eq 'IP6' -and -not (Test-UlsValidIpv6Address -Value $v)) { return $true }
+    if ($Prefix -eq 'GUID') {
+        if (Test-PreserveGuid -Value $v) { return $true }
+        if (-not (Test-UlsGuidHasSensitiveContext -Text $Text -Index $Index -Length $Length)) { return $true }
+    }
+    if ($Prefix -eq 'CERT' -and -not (Test-UlsLongHexHasSensitiveContext -Text $Text -Index $Index -Length $Length)) { return $true }
+    if ($Prefix -eq 'BLOB' -and -not (Test-LooksLikeBase64Blob -Value $v)) { return $true }
+    return $false
+}
+
+function Find-UlsConnectionHostIdentifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $out = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    if ($Text.IndexOf('://') -lt 0 -and $Text -notmatch '(?i)\b(server|host|address|bootstrap\.servers|broker\.list|data source)\s*=') { return @() }
+
+    function _AddConnectionHostId {
+        param([string]$Raw, [string]$Reason)
+        if ([string]::IsNullOrWhiteSpace($Raw)) { return }
+        $v = ([string]$Raw).Trim().Trim('[',']')
+        if ([string]::IsNullOrWhiteSpace($v)) { return }
+        if ((Is-AlreadyToken -Value $v) -or (Test-ScrubAllowlist -Value $v) -or (Test-AllowedDomain -Value $v)) { return }
+        $prefix = Get-UlsConnectionHostPrefix -HostValue $v
+        if (-not $prefix) { return }
+        if ($prefix -eq 'IP6' -and -not (Test-UlsValidIpv6Address -Value $v)) { return }
+        $norm = Normalize-TokenKey -Value $v
+        if (-not $norm -or $seen.ContainsKey($norm)) { return }
+        $seen[$norm] = $true
+        [void]$out.Add([pscustomobject]@{ Raw = $v; Prefix = $prefix; Detector = 'ConnectionHost'; Reason = $Reason })
+    }
+
+    foreach ($m in [regex]::Matches($Text, '(?i)\b(?:jdbc:[a-z0-9+.-]+:)?(?:postgres(?:ql)?|mysql|mariadb|sqlserver|oracle|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|kafka|zookeeper|ws|wss|http|https)://(?:[^@\s/;,?]+@)?(?<host>\[[^\]\s]+\]|[A-Za-z0-9][A-Za-z0-9_.-]{0,252}|\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?')) {
+        _AddConnectionHostId -Raw $m.Groups['host'].Value -Reason 'URL/connection string host'
+    }
+    foreach ($m in [regex]::Matches($Text, '(?i)\b(?:server|host|address|bootstrap\.servers|broker\.list|data source)\s*=\s*(?<host>[A-Za-z0-9][A-Za-z0-9_.-]{1,252}|\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?')) {
+        _AddConnectionHostId -Raw $m.Groups['host'].Value -Reason 'Connection string host key'
+    }
+
+    return @($out.ToArray())
+}
+
+function Find-UlsWindowsEventCsvTextIdentifiersFast {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $out = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+
+    function _AddFastWindowsEventId {
+        param([string]$Raw, [string]$Prefix, [string]$Detector, [string]$Reason)
+        if ([string]::IsNullOrWhiteSpace($Raw) -or [string]::IsNullOrWhiteSpace($Prefix)) { return }
+        $v = ([string]$Raw).Trim().Trim('"', "'", '.', ',', ';', ':', '}', ']', ')')
+        if ([string]::IsNullOrWhiteSpace($v)) { return }
+        if ((Is-AlreadyToken -Value $v) -or (Test-ScrubAllowlist -Value $v)) { return }
+        if (Test-PreserveDetectedValue -Value $v -Detector $Detector -Prefix $Prefix -Text $Reason -Index 0 -Length $v.Length) { return }
+        $norm = Normalize-TokenKey -Value $v
+        if (-not $norm -or $seen.ContainsKey($norm)) { return }
+        $seen[$norm] = $true
+        [void]$out.Add([pscustomobject]@{ Raw = $v; Prefix = $Prefix; Detector = $Detector; Reason = $Reason })
+    }
+
+    foreach ($m in [regex]::Matches($Text, '(?m)^(?:"[^"]*",){6}"(?<machine>[^"]+)"')) {
+        _AddFastWindowsEventId -Raw $m.Groups['machine'].Value -Prefix 'COMPUTER' -Detector 'WindowsEventCsvColumn' -Reason 'MachineName'
+    }
+    foreach ($m in [regex]::Matches($Text, '(?m)^(?:"[^"]*",){7}"(?<userid>S-1-\d+(?:-\d+)*)"')) {
+        _AddFastWindowsEventId -Raw $m.Groups['userid'].Value -Prefix 'SID' -Detector 'WindowsEventCsvColumn' -Reason 'UserId'
+    }
+    foreach ($m in [regex]::Matches($Text, '""(?<key>EventData_[^""]+)""\s*:\s*""(?<value>[^""]*)""')) {
+        $key = $m.Groups['key'].Value
+        $value = $m.Groups['value'].Value
+        $prefix = Get-UlsWindowsEventKeyPrefix -KeyName $key -Value $value
+        if ($prefix) { _AddFastWindowsEventId -Raw $value -Prefix $prefix -Detector 'WindowsEventJsonKey' -Reason $key }
+    }
+    foreach ($m in [regex]::Matches($Text, '(?i)\b(?:Security ID|TargetSid|SubjectUserSid)\s*:\s*(?<value>S-1-\d+(?:-\d+)+)')) {
+        _AddFastWindowsEventId -Raw $m.Groups['value'].Value -Prefix 'SID' -Detector 'WindowsEventMessageLabel' -Reason 'Security ID'
+    }
+    foreach ($m in [regex]::Matches($Text, '(?i)\b(?:Account Name|Target User Name|Subject User Name|TargetUserName|SubjectUserName)\s*:\s*(?<value>[^\s,;]+)')) {
+        _AddFastWindowsEventId -Raw $m.Groups['value'].Value -Prefix 'PRINCIPAL' -Detector 'WindowsEventMessageLabel' -Reason 'Account/User Name'
+    }
+    foreach ($m in [regex]::Matches($Text, '(?i)\b(?:Account Domain|Target Domain Name|Subject Domain Name|TargetDomainName|SubjectDomainName|Workstation Name|WorkstationName|Computer Name)\s*:\s*(?<value>[^\s,;]+)')) {
+        _AddFastWindowsEventId -Raw $m.Groups['value'].Value -Prefix 'COMPUTER' -Detector 'WindowsEventMessageLabel' -Reason 'Domain/Workstation'
+    }
+    foreach ($m in [regex]::Matches($Text, '(?i)\b(?:Source Network Address|Client Address|IP Address|IpAddress)\s*:\s*(?<value>[^\s,;]+)')) {
+        $rawIp = $m.Groups['value'].Value
+        $p = if ($rawIp -match ':' -and (Test-UlsValidIpv6Address -Value $rawIp)) { 'IP6' } else { 'IP' }
+        _AddFastWindowsEventId -Raw $rawIp -Prefix $p -Detector 'WindowsEventMessageLabel' -Reason 'Network Address'
+    }
+    foreach ($m in [regex]::Matches($Text, 'S-1-\d+(?:-\d+)+')) {
+        _AddFastWindowsEventId -Raw $m.Value -Prefix 'SID' -Detector 'WindowsEventSid' -Reason 'SID shape'
+    }
+    foreach ($m in [regex]::Matches($Text, '(?<!\d)(?<!\d\.)(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\d)(?!\.\d)')) {
+        _AddFastWindowsEventId -Raw $m.Value -Prefix 'IP' -Detector 'WindowsEventIPv4' -Reason 'IPv4 shape'
+    }
+    foreach ($id in (Find-UlsConnectionHostIdentifiers -Text $Text)) {
+        _AddFastWindowsEventId -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -Detector 'ConnectionHost' -Reason ([string]$id.Reason)
+    }
+    foreach ($id in (Find-SecretIdentifiers -Text $Text)) {
+        _AddFastWindowsEventId -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -Detector 'Secret' -Reason 'Secret pattern'
+    }
+
+    return @($out.ToArray())
+}
+
+function Find-UlsV414Identifiers {
+    param([Parameter(Mandatory)][string]$Text)
+
+    if ($Text.Length -gt 1MB -and $Text -match 'EventDataJson' -and $Text -match 'ProviderName' -and $Text -match 'MachineName') {
+        return @(Find-UlsWindowsEventCsvTextIdentifiersFast -Text $Text)
+    }
+
+    $base = @(& $script:__ULS_FindIdentifiers_BeforeV414 -Text $Text)
+    $seen = @{}
+    foreach ($id in $base) {
+        try {
+            $norm = Normalize-TokenKey -Value ([string]$id.Raw)
+            if ($norm) { $seen[$norm] = $true }
+        }
+        catch { }
+    }
+
+    $extra = New-Object System.Collections.Generic.List[object]
+    foreach ($id in (Find-UlsConnectionHostIdentifiers -Text $Text)) {
+        $norm = Normalize-TokenKey -Value ([string]$id.Raw)
+        if (-not $norm -or $seen.ContainsKey($norm)) { continue }
+        $seen[$norm] = $true
+        try {
+            Add-DetectionTrace -Detector 'ConnectionHost' -Action 'Tokenized' -Value ([string]$id.Raw) -Token (Get-Token -Value ([string]$id.Raw) -Prefix ([string]$id.Prefix)) -Reason ([string]$id.Reason) -ColumnName '(connection)' -Context ''
+        }
+        catch { }
+        [void]$extra.Add($id)
+    }
+
+    return @($base + @($extra.ToArray()))
+}
+
+${function:Test-PreserveUniversalLabeledValue} = ${function:Test-UlsV414PreserveUniversalLabeledValue}
+${function:Test-PreserveDetectedValue} = ${function:Test-UlsV414PreserveDetectedValue}
+${function:Find-Identifiers} = ${function:Find-UlsV414Identifiers}
+
+# END ULS v4.14 performance and precision policy layer
+
 Set-Alias -Name Invoke-UniversalLogScrubber -Value Invoke-UniversalScrubber
 Set-Alias -Name Invoke-ULSScrubSelfTest -Value Invoke-ScrubSelfTest
 Set-Alias -Name Test-ULSLogFormat -Value Test-LogFormat
@@ -7682,6 +10419,7 @@ Export-ModuleMember -Function `
     Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
     Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
+    Invoke-UlsScrubTextBatch, Invoke-UlsDiscoverTextBatch, Invoke-UlsScrubCsvBatch, `
     ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
     Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
     Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog `

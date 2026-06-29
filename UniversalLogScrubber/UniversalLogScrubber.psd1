@@ -12,7 +12,7 @@
 RootModule = 'UniversalLogScrubber.psm1'
 
 # Version number of this module.
-ModuleVersion = '4.13.0'
+ModuleVersion = '4.14.0'
 
 # Supported PSEditions
 CompatiblePSEditions = 'Desktop', 'Core'
@@ -76,7 +76,8 @@ FunctionsToExport = 'Invoke-UniversalScrubber', 'Test-LogFormat', 'Get-LogCorpus
                'New-ScrubProfileTemplate', 'New-ScrubProfileFromSample', 
                'Test-ScrubProfile', 'ConvertFrom-EvtxToCsv', 'ConvertFrom-W3CToCsv', 
                'ConvertFrom-XlsxToCsv', 'Invoke-ScrubFile', 'Test-ScrubbedForLeaks', 
-               'Invoke-ScrubSelfTest', 'Restore-ScrubbedFile', 'New-SyntheticLog'
+               'Invoke-UlsScrubCsvBatch', 'Invoke-ScrubSelfTest',
+               'Restore-ScrubbedFile', 'New-SyntheticLog'
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
 CmdletsToExport = @()
@@ -118,7 +119,7 @@ PrivateData = @{
         # IconUri = ''
 
         # ReleaseNotes of this module
-        ReleaseNotes = 'v4.13.0 Gallery-ready release: stable module filenames, manifest packaging, release aliases, external corpus tooling, recommendation workflows, JSON numeric hardening, expanded connection host detection, progress feedback, and static guardrails.'
+        ReleaseNotes = 'v4.14.0 performance and precision release: conservative default detection, faster Windows Event CSV streaming, true pass-through metadata handling, validated IPv6, reduced false positives, and stronger BYOP/Strict separation.'
 
         # Prerelease string of this module
         # Prerelease = ''
