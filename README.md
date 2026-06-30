@@ -8,10 +8,9 @@ events can still be correlated without exposing the original identifiers.
 It works offline against Windows Event exports, EVTX files, CSV/TSV/PSV,
 JSON/NDJSON, IIS/W3C, web access/proxy logs, key=value/logfmt/CEF-style logs,
 syslog, enterprise CSV/XLSX exports, Office documents, and mixed diagnostic
-text. Version 4.15.0 adds compact progress feedback, native DOCX/PPTX text
-extraction, ServiceNow/Nexthink/SCCM/Intune export profiles, an
-IntuneDiagnostics text profile, and continued streaming CSV/parallel scrub
-performance work.
+text. Version 4.15.1 adds native `Get-WinEvent` ETL conversion with
+`tracerpt.exe` fallback and protected generated profiles for sample-derived
+field/label names that should not appear in profile JSON.
 
 ## Safety First
 
@@ -125,9 +124,10 @@ automation. The module writes local UNSCRUBBED `.txt` intermediates under
 ask to keep them.
 
 Legacy `.doc` and `.ppt` files are not parsed natively. Export them to
-`.docx`, `.pptx`, or plain text first. ETL traces and CAB archives are
-recommendation-only guardrails in v4.15; convert ETL to `.log`/`.txt`/`.csv` or
-extract approved CAB contents before scrubbing.
+`.docx`, `.pptx`, or plain text first. ETL conversion remains explicit with
+`-ConvertEtl`; `Auto` tries `Get-WinEvent` first and falls back to
+`tracerpt.exe`. CAB archives are recommendation-only guardrails; extract only
+approved CAB contents before scrubbing.
 
 ## Build A Profile From A Sample
 
@@ -162,6 +162,11 @@ Add `-ProfileWizard` when you want the tool to ask whether to write optional
 seed and allowlist files from the sample evidence. Those files may contain raw
 values and stay local.
 
+Add `-ProtectGeneratedProfile` when sample-derived column/key names or labels
+are sensitive enough that they should be stored as salted `FIELD_`/`LABEL_`
+tokens instead of readable profile text. Protected profiles are runnable only
+with the same salt and HMAC length.
+
 ## What Gets Scrubbed
 
 - Principals, accounts, emails, domains, hostnames, servers, machines, IPs,
@@ -183,6 +188,15 @@ Diagnostic/public values such as loopback IPs, all-zero GUIDs, known public
 domains, and common built-in Windows accounts are preserved where that is safer
 and more readable. You can add your own allowlist values in a profile or
 `-AllowlistFile`.
+
+## v4.15.1 Highlights
+
+- `-ConvertEtl` still stays explicit, but `-EtlConverter Auto` now tries native
+  `Get-WinEvent` conversion first and falls back to `tracerpt.exe`.
+- `-EtlConverter GetWinEvent` and `-EtlConverter Tracerpt` force a specific ETL
+  path, and `-TracerptPath` can point at a known tracerpt binary.
+- `-ProtectGeneratedProfile` creates runnable generated profiles with protected
+  sample-derived field and label names.
 
 ## v4.15.0 Highlights
 
@@ -274,9 +288,9 @@ For deeper BYOP walkthroughs, see the
 [BYOP Profile Authoring wiki page](https://github.com/glid3s/universal-log-scrubber/wiki/BYOP-Profile-Authoring).
 Ready-to-edit profile examples live in [docs/profiles](docs/profiles).
 
-# Universal Log Scrubber v4.15 Quick Notes
+# Universal Log Scrubber v4.15.1 Quick Notes
 
-Universal Log Scrubber 4.15 keeps the default `Balanced` policy conservative and BYOP-first: built-in detection targets well-known sensitive values, while local/vendor edge cases are best handled with profiles, seed files, allowlists, or the new additive `-ProfileExtensionFile` overlay.
+Universal Log Scrubber 4.15.1 keeps the default `Balanced` policy conservative and BYOP-first: built-in detection targets well-known sensitive values, while local/vendor edge cases are best handled with profiles, seed files, allowlists, or the additive `-ProfileExtensionFile` overlay.
 
 Common v4.15 examples:
 
@@ -290,8 +304,11 @@ Invoke-UniversalScrubber -Path .\tickets.csv -Profile ServiceNow -ProfileExtensi
 # Build a standalone editable profile from a sample, starting from a built-in profile.
 Invoke-UniversalScrubber -BuildProfileFromSample -Path .\sample-firewall.log -BaseProfile Firewall -ProfileOut .\firewall-custom.json -Force -NonInteractive
 
-# ETL conversion is explicit and local. The converted CSV remains unsanitized until the scrub step completes.
-Invoke-UniversalScrubber -Path .\trace.etl -ConvertEtl -Profile Generic -SaltFile .\salt.txt -NonInteractive
+# ETL conversion is explicit and local. Auto tries Get-WinEvent, then tracerpt.exe.
+Invoke-UniversalScrubber -Path .\trace.etl -ConvertEtl -EtlConverter Auto -Profile Generic -SaltFile .\salt.txt -NonInteractive
+
+# Protect sample-derived generated profile field/label names with the same salt.
+Invoke-UniversalScrubber -BuildProfileFromSample -Path .\sample.csv -ProfileOut .\sample-profile.json -ProtectGeneratedProfile -SaltFile .\salt.txt -Force -NonInteractive
 ```
 
 New or improved v4.15 recommendations include Intune diagnostics (`.log`, `.txt`, `.reg`, `.html`, `.xml`), ServiceNow, Nexthink, SCCM/ConfigMgr, Intune CSV exports, M365/identity audit exports, Sentinel/cloud audit JSONL, EDR/XDR JSONL, firewall/VPN text, structured firewall CSV exports, XLSX, DOCX, PPTX, and ETL traces.

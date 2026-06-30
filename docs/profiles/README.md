@@ -12,6 +12,11 @@ vendor fields, tenant labels, and internal workflow shape. Review profiles befor
 sharing them. Keep token maps, salts, manifests, detailed reports, and profile
 build reports local-only.
 
+If generated column/key names or labels are sensitive, build with
+`-ProtectGeneratedProfile` and the same salt source used for scrubbing. The
+profile will store those generated matches as salted `FIELD_` and `LABEL_`
+tokens and will only run with the matching salt fingerprint and HMAC length.
+
 ## Full Profile Examples
 
 - `csv-schema-profile.json`: schema-first CSV profile with pass-through,

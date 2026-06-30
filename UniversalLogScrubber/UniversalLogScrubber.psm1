@@ -174,7 +174,15 @@
       Intune, M365/identity audit, Sentinel/cloud audit, EDR/XDR, and firewall logs.
     * -ProfileExtensionFile adds local BYOP overlays without copying an entire
       built-in profile.
-    * .etl intake is explicit with -ConvertEtl and uses Windows tracerpt.exe.
+    * .etl intake is explicit with -ConvertEtl.
+
+  v4.15.1 ADDS
+  ------------
+    * -EtlConverter Auto tries native Get-WinEvent ETL conversion first, then
+      falls back to tracerpt.exe. Use GetWinEvent or Tracerpt to force one path.
+    * -TracerptPath can point to a known tracerpt.exe location for fallback.
+    * -ProtectGeneratedProfile writes runnable sample-built profiles with salted
+      FIELD_/LABEL_ HMAC tokens for sample-derived column/key names and labels.
 
   CONSISTENCY GUARANTEE
   ---------------------
@@ -209,7 +217,7 @@
 # REGION: Session state (shared by every stage)
 # =====================================================================
 $script:ModuleName       = 'UniversalLogScrubber'
-$script:ModuleVersion    = '4.15.0'
+$script:ModuleVersion    = '4.15.1'
 $script:Salt             = $null
 $script:HmacLength       = 24
 $script:TokenByNorm      = @{}     # normalized-value -> token (the loaded map)
@@ -235,7 +243,7 @@ $script:KnownTokenPrefixes = @(
     'PRINCIPAL','UNMAPPED_PRINCIPAL','UNMAPPED_UPN','COMPUTER','GROUP',
     'OBJECT','SID','DNS','UPN','EMAIL','CERT','TEMPLATE','CA','X500',
     'GUID','IP','IP6','HOST','URL','URI','MAC','JWT','ARN','AWSKEY',
-    'INSTANCE','BLOB','SECRET','APIKEY','CONNSTR','PEM'
+    'INSTANCE','BLOB','SECRET','APIKEY','CONNSTR','PEM','FIELD','LABEL'
 )
 
 # =====================================================================
@@ -699,11 +707,43 @@ function Invoke-HmacToken {
     return $token
 }
 
+function Resolve-UlsSaltInput {
+    param([string]$Salt, [string]$SaltFromEnv, [string]$SaltFile)
+    if ($SaltFile) {
+        if (-not (Test-Path -LiteralPath $SaltFile)) { throw "Salt file not found: $SaltFile" }
+        return ([System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $SaltFile).Path)).Trim()
+    }
+    if ($SaltFromEnv) {
+        $envSalt = [Environment]::GetEnvironmentVariable($SaltFromEnv)
+        if ([string]::IsNullOrWhiteSpace($envSalt)) { throw "Environment variable '$SaltFromEnv' is empty or not set." }
+        return $envSalt
+    }
+    return $Salt
+}
+
+function Test-UlsProtectedTokenMatch {
+    param([string]$Value, [string]$ProtectedToken, [ValidateSet('FIELD','LABEL')][string]$Prefix)
+    if ([string]::IsNullOrWhiteSpace($Value) -or [string]::IsNullOrWhiteSpace($ProtectedToken)) { return $false }
+    $tok = Invoke-HmacToken -Value $Value -Prefix $Prefix
+    return (-not [string]::IsNullOrWhiteSpace($tok) -and [string]::Equals($tok, $ProtectedToken, [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Test-UlsProtectedLabelRuleMatch {
+    param($Rule, [string]$Label)
+    $protected = @()
+    try { if ($Rule.ProtectedLabels) { $protected = @($Rule.ProtectedLabels) } } catch { }
+    if ($protected.Count -eq 0) { return $true }
+    foreach ($p in $protected) {
+        if (Test-UlsProtectedTokenMatch -Value $Label -ProtectedToken ([string]$p) -Prefix LABEL) { return $true }
+    }
+    return $false
+}
+
 function Is-AlreadyToken {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
     return (
-        $Value -match '^(HV_)?(PRINCIPAL|COMPUTER|GROUP|OBJECT|SID|DNS|UPN|EMAIL|CERT|TEMPLATE|CA|X500|GUID|IP|IP6|HOST|URL|URI|MAC|JWT|ARN|AWSKEY|INSTANCE|BLOB|SECRET|APIKEY|CONNSTR|PEM)_[A-F0-9]{4,}$' -or
+        $Value -match '^(HV_)?(PRINCIPAL|COMPUTER|GROUP|OBJECT|SID|DNS|UPN|EMAIL|CERT|TEMPLATE|CA|X500|GUID|IP|IP6|HOST|URL|URI|MAC|JWT|ARN|AWSKEY|INSTANCE|BLOB|SECRET|APIKEY|CONNSTR|PEM|FIELD|LABEL)_[A-F0-9]{4,}$' -or
         $Value -match '^UNMAPPED_(UPN|PRINCIPAL|DNS|OBJECT|IP)_[A-F0-9]{4,}$' -or
         $Value -match '^(BROAD|ADCS|HV_GROUP|BUILTIN)_[A-Z0-9_]+$'
     )
@@ -1095,7 +1135,7 @@ function ConvertTo-ProfileColumnRules {
         if ($null -eq $r) { continue }
         if ($r -is [string]) {
             $rx = ConvertTo-ColumnRuleRegex -Exact $r -Context $Context
-            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$DefaultAction; Prefix=$defaultPrefixResolved; SplitOn=$null; Description='' })
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; ProtectedExact=@(); Action=$DefaultAction; Prefix=$defaultPrefixResolved; SplitOn=$null; Description='' })
             continue
         }
         $actionRaw = if ($r.Action) { [string]$r.Action } else { $DefaultAction }
@@ -1115,20 +1155,26 @@ function ConvertTo-ProfileColumnRules {
         $regexes = @()
         if ($r.Regex) { $regexes += @($r.Regex) }
         if ($r.Match -eq 'Regex' -and $r.Pattern) { $regexes += @($r.Pattern) }
+        $protectedExact = @()
+        if ($r.ProtectedExact) { $protectedExact += @($r.ProtectedExact) }
         foreach ($ex in $exactValues) {
             if ([string]::IsNullOrWhiteSpace([string]$ex)) { continue }
             $rx = ConvertTo-ColumnRuleRegex -Exact ([string]$ex) -Context $Context
-            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; ProtectedExact=@(); Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
         }
         foreach ($wc in $wildcards) {
             if ([string]::IsNullOrWhiteSpace([string]$wc)) { continue }
             $rx = ConvertTo-ColumnRuleRegex -Wildcard ([string]$wc) -Context $Context
-            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; ProtectedExact=@(); Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
         }
         foreach ($re in $regexes) {
             if ([string]::IsNullOrWhiteSpace([string]$re)) { continue }
             $rx = ConvertTo-ColumnRuleRegex -Regex ([string]$re) -Context $Context
-            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+            [void]$out.Add([pscustomobject]@{ RegexObject=$rx; ProtectedExact=@(); Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
+        }
+        $protectedClean = @($protectedExact | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        if ($protectedClean.Count -gt 0) {
+            [void]$out.Add([pscustomobject]@{ RegexObject=$null; ProtectedExact=@($protectedClean); Action=$action; Prefix=$prefix; SplitOn=$r.SplitOn; Description=([string]$r.Description) })
         }
     }
     return @($out.ToArray())
@@ -1224,13 +1270,22 @@ function ConvertTo-UniversalLabelRule {
     $sep = if ($Rule.SeparatorRegex) { [string]$Rule.SeparatorRegex } else { '[:=]' }
     $valueRx = if ($Rule.ValueRegex) { [string]$Rule.ValueRegex } else { '(?:"[^"\r\n]{1,512}"|''[^''\r\n]{1,512}''|LOCAL SERVICE|NETWORK SERVICE|ANONYMOUS LOGON|NT AUTHORITY|Window Manager|Font Driver Host|[^,\s;|]{1,512})' }
     $labelRx = $null
+    $protectedLabels = @()
+    if ($Rule.ProtectedLabels) { $protectedLabels += @($Rule.ProtectedLabels) }
     if ($Rule.LabelRegex) { $labelRx = [string]$Rule.LabelRegex }
     else {
         $labels = @()
         if ($Rule.Labels) { $labels += @($Rule.Labels) }
         if ($Rule.Label) { $labels += @($Rule.Label) }
-        if ($labels.Count -eq 0) { throw "$Context '$name' requires Labels or LabelRegex." }
-        $labelRx = (($labels | ForEach-Object { [regex]::Escape(([string]$_).Trim()) }) -join '|')
+        if ($labels.Count -gt 0) {
+            $labelRx = (($labels | ForEach-Object { [regex]::Escape(([string]$_).Trim()) }) -join '|')
+        }
+        elseif ($protectedLabels.Count -gt 0) {
+            $labelRx = '[A-Za-z][A-Za-z0-9_. -]{1,80}'
+        }
+        else {
+            throw "$Context '$name' requires Labels, ProtectedLabels, or LabelRegex."
+        }
     }
     $full = "(?im)((?<![A-Za-z0-9_])(?:$labelRx)(?![A-Za-z0-9_])\s*(?:$sep)\s*)($valueRx)"
     $preserve = if ($Rule.PreserveRegex) { New-ScrubRegex -Pattern ([string]$Rule.PreserveRegex) -Context "$Context preserve regex" } else { $null }
@@ -1240,6 +1295,7 @@ function ConvertTo-UniversalLabelRule {
         Name = $name
         Prefix = $prefix
         RegexObject = (New-ScrubRegex -Pattern $full -Context "$Context '$name'")
+        ProtectedLabels = @($protectedLabels | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
         PreserveRegex = $preserve
         PreserveExact = $allow
     }
@@ -1288,6 +1344,7 @@ function __ULS_Legacy_Find_UniversalLabeledIdentifiers_1040 {
         foreach ($m in $rule.RegexObject.Matches($Text)) {
             $label = ($m.Groups[1].Value -replace '\s*(?:[:=])\s*$', '').Trim()
             $raw = $m.Groups[2].Value.Trim().Trim('"', "'")
+            if (-not (Test-UlsProtectedLabelRuleMatch -Rule $rule -Label $label)) { continue }
             if (Test-PreserveUniversalLabeledValue -Rule $rule -Label $label -Value $raw) { continue }
             $prefix = Get-UniversalLabeledValuePrefix -Label $label -Value $raw -DefaultPrefix $rule.Prefix
             if (-not $prefix) { continue }
@@ -1328,6 +1385,7 @@ function Invoke-UniversalLabelHardening {
             $prefixText = $m.Groups[1].Value
             $label = ($prefixText -replace '\s*(?:[:=])\s*$', '').Trim()
             $raw = $m.Groups[2].Value.Trim().Trim('"', "'")
+            if (-not (Test-UlsProtectedLabelRuleMatch -Rule $rule -Label $label)) { return $m.Value }
             if (Test-PreserveUniversalLabeledValue -Rule $rule -Label $label -Value $raw) { return $m.Value }
             # ULS patch 9: apply the same high-confidence low-signal filter the discovery and leak-check
             # finders use, so the scrub agrees with them and stops tokenizing junk words after labels.
@@ -3124,7 +3182,7 @@ function Get-LogFormatRecommendation {
     if ($ext -eq '.etl') {
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'ETL trace' -SuggestedProfile 'Generic' -Confidence 45 `
             -Reasons @('The .etl extension identifies a Windows Event Trace Log.') `
-            -Warnings @('ETL conversion is opt-in. Use -ConvertEtl to run Windows tracerpt.exe locally, or convert ETL to CSV/XML/text with your diagnostic workflow before scrubbing.') `
+            -Warnings @('ETL conversion is opt-in. Use -ConvertEtl to run local ETL conversion; Auto tries Get-WinEvent first and falls back to tracerpt.exe, or convert ETL to CSV/XML/text with your diagnostic workflow before scrubbing.') `
             -ExtraSwitches '-ConvertEtl'
     }
     if ($ext -eq '.cab') {
@@ -3365,8 +3423,11 @@ function Get-MatchingProfileColumnRule {
     $rules = @()
     try { if ($Profile.$RuleSet) { $rules = @($Profile.$RuleSet) } } catch { }
     foreach ($rule in $rules) {
-        if ($null -eq $rule -or $null -eq $rule.RegexObject) { continue }
-        if ($rule.RegexObject.IsMatch($ColumnName)) { return $rule }
+        if ($null -eq $rule) { continue }
+        if ($null -ne $rule.RegexObject -and $rule.RegexObject.IsMatch($ColumnName)) { return $rule }
+        foreach ($protected in @($rule.ProtectedExact)) {
+            if (Test-UlsProtectedTokenMatch -Value $ColumnName -ProtectedToken ([string]$protected) -Prefix FIELD) { return $rule }
+        }
     }
     return $null
 }
@@ -4558,26 +4619,27 @@ function Get-EvtxEventDataMap {
     return $map
 }
 
-function ConvertFrom-EvtxToCsv {
+function ConvertFrom-WinEventPathToCsv {
     param(
-        [Parameter(Mandatory)][string]$EvtxPath,
+        [Parameter(Mandatory)][string]$InputPath,
         [Parameter(Mandatory)][string]$OutCsv,
-        [ValidateSet('Fast','CountFirst')][string]$EvtxProgressMode = $script:EvtxProgressMode
+        [Parameter(Mandatory)][string]$InputKind,
+        [ValidateSet('Fast','CountFirst')][string]$ProgressMode = 'Fast'
     )
-    if (-not (Test-Path $EvtxPath)) { throw "EVTX not found: $EvtxPath" }
+    if (-not (Test-Path $InputPath)) { throw "$InputKind not found: $InputPath" }
     if (-not (Get-Command Get-WinEvent -ErrorAction SilentlyContinue)) {
-        throw "Get-WinEvent is unavailable. Reading .evtx needs Windows PowerShell on Windows."
+        throw "Get-WinEvent is unavailable. Reading $InputKind event data needs PowerShell on Windows."
     }
     $out = Resolve-OutPath -Path $OutCsv
-    $name = [System.IO.Path]::GetFileName($EvtxPath)
-    Write-Work "Converting EVTX -> CSV: $name"
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    Write-Work "Converting $InputKind -> CSV with Get-WinEvent: $name"
 
     $eventDataColumns = New-Object System.Collections.Generic.List[string]
     $eventDataSeen = @{}
     $total = $null
-    if ($EvtxProgressMode -eq 'CountFirst') {
+    if ($ProgressMode -eq 'CountFirst') {
         $total = 0
-        foreach ($e in (Get-WinEvent -Path $EvtxPath -ErrorAction Stop)) {
+        foreach ($e in (Get-WinEvent -Path $InputPath -ErrorAction Stop)) {
             $total++
             foreach ($k in (Get-EvtxEventDataMap -Event $e).Keys) {
                 if (-not $eventDataSeen.ContainsKey($k)) {
@@ -4586,10 +4648,10 @@ function ConvertFrom-EvtxToCsv {
                 }
             }
             if ($total % 500 -eq 0) {
-                Write-UlsProgress -Activity "Index EVTX" -Phase ("cols {0}" -f $eventDataColumns.Count) -File $name -RowsDone $total
+                Write-UlsProgress -Activity "Index $InputKind" -Phase ("cols {0}" -f $eventDataColumns.Count) -File $name -RowsDone $total
             }
         }
-        Write-UlsProgress -Activity "Index EVTX" -File $name -Completed
+        Write-UlsProgress -Activity "Index $InputKind" -File $name -Completed
     }
 
     $columns = @('RecordId','TimeCreated','Id','LevelDisplayName','ProviderName','LogName','MachineName','UserId') + @($eventDataColumns) + @('EventDataJson','Message')
@@ -4598,7 +4660,7 @@ function ConvertFrom-EvtxToCsv {
     $count = 0
     try {
         $writer.WriteLine((($columns | ForEach-Object { ConvertTo-ScrubCsvField $_ }) -join ','))
-        foreach ($e in (Get-WinEvent -Path $EvtxPath -ErrorAction Stop)) {
+        foreach ($e in (Get-WinEvent -Path $InputPath -ErrorAction Stop)) {
             try {
                 $count++
                 $tc = ""
@@ -4626,7 +4688,7 @@ function ConvertFrom-EvtxToCsv {
                 Write-ScrubCsvRow -Writer $writer -Columns $columns -Row $row
                 if ($count % 100 -eq 0) {
                     $pct = if ($total -and $total -gt 0) { [int](($count / [Math]::Max($total, 1)) * 100) } else { -1 }
-                    Write-UlsProgress -Activity "Convert EVTX" -Phase ("RecordId {0}" -f $e.RecordId) -File $name -RowsDone $count -RowsTotal $total
+                    Write-UlsProgress -Activity "Convert $InputKind" -Phase ("RecordId {0}" -f $e.RecordId) -File $name -RowsDone $count -RowsTotal $total
                 }
             }
             catch { }
@@ -4634,14 +4696,23 @@ function ConvertFrom-EvtxToCsv {
     }
     finally {
         $writer.Close()
-        Write-UlsProgress -Activity "Convert EVTX" -File $name -Completed
+        Write-UlsProgress -Activity "Convert $InputKind" -File $name -Completed
     }
     if ($count -eq 0) {
         [pscustomobject]@{ Note = 'No events could be read from this log.' } | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8
     }
-    Write-Ok "EVTX converted: $out  ($count events)"
-    Write-Detail "Note: this .evtx.csv is UNSCRUBBED -- it gets scrubbed next; delete it after."
+    Write-Ok "$InputKind converted: $out  ($count events)"
+    Write-Detail "Note: this converted CSV is UNSCRUBBED -- it gets scrubbed next; delete it after."
     return $out
+}
+
+function ConvertFrom-EvtxToCsv {
+    param(
+        [Parameter(Mandatory)][string]$EvtxPath,
+        [Parameter(Mandatory)][string]$OutCsv,
+        [ValidateSet('Fast','CountFirst')][string]$EvtxProgressMode = $script:EvtxProgressMode
+    )
+    return ConvertFrom-WinEventPathToCsv -InputPath $EvtxPath -OutCsv $OutCsv -InputKind 'EVTX' -ProgressMode $EvtxProgressMode
 }
 
 # =====================================================================
@@ -4719,6 +4790,8 @@ function Import-ScrubProfileFile {
     $raw = if ($ext -eq '.psd1') { Import-PowerShellDataFile -Path $Path } else { (Get-Content -Path $Path -Raw) | ConvertFrom-Json }
     if (-not $raw) { throw "Profile file is empty or invalid: $Path" }
     $name = if ($raw.Name) { [string]$raw.Name } else { [System.IO.Path]::GetFileNameWithoutExtension($Path) }
+    $protection = Get-UlsObjectPropertyValue -Object $raw -Name 'Protection' -Default $null
+    Assert-UlsProfileProtectionContext -Protection $protection -Context "Profile '$name'"
     $validFormats = @('Auto','Csv','Tsv','Psv','Text','Json','Kv')
     $fmt = if ($raw.Format) { [string]$raw.Format } else { 'Auto' }
     if (@($validFormats | Where-Object { $_ -ieq $fmt }).Count -eq 0) { throw "Invalid profile Format '$fmt'. Expected one of: $($validFormats -join ', ')." }
@@ -4742,6 +4815,7 @@ function Import-ScrubProfileFile {
         Name             = $name
         Description      = if ($raw.Description) { [string]$raw.Description } else { "Custom profile ($name)" }
         SchemaVersion    = if ($raw.SchemaVersion) { [int]$raw.SchemaVersion } else { 1 }
+        Protection       = $protection
         Format           = $fmt
         Delimiter        = if ($raw.Delimiter) { [string]$raw.Delimiter } else { ',' }
         PassThroughRegex = if ($raw.PassThroughRegex) { [string]$raw.PassThroughRegex } else { $null }
@@ -5352,6 +5426,99 @@ function ConvertTo-GeneratedProfile {
     return $profile
 }
 
+function Remove-UlsObjectProperty {
+    param($Object, [string]$Name)
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Name)) { return }
+    try {
+        if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name)) {
+            [void]$Object.Remove($Name)
+            return
+        }
+    } catch { }
+    try {
+        if ($Object.PSObject.Properties[$Name]) { $Object.PSObject.Properties.Remove($Name) }
+    } catch { }
+}
+
+function Set-UlsObjectProperty {
+    param($Object, [string]$Name, $Value)
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Name)) { return }
+    try {
+        if ($Object -is [System.Collections.IDictionary]) {
+            $Object[$Name] = $Value
+            return
+        }
+    } catch { }
+    try {
+        if ($Object.PSObject.Properties[$Name]) { $Object.PSObject.Properties[$Name].Value = $Value }
+        else { Add-Member -InputObject $Object -NotePropertyName $Name -NotePropertyValue $Value -Force }
+    } catch { }
+}
+
+function Protect-UlsGeneratedProfile {
+    param([Parameter(Mandatory)]$Profile)
+    [void](Get-SessionSalt)
+    $profileProtection = [ordered]@{
+        Enabled         = $true
+        Algorithm       = 'HMAC-SHA256'
+        SaltFingerprint = (Get-SaltFingerprint)
+        HmacLength      = [int]$script:HmacLength
+    }
+    Set-UlsObjectProperty -Object $Profile -Name 'Protection' -Value $profileProtection
+
+    foreach ($propName in @('SchemaColumns','WholeColumnRules')) {
+        foreach ($rule in @(Get-UlsObjectPropertyArray -Object $Profile -Name $propName)) {
+            $protected = New-Object System.Collections.Generic.List[string]
+            foreach ($fieldName in @('Exact','Column','Columns','Name')) {
+                foreach ($value in @(Get-UlsObjectPropertyArray -Object $rule -Name $fieldName)) {
+                    if ([string]::IsNullOrWhiteSpace([string]$value)) { continue }
+                    $tok = Invoke-HmacToken -Value ([string]$value) -Prefix FIELD
+                    if ($tok -and -not $protected.Contains($tok)) { [void]$protected.Add($tok) }
+                }
+                Remove-UlsObjectProperty -Object $rule -Name $fieldName
+            }
+            if ($protected.Count -gt 0) { Set-UlsObjectProperty -Object $rule -Name 'ProtectedExact' -Value @($protected.ToArray()) }
+        }
+    }
+
+    foreach ($rule in @(Get-UlsObjectPropertyArray -Object $Profile -Name 'LabelRules')) {
+        $protected = New-Object System.Collections.Generic.List[string]
+        foreach ($fieldName in @('Labels','Label')) {
+            foreach ($value in @(Get-UlsObjectPropertyArray -Object $rule -Name $fieldName)) {
+                if ([string]::IsNullOrWhiteSpace([string]$value)) { continue }
+                $tok = Invoke-HmacToken -Value ([string]$value) -Prefix LABEL
+                if ($tok -and -not $protected.Contains($tok)) { [void]$protected.Add($tok) }
+            }
+            Remove-UlsObjectProperty -Object $rule -Name $fieldName
+        }
+        if ($protected.Count -gt 0) { Set-UlsObjectProperty -Object $rule -Name 'ProtectedLabels' -Value @($protected.ToArray()) }
+    }
+    return $Profile
+}
+
+function Assert-UlsProfileProtectionContext {
+    param($Protection, [string]$Context = 'profile')
+    $enabled = $false
+    try { $enabled = [bool](Get-UlsObjectPropertyValue -Object $Protection -Name 'Enabled' -Default $false) } catch { }
+    if (-not $enabled) { return }
+    if ([string]::IsNullOrWhiteSpace($script:Salt)) {
+        throw "$Context is protected and requires the same salt used to generate it. Pass -Salt, -SaltFromEnv, or -SaltFile before loading the profile."
+    }
+    $expectedAlg = [string](Get-UlsObjectPropertyValue -Object $Protection -Name 'Algorithm' -Default 'HMAC-SHA256')
+    if ($expectedAlg -and $expectedAlg -ne 'HMAC-SHA256') { throw "$Context uses unsupported protection algorithm '$expectedAlg'." }
+    $expectedLen = [int](Get-UlsObjectPropertyValue -Object $Protection -Name 'HmacLength' -Default $script:HmacLength)
+    if ($expectedLen -ne [int]$script:HmacLength) {
+        throw "$Context was protected with HMAC length $expectedLen, but this run is using $script:HmacLength."
+    }
+    $expectedFp = [string](Get-UlsObjectPropertyValue -Object $Protection -Name 'SaltFingerprint' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($expectedFp)) {
+        $actualFp = Get-SaltFingerprint
+        if (-not [string]::Equals($expectedFp, $actualFp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Context salt fingerprint mismatch. Use the same salt that generated the protected profile."
+        }
+    }
+}
+
 function ConvertTo-UlsSerializableColumnPrefixRules {
     param($Rules)
     $out = New-Object System.Collections.Generic.List[object]
@@ -5419,6 +5586,8 @@ function Merge-UlsGeneratedProfileWithBase {
             Delimiter = [string](Get-UlsObjectPropertyValue -Object $base -Name 'Delimiter' -Default (Get-UlsObjectPropertyValue -Object $GeneratedProfile -Name 'Delimiter' -Default ','))
             DenyByDefault = [bool](Get-UlsObjectPropertyValue -Object $base -Name 'DenyByDefault' -Default $true)
         }
+        $protection = Get-UlsObjectPropertyValue -Object $GeneratedProfile -Name 'Protection' -Default $null
+        if ($protection) { $merged.Protection = $protection }
         $pass = Get-UlsObjectPropertyValue -Object $base -Name 'PassThroughRegex' -Default $null
         if ($pass) { $merged.PassThroughRegex = [string]$pass }
         $free = Get-UlsObjectPropertyValue -Object $base -Name 'FreeTextRegex' -Default $null
@@ -5554,6 +5723,11 @@ function New-ScrubProfileFromSample {
         [switch]$ProfileWizard,
         [int]$MaxSampleRows = 500,
         [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
+        [switch]$ProtectGeneratedProfile,
+        [string]$Salt,
+        [string]$SaltFromEnv,
+        [string]$SaltFile,
+        [int]$HmacLength = $script:HmacLength,
         [switch]$Force,
         [switch]$NonInteractive
     )
@@ -5577,6 +5751,16 @@ function New-ScrubProfileFromSample {
     $reportPath = Resolve-OutPath -Path $reportPath
     if ((Test-Path -LiteralPath $reportPath) -and -not $Force) { throw "Profile report already exists: $reportPath. Use -Force to overwrite." }
 
+    if ($ProtectGeneratedProfile) {
+        $resolvedSalt = Resolve-UlsSaltInput -Salt $Salt -SaltFromEnv $SaltFromEnv -SaltFile $SaltFile
+        if ([string]::IsNullOrWhiteSpace($resolvedSalt)) {
+            throw "Protected generated profiles require -Salt, -SaltFromEnv, or -SaltFile."
+        }
+        $script:Salt = $resolvedSalt
+        if ($HmacLength -lt 4 -or $HmacLength -gt 64) { throw "HmacLength must be between 4 and 64 for protected generated profiles." }
+        $script:HmacLength = $HmacLength
+    }
+
     Write-Work "Analyzing sample log(s) locally"
     $analysis = Invoke-SampleProfileAnalysis -Files $files -SampleFormat $SampleFormat -MaxSampleRows $MaxSampleRows
     if ($analysis.Stats.Rows -eq 0 -and $analysis.Stats.Columns.Count -eq 0 -and $analysis.Stats.Labels.Count -eq 0) {
@@ -5586,6 +5770,7 @@ function New-ScrubProfileFromSample {
     $name = 'GeneratedSampleProfile'
     try { $name = ('Generated-' + [System.IO.Path]::GetFileNameWithoutExtension($files[0])) -replace '[^A-Za-z0-9_.-]', '-' } catch { }
     $profile = ConvertTo-GeneratedProfile -Analysis $analysis -Name $name -IncludeSeeds:($optional.IncludeSeeds) -IncludeAllowlist:($optional.IncludeAllowlist)
+    if ($ProtectGeneratedProfile) { $profile = Protect-UlsGeneratedProfile -Profile $profile }
     $profile = Merge-UlsGeneratedProfileWithBase -GeneratedProfile $profile -BaseProfile $BaseProfile -ProfileExtensionFile $ProfileExtensionFile
     $profile | ConvertTo-Json -Depth 8 | Set-Content -Path $outPath -Encoding UTF8
     [void](Test-ScrubProfile -Path $outPath -Quiet)
@@ -5602,6 +5787,7 @@ function New-ScrubProfileFromSample {
         RowsAnalyzed = $analysis.Stats.Rows
         SeedPath = $optional.SeedPath
         AllowlistPath = $optional.AllowlistPath
+        Protected = [bool]$ProtectGeneratedProfile
     }
 }
 
@@ -5725,7 +5911,21 @@ function Resolve-UlsTracerptPath {
     return [pscustomobject]@{ Path = $null; Tried = @($tried.ToArray()) }
 }
 
-function ConvertFrom-EtlToCsv {
+function ConvertFrom-EtlToCsvGetWinEvent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EtlPath,
+        [Parameter(Mandatory)][string]$OutCsv
+    )
+    if (-not (Test-Path -LiteralPath $EtlPath)) { throw "ETL not found: $EtlPath" }
+    $out = Resolve-OutPath -Path $OutCsv
+    $outDir = Split-Path -Parent $out
+    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    Write-Warn "ETL conversion output is UNSCRUBBED until the scrub step completes: $out"
+    return ConvertFrom-WinEventPathToCsv -InputPath $EtlPath -OutCsv $out -InputKind 'ETL' -ProgressMode 'Fast'
+}
+
+function ConvertFrom-EtlToCsvTracerpt {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$EtlPath,
@@ -5753,6 +5953,43 @@ function ConvertFrom-EtlToCsv {
     if (-not (Test-Path -LiteralPath $out)) { throw "tracerpt.exe completed but did not create expected CSV: $out" }
     Write-Ok "ETL converted: $out"
     return $out
+}
+
+function ConvertFrom-EtlToCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EtlPath,
+        [Parameter(Mandatory)][string]$OutCsv,
+        [string]$TracerptPath,
+        [ValidateSet('Auto','GetWinEvent','Tracerpt')][string]$EtlConverter = 'Auto'
+    )
+    if ($EtlConverter -eq 'GetWinEvent') {
+        try { return ConvertFrom-EtlToCsvGetWinEvent -EtlPath $EtlPath -OutCsv $OutCsv }
+        catch { throw "Get-WinEvent ETL conversion failed: $($_.Exception.Message)" }
+    }
+    if ($EtlConverter -eq 'Tracerpt') {
+        return ConvertFrom-EtlToCsvTracerpt -EtlPath $EtlPath -OutCsv $OutCsv -TracerptPath $TracerptPath
+    }
+
+    $nativeError = $null
+    try {
+        return ConvertFrom-EtlToCsvGetWinEvent -EtlPath $EtlPath -OutCsv $OutCsv
+    }
+    catch {
+        $nativeError = $_.Exception.Message
+        Write-Warn "Get-WinEvent ETL conversion failed; falling back to tracerpt.exe. $nativeError"
+        try {
+            $out = Resolve-OutPath -Path $OutCsv
+            if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue }
+        } catch { }
+    }
+
+    try {
+        return ConvertFrom-EtlToCsvTracerpt -EtlPath $EtlPath -OutCsv $OutCsv -TracerptPath $TracerptPath
+    }
+    catch {
+        throw "ETL conversion failed. Get-WinEvent: $nativeError tracerpt.exe: $($_.Exception.Message)"
+    }
 }
 
 # Best-effort native XLSX reader (first worksheet). Prefers the ImportExcel module
@@ -7845,12 +8082,24 @@ function Invoke-ScrubSelfTest {
             }
             catch { $etlRunRefused = ($_.Exception.Message -match 'requires -ConvertEtl') }
             & $assert $etlRunRefused "ETL input refuses conversion unless -ConvertEtl is supplied"
+            $etlNativeFailed = $false
+            try {
+                [void](ConvertFrom-EtlToCsv -EtlPath (Join-Path $recDir 'etl.etl') -OutCsv (Join-Path $recDir 'etl-native.csv') -EtlConverter GetWinEvent)
+            }
+            catch { $etlNativeFailed = ($_.Exception.Message -match 'Get-WinEvent ETL conversion failed') }
+            & $assert $etlNativeFailed "ETL converter supports explicit Get-WinEvent mode"
             $etlMissingTracerpt = $false
             try {
-                [void](ConvertFrom-EtlToCsv -EtlPath (Join-Path $recDir 'etl.etl') -OutCsv (Join-Path $recDir 'etl.csv') -TracerptPath (Join-Path $recDir 'missing-tracerpt.exe'))
+                [void](ConvertFrom-EtlToCsv -EtlPath (Join-Path $recDir 'etl.etl') -OutCsv (Join-Path $recDir 'etl.csv') -EtlConverter Tracerpt -TracerptPath (Join-Path $recDir 'missing-tracerpt.exe'))
             }
             catch { $etlMissingTracerpt = ($_.Exception.Message -match 'tracerpt\.exe was not found') }
-            & $assert $etlMissingTracerpt "ETL converter reports missing tracerpt.exe clearly"
+            & $assert $etlMissingTracerpt "ETL converter supports explicit tracerpt mode"
+            $etlAutoReportsBoth = $false
+            try {
+                [void](ConvertFrom-EtlToCsv -EtlPath (Join-Path $recDir 'etl.etl') -OutCsv (Join-Path $recDir 'etl-auto.csv') -TracerptPath (Join-Path $recDir 'missing-tracerpt.exe'))
+            }
+            catch { $etlAutoReportsBoth = ($_.Exception.Message -match 'Get-WinEvent' -and $_.Exception.Message -match 'tracerpt\.exe') }
+            & $assert $etlAutoReportsBoth "ETL auto mode reports native failure and tracerpt fallback failure"
         }
         finally { $script:Salt = $recSalt }
 
@@ -8249,6 +8498,44 @@ function Invoke-ScrubSelfTest {
         & $assert ($builtBaseText -match '"BaseProfile"\s*:\s*"Logfmt"') "profile builder records base profile"
         & $assert ($builtBaseText -match 'SelfTestExtension') "profile builder records extension source"
         & $assert ($builtBaseText -match 'ExtensionCaseId') "profile builder merges extension rules into standalone profile"
+
+        $protectedSample = Join-Path $builder 'protected_profile.csv'
+        @(
+            'ProjectFalconUser,ProjectFalconHost,TicketMessage',
+            '"stealthalias","secret-host-01","Project Falcon Owner: owneralias ticket ok"'
+        ) | Set-Content -Path $protectedSample -Encoding UTF8
+        $protectedProfileOut = Join-Path $builder 'protected_profile.json'
+        $protectedReportOut = Join-Path $builder 'protected_profile_report_DO_NOT_UPLOAD.md'
+        $protectedNoSaltFailed = $false
+        try {
+            [void](New-ScrubProfileFromSample -Path $protectedSample -ProfileOut (Join-Path $builder 'protected_no_salt.json') -ProfileReportOut (Join-Path $builder 'protected_no_salt_report_DO_NOT_UPLOAD.md') -ProtectGeneratedProfile -MaxSampleRows 50 -Force -NonInteractive)
+        } catch { $protectedNoSaltFailed = ($_.Exception.Message -match 'require -Salt') }
+        & $assert $protectedNoSaltFailed "protected profile generation requires explicit salt source"
+        $protectedBuilt = New-ScrubProfileFromSample -Path $protectedSample -ProfileOut $protectedProfileOut -ProfileReportOut $protectedReportOut -ProtectGeneratedProfile -Salt 'selftest-fixed-salt' -HmacLength 24 -MaxSampleRows 50 -Force -NonInteractive
+        $protectedText = Get-Content -Path $protectedBuilt.ProfilePath -Raw
+        & $assert ($protectedText -match '"Protection"\s*:') "protected profile records protection metadata"
+        & $assert ($protectedText -match 'FIELD_[A-F0-9]{24}') "protected profile stores salted column tokens"
+        & $assert ($protectedText -match 'LABEL_[A-F0-9]{24}') "protected profile stores salted label tokens"
+        foreach ($raw in @('ProjectFalconUser','ProjectFalconHost','Project Falcon Owner')) {
+            & $assert (-not ($protectedText -match [regex]::Escape($raw))) "protected profile omits raw generated rule text: $raw"
+        }
+        & $assert (Test-ScrubProfile -Path $protectedBuilt.ProfilePath -Quiet) "protected profile imports with matching salt"
+        $oldSaltForProtected = $script:Salt
+        $oldLenForProtected = $script:HmacLength
+        $script:Salt = 'wrong-selftest-salt'
+        $protectedWrongSaltRejected = -not (Test-ScrubProfile -Path $protectedBuilt.ProfilePath -Quiet)
+        $script:Salt = 'selftest-fixed-salt'
+        $script:HmacLength = 16
+        $protectedWrongLenRejected = -not (Test-ScrubProfile -Path $protectedBuilt.ProfilePath -Quiet)
+        $script:Salt = $oldSaltForProtected
+        $script:HmacLength = $oldLenForProtected
+        & $assert $protectedWrongSaltRejected "protected profile rejects mismatched salt fingerprint"
+        & $assert $protectedWrongLenRejected "protected profile rejects mismatched HMAC length"
+        $protectedRun = Invoke-UniversalScrubber -Path $protectedSample -WorkDir (Join-Path $builder 'protected-out') -ProfileFile $protectedBuilt.ProfilePath -Salt 'selftest-fixed-salt' -HmacLength 24 -MapSource Discover -TokenMapMode Replace -NonInteractive
+        $protectedScrubbed = Get-Content -Path (@($protectedRun)[0].Output) -Raw
+        foreach ($raw in @('stealthalias','secret-host-01','owneralias')) {
+            & $assert (-not ($protectedScrubbed -match [regex]::Escape($raw))) "protected profile scrub removes: $raw"
+        }
 
         # ---- 6) Streaming vs normal equivalence ----
         Write-Rule "Streaming equivalence"
@@ -8708,6 +8995,7 @@ function Invoke-UniversalScrubber {
         [switch]$ProfileWizard,
         [int]$MaxSampleRows = 500,
         [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
+        [switch]$ProtectGeneratedProfile,
         [string]$SafeBundleOut,
         [switch]$Force,
         [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = 'Balanced',
@@ -8719,6 +9007,8 @@ function Invoke-UniversalScrubber {
         [string]$SaltFile,
         [switch]$KeepIntermediate,
         [switch]$ConvertEtl,
+        [ValidateSet('Auto','GetWinEvent','Tracerpt')][string]$EtlConverter = 'Auto',
+        [string]$TracerptPath,
         [switch]$Recurse,
         [string[]]$Include,
         [string[]]$Exclude,
@@ -8840,7 +9130,7 @@ function Invoke-UniversalScrubber {
         }
         if ([string]::IsNullOrWhiteSpace($ProfileOut)) { $ProfileOut = Join-Path $WorkDir 'generated-profile.json' }
         if ([string]::IsNullOrWhiteSpace($ProfileReportOut)) { $ProfileReportOut = Join-Path $WorkDir 'profile_build_report_DO_NOT_UPLOAD.md' }
-        return New-ScrubProfileFromSample -Path $Path -ProfileOut $ProfileOut -ProfileReportOut $ProfileReportOut -BaseProfile $BaseProfile -ProfileExtensionFile $ProfileExtensionFile -ProfileWizard:$ProfileWizard -MaxSampleRows $MaxSampleRows -SampleFormat $SampleFormat -Force:$Force -NonInteractive:$NonInteractive
+        return New-ScrubProfileFromSample -Path $Path -ProfileOut $ProfileOut -ProfileReportOut $ProfileReportOut -BaseProfile $BaseProfile -ProfileExtensionFile $ProfileExtensionFile -ProfileWizard:$ProfileWizard -MaxSampleRows $MaxSampleRows -SampleFormat $SampleFormat -ProtectGeneratedProfile:$ProtectGeneratedProfile -Salt $Salt -SaltFromEnv $SaltFromEnv -SaltFile $SaltFile -HmacLength $HmacLength -Force:$Force -NonInteractive:$NonInteractive
     }
 
     # --- Input file(s) ---
@@ -8926,11 +9216,11 @@ function Invoke-UniversalScrubber {
                 }
                 elseif ($ext2 -eq '.etl') {
                     if (-not $ConvertEtl) {
-                        throw "ETL file '$($t.Name)' requires -ConvertEtl to run tracerpt.exe locally. Or convert the ETL to CSV/XML/text yourself and scrub the converted output."
+                        throw "ETL file '$($t.Name)' requires -ConvertEtl to run local ETL conversion. Auto tries Get-WinEvent first and falls back to tracerpt.exe; or convert the ETL to CSV/XML/text yourself and scrub the converted output."
                     }
                     $key = ($t.BaseName + '.etl.csv').ToLowerInvariant()
                     $outCsv = Get-SafeDerivedPath -InputPath $t.FullName -OutDir $WorkDir -Suffix '.etl.csv' -UseHash:($conversionNameCounts[$key] -gt 1)
-                    [void](ConvertFrom-EtlToCsv -EtlPath $t.FullName -OutCsv $outCsv)
+                    [void](ConvertFrom-EtlToCsv -EtlPath $t.FullName -OutCsv $outCsv -EtlConverter $EtlConverter -TracerptPath $TracerptPath)
                     if (Test-Path -LiteralPath $outCsv) { $converted = Get-Item -LiteralPath $outCsv }
                 }
                 elseif ($ext2 -eq '.xlsx') {

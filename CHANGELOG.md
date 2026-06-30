@@ -1,5 +1,21 @@
 # Changelog
 
+## v4.15.1
+
+- Added `-EtlConverter` for explicit ETL conversion selection:
+  `Auto`, `GetWinEvent`, or `Tracerpt`. `Auto` tries native `Get-WinEvent`
+  first and falls back to `tracerpt.exe`.
+- Added `-TracerptPath` to point ETL fallback at a known `tracerpt.exe`
+  location.
+- Added `-ProtectGeneratedProfile` for sample-built BYOP profiles. Protected
+  generated profiles store sample-derived column/key names and label strings as
+  salted `FIELD_` and `LABEL_` HMAC tokens while remaining runnable with the same
+  salt and HMAC length.
+- Added fail-closed protected profile import checks for salt fingerprint and
+  HMAC length mismatches.
+- Extended self-test coverage for ETL converter selection/fallback messaging and
+  protected generated CSV/text profile behavior.
+
 ## v4.15.0
 
 - Added unified compact progress feedback across discovery, streaming scrub,

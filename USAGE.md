@@ -4,7 +4,7 @@ This guide is written for people who need to safely prepare logs for external
 analysis, including LLM-assisted analysis, without sending sensitive values out
 of a secure environment.
 
-This guide covers Universal Log Scrubber v4.15.0.
+This guide covers Universal Log Scrubber v4.15.1.
 
 The short version:
 
@@ -217,8 +217,8 @@ Notes for Intune Diagnostics:
 
 - `.log`, `.txt`, `.reg`, `.html`, and `.xml` are treated as local text/report
   inputs.
-- ETL traces are not parsed natively in v4.15. Convert them to `.log`,
-  `.txt`, or `.csv` with your existing workflow first.
+- ETL conversion is explicit with `-ConvertEtl`. By default, v4.15.1 tries
+  `Get-WinEvent` first and falls back to `tracerpt.exe`.
 - CAB archives are not expanded by the scrubber. Extract approved contents or
   remove archives that are not needed for review.
 - Keep using BYOP for organization-specific report fields, vendor labels, or
@@ -248,6 +248,12 @@ What this creates:
   sample values by default.
 - `profile_build_report_DO_NOT_UPLOAD.md`: local-only evidence report with raw
   examples, suggestions, and confidence hints.
+
+If sample-derived column/key names or labels are sensitive, add
+`-ProtectGeneratedProfile` and provide the same salt source you will use when
+running that profile. Protected profiles store those generated matches as salted
+`FIELD_` and `LABEL_` tokens and fail closed if the salt fingerprint or HMAC
+length does not match.
 
 Optional wizard mode:
 
@@ -571,7 +577,7 @@ Test-LogFormat -Path .\samples\logs -Recurse
 Use synthetic or approved local logs for dry-run validation. The dry run previews
 what would be detected and tokenized without writing scrubbed output files.
 
-# v4.15 Usage Addendum
+# v4.15.1 Usage Addendum
 
 ## Enterprise Exports
 
@@ -632,15 +638,34 @@ Invoke-UniversalScrubber `
 
 The profile output is designed to be edited and committed if it contains no raw sensitive values. The report, seed files, token maps, salts, converted intermediates, and scrub manifests remain local-only.
 
+Protect generated field and label names when those names may reveal sensitive
+local context:
+
+```powershell
+Invoke-UniversalScrubber `
+  -BuildProfileFromSample `
+  -Path .\sample-ticket-export.csv `
+  -ProfileOut .\servicenow-protected.json `
+  -ProtectGeneratedProfile `
+  -SaltFile .\salt.txt `
+  -Force `
+  -NonInteractive
+```
+
 ## ETL, Office, And Converted Intermediates
 
 ETL conversion is opt-in:
 
 ```powershell
-Invoke-UniversalScrubber -Path .\diagnostic.etl -ConvertEtl -Profile Generic -SaltFile .\salt.txt -NonInteractive
+Invoke-UniversalScrubber -Path .\diagnostic.etl -ConvertEtl -EtlConverter Auto -Profile Generic -SaltFile .\salt.txt -NonInteractive
 ```
 
-The command uses Windows `tracerpt.exe` when available. If `tracerpt.exe` is unavailable, convert the ETL to CSV, XML, or text with your normal diagnostic workflow, then scrub the converted file.
+`-EtlConverter Auto` tries native `Get-WinEvent` first and falls back to
+Windows `tracerpt.exe`. Use `-EtlConverter GetWinEvent` or
+`-EtlConverter Tracerpt` to force one path. Use `-TracerptPath` when tracerpt is
+installed in a nonstandard location. If conversion is unsupported for a trace,
+convert the ETL to CSV, XML, or text with your normal diagnostic workflow, then
+scrub the converted file.
 
 DOCX, PPTX, XLSX, HTML, XML, REG, ETL, and other converted intermediates may contain raw sensitive data until the scrub step completes. Keep work directories local and do not upload token maps, salts, manifests, converted intermediates, or `*_DO_NOT_UPLOAD*` reports.
 
