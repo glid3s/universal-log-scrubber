@@ -10,10 +10,11 @@ These files are synthetic. They are safe to commit and safe to use for demos.
 
 Do not replace them with real client logs. If you need a new fixture, fictionalize it first.
 
-External public corpora downloaded through v4.13.0 tools belong in
-`samples/external-corpora/` by default. That folder is ignored by git because
-public corpora may be raw, unsanitized, realistic, offensive, or
-license-restricted.
+v4.15 also supports local enterprise exports and diagnostic reports such as
+ServiceNow, Nexthink, SCCM/MECM, Intune CSV/XLSX exports, Intune Diagnostics
+`.log`/`.txt`/`.reg`/`.html`/`.xml` reports, and DOCX/PPTX text extraction. Do
+not add real examples of those files to this folder; use synthetic fixtures or
+keep raw exports in a local ignored work directory.
 
 ## Quick sample smoke test
 
@@ -24,32 +25,6 @@ From the repository root:
 ```
 
 The script runs dry-run and real scrub passes against the sample files and verifies that each real scrub reports clean output.
-
-## Optional external corpus catalog
-
-List curated public corpus entries:
-
-```powershell
-.\scripts\Get-SampleLogs.ps1
-```
-
-Save a small direct-download corpus sample after reviewing source warnings:
-
-```powershell
-.\scripts\Get-SampleLogs.ps1 -Name Loghub-Apache -AcceptRisk
-```
-
-Run local recommendation and dry-run smoke tests over downloaded corpora:
-
-```powershell
-Invoke-ExternalCorpusSmokeTest `
-  -CorpusRoot .\samples\external-corpora `
-  -Recurse `
-  -UseRecommendations `
-  -DryRunOnly `
-  -Salt "preview-only" `
-  -NonInteractive
-```
 
 ## Manual examples
 
@@ -111,3 +86,20 @@ $env:SCRUB_SALT = 'sample-only-do-not-use-in-production'
 | `sample-seeds.txt` | Fictional shapeless terms that should be scrubbed. |
 | `sample-allowlist.txt` | Public/diagnostic values that should stay readable. |
 
+# v4.15 Sample Coverage
+
+The committed `samples/logs` folder contains only synthetic fixtures. It now includes examples for:
+
+- Application NDJSON and cloud audit JSONL.
+- Sentinel-style incident/alert JSONL and EDR/XDR alert JSONL.
+- ServiceNow, Nexthink, SCCM/MECM, Intune, and M365/identity CSV exports.
+- Firewall/VPN syslog or key=value text and structured Windows Event CSV.
+- Intune diagnostic `.reg`, `.html`, and `.xml` reports.
+
+Run the public sample smoke test:
+
+```powershell
+.\scripts\Test-SampleLogs.ps1
+```
+
+Sample outputs are written under `samples/out/` and are ignored. Treat any token maps, salts, manifests, converted intermediates, and generated reports as local-only artifacts.

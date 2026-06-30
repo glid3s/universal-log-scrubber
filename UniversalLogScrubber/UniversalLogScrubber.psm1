@@ -168,14 +168,13 @@
     * -AutoProfile can choose one high-confidence profile for uniform inputs and
       refuses mixed/low-confidence folders in noninteractive mode.
 
-  v4.13 ADDS
+  v4.15 ADDS
   ----------
-    * External corpus catalog commands help operators find and optionally fetch
-      curated public log samples without committing downloaded corpora.
-    * Save-LogCorpusSample requires explicit risk acceptance before direct
-      downloads and writes local manifests with source and hash evidence.
-    * Invoke-ExternalCorpusSmokeTest runs optional recommendation/dry-run checks
-      over local corpus folders and writes local CSV/JSON/Markdown summaries.
+    * Enterprise profile recommendations for ServiceNow, Nexthink, SCCM/ConfigMgr,
+      Intune, M365/identity audit, Sentinel/cloud audit, EDR/XDR, and firewall logs.
+    * -ProfileExtensionFile adds local BYOP overlays without copying an entire
+      built-in profile.
+    * .etl intake is explicit with -ConvertEtl and uses Windows tracerpt.exe.
 
   CONSISTENCY GUARANTEE
   ---------------------
@@ -210,7 +209,7 @@
 # REGION: Session state (shared by every stage)
 # =====================================================================
 $script:ModuleName       = 'UniversalLogScrubber'
-$script:ModuleVersion    = '4.14.0'
+$script:ModuleVersion    = '4.15.0'
 $script:Salt             = $null
 $script:HmacLength       = 24
 $script:TokenByNorm      = @{}     # normalized-value -> token (the loaded map)
@@ -271,6 +270,70 @@ $script:PerfReportDetailedEnabled = $false
 $script:PerfReportRows = $null
 $script:PerfReportPath = $null
 $script:PerfReportTextPath = $null
+
+# Compact, consistent progress rendering. Keep status short because hosts often
+# truncate Write-Progress status text before the most useful data.
+$script:UlsProgressState = @{}
+function Write-UlsProgress {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Activity,
+        [string]$Phase,
+        [string]$File,
+        [long]$RowsDone = -1,
+        [long]$RowsTotal = -1,
+        [long]$BytesDone = -1,
+        [long]$BytesTotal = -1,
+        [int]$Workers = -1,
+        [int]$Pending = -1,
+        [int]$Ready = -1,
+        [int]$CompletedBatches = -1,
+        [switch]$Completed,
+        [switch]$Force,
+        [int]$MinIntervalMs = 1000
+    )
+
+    if ($Completed) {
+        Write-Progress -Activity $Activity -Completed
+        $script:UlsProgressState.Remove($Activity)
+        return
+    }
+
+    $now = [datetime]::UtcNow
+    $state = $script:UlsProgressState[$Activity]
+    if ($null -eq $state) {
+        $state = [pscustomobject]@{ LastUtc = $now.AddMilliseconds(-1 * ($MinIntervalMs + 1)); StartUtc = $now }
+        $script:UlsProgressState[$Activity] = $state
+    }
+    if (-not $Force -and (($now - $state.LastUtc).TotalMilliseconds -lt $MinIntervalMs)) { return }
+
+    $bits = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($Phase)) { [void]$bits.Add($Phase) }
+    if ($RowsDone -ge 0) {
+        if ($RowsTotal -gt 0) { [void]$bits.Add(("rows {0}/{1}" -f $RowsDone, $RowsTotal)) }
+        else { [void]$bits.Add(("rows {0}" -f $RowsDone)) }
+    }
+    if ($BytesDone -ge 0) {
+        $mbDone = [Math]::Round(($BytesDone / 1MB), 1)
+        if ($BytesTotal -gt 0) { [void]$bits.Add(("{0}/{1} MB" -f $mbDone, [Math]::Round(($BytesTotal / 1MB), 1))) }
+        else { [void]$bits.Add(("{0} MB" -f $mbDone)) }
+    }
+    if ($Workers -ge 0) { [void]$bits.Add(("workers {0}" -f $Workers)) }
+    if ($Pending -ge 0) { [void]$bits.Add(("pending {0}" -f $Pending)) }
+    if ($Ready -ge 0) { [void]$bits.Add(("ready {0}" -f $Ready)) }
+    if ($CompletedBatches -ge 0) { [void]$bits.Add(("batches {0}" -f $CompletedBatches)) }
+    $elapsed = [Math]::Max(0.001, ($now - $state.StartUtc).TotalSeconds)
+    if ($RowsDone -gt 0) { [void]$bits.Add(("{0}/s" -f [Math]::Round(($RowsDone / $elapsed), 0))) }
+    [void]$bits.Add(("elapsed {0}" -f ([TimeSpan]::FromSeconds([Math]::Round($elapsed)).ToString("mm\:ss"))))
+
+    $pct = -1
+    if ($BytesTotal -gt 0 -and $BytesDone -ge 0) { $pct = [Math]::Min(100, [Math]::Max(0, [int](($BytesDone / [double]$BytesTotal) * 100))) }
+    elseif ($RowsTotal -gt 0 -and $RowsDone -ge 0) { $pct = [Math]::Min(100, [Math]::Max(0, [int](($RowsDone / [double]$RowsTotal) * 100))) }
+
+    $label = if ([string]::IsNullOrWhiteSpace($File)) { $Activity } else { ("{0}: {1}" -f $Activity, $File) }
+    Write-Progress -Activity $label -Status (($bits.ToArray()) -join '; ') -PercentComplete $pct
+    $state.LastUtc = $now
+}
 
 function New-UlsPerfStopwatch {
     if (-not $script:PerfReportEnabled) { return $null }
@@ -2006,7 +2069,7 @@ function New-ScrubTokenMap {
                         try {
                             if ($fileLength -gt 0) { $pct = [Math]::Min(99, [Math]::Max(0, [int](([int64]$reader.BaseStream.Position * 100.0) / [double]$fileLength))) }
                         } catch { }
-                        Write-Progress -Activity "Discovering identifiers in $name" -Status "Row $rn ($($seen.Count) unique so far)" -PercentComplete $pct
+                        Write-UlsProgress -Activity "Discover" -Phase ("unique {0}" -f $seen.Count) -File $name -RowsDone $rn -BytesDone ([int64]$reader.BaseStream.Position) -BytesTotal $fileLength
                     }
                     $rowPrincipals = @{}   # localpart -> list of norms seen in THIS row
                     for ($ci = 0; $ci -lt $headers.Count; $ci++) {
@@ -2049,7 +2112,7 @@ function New-ScrubTokenMap {
             }
             finally {
                 try { $reader.Close() } catch { }
-                Write-Progress -Activity "Discovering identifiers in $name" -Completed
+                Write-UlsProgress -Activity "Discover" -File $name -Completed
             }
             $ulsPerfDiscoverNotes = 'CSV cell identifier scan'
             if ($discoverSkipColumns.Count -gt 0) {
@@ -2103,7 +2166,7 @@ function New-ScrubTokenMap {
             $candidateNo = 0
             $lastProgress = [DateTime]::UtcNow.AddSeconds(-10)
             $activity = "Discovering identifiers in $name"
-            Write-Progress -Activity $activity -Status "Streaming $fileLength bytes" -PercentComplete -1
+            Write-UlsProgress -Activity "Discover" -Phase "start" -File $name -BytesDone 0 -BytesTotal $fileLength -Force
             $reader = [System.IO.StreamReader]::new($file)
             try {
                 while (-not $reader.EndOfStream) {
@@ -2121,7 +2184,7 @@ function New-ScrubTokenMap {
                         } catch { $pct = -1 }
                         $status = "Line $lineNo; $($seen.Count) unique so far"
                         if ($fileLength -gt 0) { $status = "$status; $([Math]::Round(($reader.BaseStream.Position / 1MB),1)) MB / $([Math]::Round(($fileLength / 1MB),1)) MB" }
-                        Write-Progress -Activity $activity -Status $status -PercentComplete $pct
+                        Write-UlsProgress -Activity "Discover" -Phase ("unique {0}" -f $seen.Count) -File $name -RowsDone $lineNo -BytesDone ([int64]$reader.BaseStream.Position) -BytesTotal $fileLength
                         $lastProgress = $now
                     }
 
@@ -2143,7 +2206,7 @@ function New-ScrubTokenMap {
             }
             finally {
                 try { $reader.Close() } catch { }
-                Write-Progress -Activity $activity -Completed
+                Write-UlsProgress -Activity "Discover" -File $name -Completed
             }
             if ($ulsPerfReadText) { $ulsPerfReadText.Stop() }
             if ($ulsPerfDiscoverText) { $ulsPerfDiscoverText.Stop() }
@@ -2268,7 +2331,7 @@ function New-ScrubTokenMapFromAD {
     Write-Work "Enumerating AD users, groups and computers..."
     foreach ($r in $searcher.FindAll()) {
         $count++
-        if ($count % 500 -eq 0) { Write-Progress -Activity "Reading Active Directory" -Status "$count objects ($($seen.Count) aliases)" -PercentComplete -1 }
+        if ($count % 500 -eq 0) { Write-UlsProgress -Activity "Read AD" -Phase ("aliases {0}" -f $seen.Count) -RowsDone $count }
         $sidBytes = Get-One $r "objectSid"
         if (-not $sidBytes) { continue }
         $sid = Convert-ObjectSidToString -ObjectSid $sidBytes
@@ -2327,7 +2390,7 @@ function New-ScrubTokenMapFromAD {
             }
         }
     }
-    Write-Progress -Activity "Reading Active Directory" -Completed
+    Write-UlsProgress -Activity "Read AD" -Completed
     }
     catch {
         Write-Warn "AD enumeration interrupted: $($_.Exception.Message)"
@@ -2445,7 +2508,7 @@ function Get-ScrubProfile {
         Name='IIS'; Description='IIS / W3C access logs (.log with a #Fields header).'; Format='Csv'; Delimiter=','
         PassThroughRegex='^(date|time|time-taken|sc-status|sc-substatus|sc-win32-status|sc-bytes|cs-bytes|s-port|cs-method|cs-version)$'
         ColumnPrefix=@(
-            @{ Pattern='c-ip|s-ip|x-forwarded|ip'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:c-ip|s-ip|x-forwarded|x-forwarded-for|ip|ipaddr|ipaddress)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='username|cs-username|user'; Prefix='PRINCIPAL'; DollarComputer=$true },
             @{ Pattern='host|computername|s-computername|cs-host'; Prefix='DNS' }
         )
@@ -2482,18 +2545,34 @@ function Get-ScrubProfile {
         ColumnPrefix=@(
             @{ Pattern='user|principal|actor|caller|identity|assumedrole|arn'; Prefix='PRINCIPAL'; DollarComputer=$true },
             @{ Pattern='tenant|account|subscription|project|organization|org'; Prefix='X500' },
-            @{ Pattern='source|client|remote|ip|address'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:source|client|remote|ip|ipaddr|ipaddress|address|addr)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='host|resource|instance|node|cluster'; Prefix='DNS' },
             @{ Pattern='request|correlation|trace|session|eventid'; Prefix='OBJECT' }
         )
         FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
     }
-    $firewall = [pscustomobject]@{
-        Name='Firewall'; Description='Firewall and network security logs with source/destination addresses, users, devices, and rules.'; Format='Csv'; Delimiter=','
+    $firewallText = [pscustomobject]@{
+        Name='Firewall'; Description='Firewall/VPN syslog and key=value text logs with source/destination addresses, users, devices, and rules.'; Format='Kv'; Delimiter=','
+        PassThroughRegex=$null
+        ColumnPrefix=@(
+            @{ Pattern='(^|[_\-. ])(?:src|dst|source|destination|client|remote|ip|ipaddr|ipaddress|addr|address)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='user|account|principal|identity|login'; Prefix='PRINCIPAL'; DollarComputer=$true },
+            @{ Pattern='host|device|gateway|server|clientname|fqdn|domain'; Prefix='DNS' },
+            @{ Pattern='url|uri|endpoint'; Prefix='URI' },
+            @{ Pattern='session|correlation|request|rule|policy'; Prefix='OBJECT' }
+        )
+        FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
+    }
+    $firewallTextAlias = [pscustomobject]@{
+        Name='FirewallText'; Description='Alias-style profile for firewall/VPN syslog and key=value text logs.'; Format='Kv'; Delimiter=','
+        PassThroughRegex=$firewallText.PassThroughRegex; ColumnPrefix=$firewallText.ColumnPrefix; FreeTextRegex=$firewallText.FreeTextRegex; DenyByDefault=$firewallText.DenyByDefault; AllowedDomains=$firewallText.AllowedDomains
+    }
+    $firewallCsv = [pscustomobject]@{
+        Name='FirewallCsv'; Description='Structured firewall/network security CSV exports with source/destination addresses, users, devices, and rules.'; Format='Csv'; Delimiter=','
         PassThroughRegex='^(action|allow|deny|protocol|proto|port|src_port|dst_port|bytes|packets|rule|policy|severity|time|date|timestamp)$'
         ColumnPrefix=@(
-            @{ Pattern='src|dst|source|destination|client|remote|ip|addr|address'; Prefix='IP' },
-            @{ Pattern='user|account|principal|identity'; Prefix='PRINCIPAL' },
+            @{ Pattern='(^|[_\-. ])(?:src|dst|source|destination|client|remote|ip|ipaddr|ipaddress|addr|address)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='user|account|principal|identity'; Prefix='PRINCIPAL'; DollarComputer=$true },
             @{ Pattern='host|device|gateway|server|clientname'; Prefix='DNS' }
         )
         FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
@@ -2503,7 +2582,7 @@ function Get-ScrubProfile {
         PassThroughRegex='^(action|status|result|duration|bytes|port|protocol|time|date|timestamp|reason)$'
         ColumnPrefix=@(
             @{ Pattern='user|username|account|principal|identity|login'; Prefix='PRINCIPAL' },
-            @{ Pattern='client|remote|assigned|source|ip|address'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:client|remote|assigned|source|ip|ipaddr|ipaddress|address|addr)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='host|gateway|server|device'; Prefix='DNS' },
             @{ Pattern='session|correlation|request'; Prefix='OBJECT' }
         )
@@ -2514,7 +2593,7 @@ function Get-ScrubProfile {
         PassThroughRegex='^(action|status|category|method|http_method|response_code|bytes|time|date|timestamp|mime|user_agent)$'
         ColumnPrefix=@(
             @{ Pattern='user|username|account|principal'; Prefix='PRINCIPAL' },
-            @{ Pattern='client|source|remote|ip|address'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:client|source|remote|ip|ipaddr|ipaddress|address|addr)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='url|uri|referer|referrer|request'; Prefix='URI' },
             @{ Pattern='host|domain|fqdn|server'; Prefix='DNS' }
         )
@@ -2526,7 +2605,7 @@ function Get-ScrubProfile {
         ColumnPrefix=@(
             @{ Pattern='user|username|account|principal|actor|subject'; Prefix='PRINCIPAL' },
             @{ Pattern='host|server|machine|node|pod|container|service'; Prefix='DNS' },
-            @{ Pattern='ip|address|client|remote|source'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|client|remote|source)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='tenant|org|organization|domain'; Prefix='X500' },
             @{ Pattern='request|correlation|trace|span|session|transaction'; Prefix='OBJECT' },
             @{ Pattern='token|secret|password|key|authorization'; Prefix='SECRET' }
@@ -2539,7 +2618,7 @@ function Get-ScrubProfile {
         ColumnPrefix=@(
             @{ Pattern='user|login|principal|account|owner|schema'; Prefix='PRINCIPAL' },
             @{ Pattern='host|server|database|db|instance|client'; Prefix='DNS' },
-            @{ Pattern='ip|address|client'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|client)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='password|secret|connection|string|conn'; Prefix='SECRET' }
         )
         FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
@@ -2550,7 +2629,7 @@ function Get-ScrubProfile {
         ColumnPrefix=@(
             @{ Pattern='container|pod|node|host|image|service|namespace|cluster'; Prefix='DNS' },
             @{ Pattern='user|account|principal|serviceaccount'; Prefix='PRINCIPAL' },
-            @{ Pattern='ip|address'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='secret|token|key|password'; Prefix='SECRET' }
         )
         FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
@@ -2561,7 +2640,7 @@ function Get-ScrubProfile {
         ColumnPrefix=@(
             @{ Pattern='user|username|groups|serviceaccount|impersonated'; Prefix='PRINCIPAL' },
             @{ Pattern='pod|node|container|host|cluster|object|resource|namespace'; Prefix='DNS' },
-            @{ Pattern='source|ip|address'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:source|ip|ipaddr|ipaddress|address|addr)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='token|secret|authorization'; Prefix='SECRET' }
         )
         FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
@@ -2572,17 +2651,161 @@ function Get-ScrubProfile {
         ColumnPrefix=@(
             @{ Pattern='user|username|upn|email|account|principal|actor|target'; Prefix='UNMAPPED_UPN' },
             @{ Pattern='tenant|domain|realm|org|organization|directory'; Prefix='X500' },
-            @{ Pattern='ip|address|client|source|remote'; Prefix='IP' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|client|source|remote)(?:$|[_\-. ])'; Prefix='IP' },
             @{ Pattern='device|host|machine|computer'; Prefix='DNS' },
             @{ Pattern='session|correlation|request|token|jti'; Prefix='OBJECT' }
         )
         FreeTextRegex='.*'; DenyByDefault=$true; AllowedDomains=@()
     }
+    $serviceNow = [pscustomobject]@{
+        Name='ServiceNow'; Description='ServiceNow incident/change/task/CMDB exports with callers, assignees, CIs, notes, and URLs.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(number|sys_id|opened|opened_at|closed|closed_at|resolved|resolved_at|updated|sys_updated_on|created|sys_created_on|state|status|priority|impact|urgency|severity|category|subcategory|assignment_group|business_service|short_description|approval|active|made_sla|reassignment_count|calendar_duration|business_duration)$'
+        ColumnPrefix=@(
+            @{ Pattern='caller|opened_by|resolved_by|closed_by|assigned_to|requested_for|requested_by|watch_list|user|email|upn'; Prefix='PRINCIPAL'; DollarComputer=$true },
+            @{ Pattern='cmdb_ci|configuration_item|computer|host|device|server|node|endpoint|asset'; Prefix='COMPUTER' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|source|destination)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='company|department|domain|tenant|account'; Prefix='X500' },
+            @{ Pattern='url|uri|link|endpoint'; Prefix='URI' },
+            @{ Pattern='work_notes|comments|description|close_notes|additional_comments'; Prefix='OBJECT' },
+            @{ Pattern='token|secret|password|credential|key'; Prefix='SECRET' }
+        )
+        FreeTextRegex='work_notes|comments|description|notes|url|uri|link'
+        DenyByDefault=$false; AllowedDomains=@('service-now.com','servicenow.com')
+    }
+    $intuneDiagnostics = [pscustomobject]@{
+        Name='IntuneDiagnostics'; Description='Intune diagnostics bundle logs, MDM diagnostic reports, registry exports, XML/HTML reports, and command-output text.'; Format='Text'; Delimiter=','
+        PassThroughRegex='^(timestamp|time|date|status|state|result|level|severity|eventid|event_id|errorcode|error_code|hresult|policy|policyname|provider|operation|phase|step|count)$'
+        ColumnPrefix=@()
+        FreeTextRegex='(?i)(intune|mdm|omadm|deviceenroller|deviceenrollment|enrollment|autopilot|windows update|windowsupdate|policy|compliance|tenant|upn|user|device|serial|imei|wifi|ethernet|regedit|registry|html|xml)'
+        DenyByDefault=$false; AllowedDomains=@('microsoft.com','windows.net')
+        LabelRules=@(
+            @{ Name='IntuneUser'; Labels=@('UPN','User Principal Name','User','User Name','UserId','Primary User','Enrolled By'); Prefix='UNMAPPED_UPN' },
+            @{ Name='IntuneDevice'; Labels=@('Device Name','Managed Device Name','Computer Name','Hostname','Serial Number','IMEI','MEID','Azure AD Device ID','AAD Device ID'); Prefix='COMPUTER' },
+            @{ Name='IntuneNetwork'; Labels=@('IP Address','IPv4 Address','WiFi MAC Address','Ethernet MAC Address','MAC Address'); Prefix='OBJECT' },
+            @{ Name='IntuneTenant'; Labels=@('Tenant ID','Tenant Name','Domain Name','Enrollment UPN'); Prefix='X500' },
+            @{ Name='IntuneSecrets'; Labels=@('Token','Refresh Token','Access Token','Authorization','Bearer','Password','Client Secret'); Prefix='SECRET' }
+        )
+        CustomRegexRules=@(
+            @{
+                Name='RegistryUserSid'
+                Regex='(?i)(\\(?:Users|ProfileList)\\)(S-1-5-21-[0-9-]{10,})'
+                CaptureGroup=2
+                Prefix='SID'
+                Keywords=@('ProfileList','Users','S-1-5-21')
+                Entropy=0
+            },
+            @{
+                Name='HtmlAttributeSensitiveValue'
+                Regex='(?i)\b(?:data-user|data-upn|data-device|data-tenant)\s*=\s*["'']([^"'']{3,200})["'']'
+                CaptureGroup=1
+                Prefix='OBJECT'
+                Keywords=@('data-user','data-upn','data-device','data-tenant')
+                Entropy=0
+            },
+            @{
+                Name='IntuneDiagnosticSerialNumber'
+                Regex='(?i)\b(Serial\s+Number\s*[:=]\s*)([A-Z0-9][A-Z0-9._-]{5,})\b'
+                CaptureGroup=2
+                Prefix='COMPUTER'
+                Keywords=@('Serial Number')
+                Entropy=0
+            }
+        )
+    }
+    $nexthink = [pscustomobject]@{
+        Name='Nexthink'; Description='Nexthink device, user, binary, destination, campaign, and experience exports.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(timestamp|time|date|event_time|collector|score|status|state|severity|platform|os|os_version|version|binary_version|package_version|count|duration|latency|size|bytes|cpu|memory|disk|battery|wifi|execution_status)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|upn|email|account|employee|principal'; Prefix='PRINCIPAL'; DollarComputer=$true },
+            @{ Pattern='device|host|hostname|machine|computer|endpoint|collector|serial|asset'; Prefix='COMPUTER' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|remote|destination|source)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='domain|tenant|organization|department|entity'; Prefix='X500' },
+            @{ Pattern='url|uri|web|destination|dns|fqdn'; Prefix='DNS' },
+            @{ Pattern='campaign|survey|question|answer|comment|description'; Prefix='OBJECT' },
+            @{ Pattern='token|secret|password|credential|key'; Prefix='SECRET' }
+        )
+        FreeTextRegex='comment|description|campaign|question|answer|url|uri|destination'
+        DenyByDefault=$false; AllowedDomains=@('nexthink.com')
+    }
+    $sccm = [pscustomobject]@{
+        Name='Sccm'; Description='SCCM/MECM inventory, deployment, client, and collection exports.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(timestamp|time|date|site|site_code|status|state|result|compliance|deployment_status|client_status|active|obsolete|version|build|os|os_version|collection|collection_id|deployment_id|assignment_id|article_id|ci_id|resourceid|resource_id|model|manufacturer|count)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|last_logon|primary_user|upn|email|account'; Prefix='PRINCIPAL'; DollarComputer=$true },
+            @{ Pattern='device|resource|computer|machine|hostname|netbios|client|endpoint|serial|smbios|bios|asset'; Prefix='COMPUTER' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|subnet|boundary)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='(^|_)(mac|macaddress|mac_address|mac_addresses0)($|_)'; Prefix='MAC' },
+            @{ Pattern='domain|forest|tenant|department|org|organization'; Prefix='X500' },
+            @{ Pattern='package|application|app|program|software|publisher|product'; Prefix='OBJECT' },
+            @{ Pattern='url|uri|management_point|distribution_point|server'; Prefix='DNS' },
+            @{ Pattern='token|secret|password|credential|key'; Prefix='SECRET' }
+        )
+        FreeTextRegex='description|error|message|comment|url|uri|server|management|distribution'
+        DenyByDefault=$false; AllowedDomains=@()
+    }
+    $sccmText = [pscustomobject]@{
+        Name='SccmText'; Description='SCCM/MECM/ConfigMgr client, CMTrace, deployment, and management-point text logs.'
+        Format='Text'; Delimiter=','
+        PassThroughRegex=$null
+        ColumnPrefix=@()
+        FreeTextRegex='.*'
+        DenyByDefault=$true
+        AllowedDomains=@('microsoft.com','windows.net')
+        LabelRules=@(
+            @{ Name='ConfigMgrUser'; Labels=@('user','username','account','context','caller','primary user'); Prefix='PRINCIPAL'; Preserve=@('SYSTEM','LOCAL SYSTEM','NT AUTHORITY\SYSTEM') },
+            @{ Name='ConfigMgrDevice'; Labels=@('device','machine','computer','hostname','client','management point','distribution point','server'); Prefix='COMPUTER' },
+            @{ Name='ConfigMgrAddress'; Labels=@('ip','ip address','client ip','remote address','source address'); Prefix='IP' },
+            @{ Name='ConfigMgrUrl'; Labels=@('url','uri','mp','dp','endpoint'); Prefix='URI' }
+        )
+        CustomRegexRules=@(
+            @{
+                Name='CMTraceContext'
+                Regex='(?i)\bcontext="([^"]{3,180})"'
+                CaptureGroup=1
+                Prefix='PRINCIPAL'
+                Keywords=@('context=')
+                Entropy=0
+                Allowlist=@('SYSTEM','LOCAL SYSTEM','NT AUTHORITY\SYSTEM')
+            }
+        )
+    }
+    $intune = [pscustomobject]@{
+        Name='Intune'; Description='Microsoft Intune / Endpoint Manager device, app, policy, enrollment, and compliance exports.'; Format='Csv'; Delimiter=','
+        PassThroughRegex='^(timestamp|time|date|last_sync|enrolled_date|enrollment_date|compliance_state|compliant|managed|ownership|management_agent|platform|os|os_version|model|manufacturer|policy|policy_name|profile|assignment|state|status|result|risk|count|version)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|upn|email|primary_user|enrolled_by|owner|principal|account'; Prefix='UNMAPPED_UPN'; DollarComputer=$true },
+            @{ Pattern='device|device_name|managed_device|computer|host|machine|serial|imei|meid|azure_ad_device|aad_device|entra|endpoint'; Prefix='COMPUTER' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='(^|_)(mac|macaddress|mac_address|wifi|wi_?fi|ethernet)($|_)'; Prefix='MAC' },
+            @{ Pattern='tenant|domain|organization|department|group'; Prefix='X500' },
+            @{ Pattern='app|application|bundle|package|publisher|certificate|thumbprint'; Prefix='OBJECT' },
+            @{ Pattern='url|uri|server|endpoint'; Prefix='DNS' },
+            @{ Pattern='token|secret|password|credential|key'; Prefix='SECRET' }
+        )
+        FreeTextRegex='description|error|message|remediation|notes|url|uri'
+        DenyByDefault=$false; AllowedDomains=@('microsoft.com','windows.net')
+    }
+    $edr = [pscustomobject]@{
+        Name='Edr'; Description='EDR/XDR alert JSON or JSONL exports with devices, users, network destinations, commands, and evidence.'
+        Format='Json'; Delimiter=','
+        PassThroughRegex='^(timestamp|time|date|vendor|product|severity|level|status|state|action|verdict|process_name|parent_process|parent_process_name|file_name|sha1|sha256|md5|alert_id|event_id|rule|rule_name|tactic|technique)$'
+        ColumnPrefix=@(
+            @{ Pattern='user|username|user_email|upn|account|principal|identity'; Prefix='PRINCIPAL'; DollarComputer=$true },
+            @{ Pattern='device|device_name|device_id|host|hostname|machine|computer|endpoint|asset|sensor'; Prefix='COMPUTER' },
+            @{ Pattern='(^|[_\-. ])(?:ip|ipaddr|ipaddress|address|addr|remote_ip|local_ip|source|destination)(?:$|[_\-. ])'; Prefix='IP' },
+            @{ Pattern='domain|remote_domain|dns|fqdn|url|uri|endpoint'; Prefix='DNS' },
+            @{ Pattern='command|command_line|process_path|image_path|file_path|registry|evidence|description|message'; Prefix='OBJECT' },
+            @{ Pattern='token|secret|password|credential|key|authorization'; Prefix='SECRET' }
+        )
+        FreeTextRegex='command|command_line|process_path|image_path|file_path|registry|evidence|description|message|url|uri|domain'
+        DenyByDefault=$false; AllowedDomains=@('microsoft.com','windows.net')
+    }
 
     $all = [ordered]@{ Generic=$generic; CA=$ca; WindowsEventCsv=$win; Text=$text;
                        Tsv=$tsv; Psv=$psv; IIS=$iis; Syslog=$syslog; Apache=$apache; Cef=$cef; Logfmt=$logfmt;
-                       WebAccess=$webAccess; CloudAudit=$cloudAudit; Firewall=$firewall; Vpn=$vpn; Proxy=$proxy;
-                       AppJson=$appJson; Database=$database; Container=$container; Kubernetes=$kubernetes; IdentityProvider=$identityProvider }
+                       WebAccess=$webAccess; CloudAudit=$cloudAudit; Firewall=$firewallText; FirewallText=$firewallTextAlias; FirewallCsv=$firewallCsv; Vpn=$vpn; Proxy=$proxy;
+                       AppJson=$appJson; Database=$database; Container=$container; Kubernetes=$kubernetes; IdentityProvider=$identityProvider;
+                       ServiceNow=$serviceNow; IntuneDiagnostics=$intuneDiagnostics; Nexthink=$nexthink; Sccm=$sccm; SccmText=$sccmText; Intune=$intune; Edr=$edr }
     if ($Name) {
         foreach ($k in $all.Keys) { if ($k -ieq $Name) { return $all[$k] } }
         return $null
@@ -2596,7 +2819,7 @@ function Get-ScrubProfile {
 function __ULS_Legacy_Test_GeneratedScrubArtifactName_2196 {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
-    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|scrub_run_manifest|corpus-manifest|external-corpus-summary)') { return $true }
+    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|scrub_run_manifest)') { return $true }
     if ([System.IO.Path]::GetExtension($Name) -ieq '.zip') { return $true }
     return $false
 }
@@ -2648,7 +2871,7 @@ function Get-ReadableFileSample {
     if ($SampleLines -lt 1) { $SampleLines = 1 }
     $warnings = @()
     $ext = ([string]$File.Extension).ToLowerInvariant()
-    if ($ext -in @('.evtx','.xlsx','.zip')) {
+    if ($ext -in @('.evtx','.xlsx','.docx','.pptx','.doc','.ppt','.cab','.etl','.zip')) {
         $warnings += "File type is not sampled as plain text."
         return [pscustomobject]@{ Lines = @(); Text = ''; Warnings = $warnings }
     }
@@ -2717,15 +2940,119 @@ function Test-JsonLines {
     return ($ok -ge [Math]::Ceiling($checked * 0.8))
 }
 
+function Get-UlsEnterpriseProfileHint {
+    param(
+        [string[]]$Columns = @(),
+        [string]$Text = ''
+    )
+
+    $columnsSafe = @($Columns | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $textSafe = [string]$Text
+
+    $hints = @(
+        [pscustomobject]@{
+            Profile='ServiceNow'; Format='ServiceNow export'; Confidence=92
+            Patterns=@('(?i)^sys_id$','(?i)^number$','(?i)^short_description$','(?i)^work_notes$','(?i)^additional_comments$','(?i)^caller_id$','(?i)^opened_by$','(?i)^assigned_to$','(?i)^cmdb_ci$','(?i)^assignment_group$','(?i)^sys_created_on$','(?i)^sys_updated_on$')
+            TextPattern='(?i)\b(service[- ]?now|sys_id|work_notes|cmdb_ci|assignment_group|additional_comments)\b'
+            Reason='Header/sample contains ServiceNow task, CMDB, caller, assignee, or work-note fields.'
+            MinHits=3
+        }
+        [pscustomobject]@{
+            Profile='Nexthink'; Format='Nexthink export'; Confidence=90
+            Patterns=@('(?i)^device_uid$','(?i)^device_name$','(?i)^device\.name$','(?i)^device\.collector\.uid$','(?i)^user_name$','(?i)^user\.name$','(?i)^user\.email$','(?i)^user_sid$','(?i)^binary_name$','(?i)^binary\.name$','(?i)^remote_action$','(?i)^remote_action\.name$','(?i)^campaign$','(?i)^campaign\.name$','(?i)^execution_status$','(?i)^execution\.status$','(?i)^collector$','(?i)^experience_score$','(?i)^destination$','(?i)^destination\.name$','(?i)^destination\.ip$')
+            TextPattern='(?i)\b(nexthink|device_uid|remote_action|experience_score|execution_status|binary_name)\b'
+            Reason='Header/sample contains Nexthink device, user, binary, campaign, or remote-action fields.'
+            MinHits=3
+        }
+        [pscustomobject]@{
+            Profile='Sccm'; Format='SCCM/MECM export'; Confidence=91
+            Patterns=@('(?i)^ResourceID$','(?i)^SMSUniqueIdentifier$','(?i)^Name0$','(?i)^User_Name0$','(?i)^CollectionID$','(?i)^DeploymentID$','(?i)^SiteCode$','(?i)^PackageID$','(?i)^ApplicationName$','(?i)^ClientVersion$','(?i)^LastLogonUserName$','(?i)^MAC_Addresses0$','(?i)^SerialNumber0$')
+            TextPattern='(?i)\b(SMSUniqueIdentifier|ResourceID|CollectionID|DeploymentID|SiteCode|ClientVersion|MECM|SCCM)\b'
+            Reason='Header/sample contains SCCM/MECM inventory, client, collection, or deployment fields.'
+            MinHits=3
+        }
+        [pscustomobject]@{
+            Profile='Intune'; Format='Intune export'; Confidence=91
+            Patterns=@('(?i)^managedDeviceName$','(?i)^managed device id$','(?i)^deviceName$','(?i)^device name$','(?i)^userPrincipalName$','(?i)^user principal name$','(?i)^primary user$','(?i)^email address$','(?i)^azureADDeviceId$','(?i)^azure ad device id$','(?i)^complianceState$','(?i)^compliance$','(?i)^managementAgent$','(?i)^enrolledDateTime$','(?i)^deviceEnrollmentType$','(?i)^serialNumber$','(?i)^serial number$','(?i)^imei$','(?i)^wiFiMacAddress$','(?i)^wi-fi mac$','(?i)^ethernetMacAddress$','(?i)^ownerType$','(?i)^operatingSystem$','(?i)^os$','(?i)^osVersion$','(?i)^os version$','(?i)^last check-in$')
+            TextPattern='(?i)\b(Intune|Endpoint Manager|managedDeviceName|azureADDeviceId|complianceState|managementAgent|deviceEnrollmentType)\b'
+            Reason='Header/sample contains Intune device, enrollment, compliance, or management-agent fields.'
+            MinHits=3
+        }
+        [pscustomobject]@{
+            Profile='IdentityProvider'; Format='M365/identity audit export'; Confidence=89
+            Patterns=@('(?i)^CreationDate$','(?i)^UserIds?$','(?i)^Operations?$','(?i)^AuditData$','(?i)^Workload$','(?i)^RecordType$','(?i)^ResultStatus$','(?i)^ClientIP$','(?i)^UserId$','(?i)^ObjectId$','(?i)^Actor$','(?i)^Target$')
+            TextPattern='(?i)\b(OfficeActivity|AzureActiveDirectory|Exchange|SharePoint|Unified Audit|AuditData|ResultStatus|ClientIP)\b'
+            Reason='Header/sample contains Microsoft 365, Entra ID, or unified audit export fields.'
+            MinHits=3
+        }
+        [pscustomobject]@{
+            Profile='FirewallCsv'; Format='Firewall CSV export'; Confidence=88
+            Patterns=@('(?i)^(src|src_ip|srcip|source|source_ip|sourceip|source_address|sourceaddress)$','(?i)^(dst|dst_ip|dstip|destination|destination_ip|destinationip|destination_address|destinationaddress)$','(?i)^(action|rule|policy|protocol|proto)$','(?i)^(src_port|srcport|dst_port|dstport|bytes|packets)$','(?i)^(user|username|identity|src_user|srcuser|source_user|sourceuser|destination_user|destinationuser)$','(?i)^(src_host|srchost|source_host|sourcehost|dst_host|dsthost|destination_host|destinationhost)$')
+            TextPattern='(?i)\b(src_ip|dst_ip|source_ip|destination_ip|firewall|vpn|policy|rule|deny|allow)\b'
+            Reason='Header/sample contains firewall/VPN source, destination, action, rule, or user fields.'
+            MinHits=3
+        }
+    )
+
+    foreach ($hint in $hints) {
+        $hits = Get-LogColumnHitCount -Columns $columnsSafe -Patterns $hint.Patterns
+        if ($hits -ge [int]$hint.MinHits) {
+            return [pscustomobject]@{ Profile=$hint.Profile; Format=$hint.Format; Confidence=$hint.Confidence; Reason=$hint.Reason }
+        }
+        if ($hits -ge 2 -and -not [string]::IsNullOrWhiteSpace($textSafe) -and $textSafe -match $hint.TextPattern) {
+            return [pscustomobject]@{ Profile=$hint.Profile; Format=$hint.Format; Confidence=$hint.Confidence; Reason=$hint.Reason }
+        }
+    }
+    return $null
+}
+
+function Test-UlsIntuneDiagnosticsText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $patterns = @(
+        '(?i)\b(Intune|IntuneManagementExtension|Endpoint Manager)\b',
+        '(?i)\b(MDM|OMADM|OMA-DM|DeviceManagement-Enterprise-Diagnostics-Provider)\b',
+        '(?i)\b(DeviceEnroller|DeviceEnrollment|EnterpriseMgmt|EnrollmentStatusTracking|Autopilot)\b',
+        '(?i)\b(Windows Update|WindowsUpdate|UsoSvc|UpdateSessionOrchestration)\b',
+        '(?i)\b(PolicyManager|./Vendor/MSFT|Diagnostic Report|MDMDiagReport)\b',
+        '(?i)\\(SOFTWARE\\Microsoft\\Enrollments|SOFTWARE\\Microsoft\\Provisioning|ProfileList\\S-1-5-21-)'
+    )
+    $hits = 0
+    foreach ($pat in $patterns) {
+        if ($Text -match $pat) { $hits++ }
+    }
+    return ($hits -ge 2)
+}
+
+function Test-UlsFirewallVpnText {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $hasNetworkPair = ($Text -match '(?i)\b(src_ip|source_ip|src=|saddr=)\b' -and $Text -match '(?i)\b(dst_ip|destination_ip|dst=|daddr=)\b')
+    $hasFirewallMarker = ($Text -match '(?i)\b(firewall|fw-|vpn|globalprotect|anyconnect|ipsec|wireguard|tunnel|policy=|rule=|proto=|protocol=|deny|allow|blocked|permitted)\b')
+    if (-not ($hasNetworkPair -and $hasFirewallMarker)) { return $false }
+    $hits = 0
+    foreach ($pat in @(
+        '(?i)\b(src_ip|source_ip|dst_ip|destination_ip|src=|dst=|saddr=|daddr=)\b',
+        '(?i)\b(firewall|fw-|vpn|globalprotect|anyconnect|ipsec|wireguard|tunnel)\b',
+        '(?i)\b(action|policy|rule|deny|allow|blocked|permitted|protocol|proto|src_port|dst_port)\s*=',
+        '(?i)\b(user|username|account|identity)\s*='
+    )) {
+        if ($Text -match $pat) { $hits++ }
+    }
+    return ($hits -ge 2)
+}
+
 function New-RecommendedScrubCommand {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Profile,
-        [switch]$UseAutoProfile
+        [switch]$UseAutoProfile,
+        [string]$ExtraSwitches = ''
     )
     $quotedPath = "'" + ($Path -replace "'", "''") + "'"
     $profilePart = if ($UseAutoProfile) { "-AutoProfile" } else { "-Profile $Profile" }
-    return "Invoke-UniversalScrubber -Path $quotedPath $profilePart -DryRun -Salt `"preview-only`" -MapSource Discover -NonInteractive"
+    $extraPart = if ([string]::IsNullOrWhiteSpace($ExtraSwitches)) { '' } else { ' ' + $ExtraSwitches.Trim() }
+    return "Invoke-UniversalScrubber -Path $quotedPath $profilePart$extraPart -DryRun -Salt `"preview-only`" -MapSource Discover -NonInteractive"
 }
 
 function New-LogFormatRecommendationObject {
@@ -2735,7 +3062,8 @@ function New-LogFormatRecommendationObject {
         [Parameter(Mandatory)][string]$SuggestedProfile,
         [Parameter(Mandatory)][int]$Confidence,
         [string[]]$Reasons,
-        [string[]]$Warnings
+        [string[]]$Warnings,
+        [string]$ExtraSwitches = ''
     )
 
     if (-not (Get-ScrubProfile -Name $SuggestedProfile)) {
@@ -2753,7 +3081,7 @@ function New-LogFormatRecommendationObject {
         Confidence         = $Confidence
         Reasons            = @($Reasons)
         Warnings           = @($Warnings)
-        RecommendedCommand = (New-RecommendedScrubCommand -Path $File.FullName -Profile $SuggestedProfile)
+        RecommendedCommand = (New-RecommendedScrubCommand -Path $File.FullName -Profile $SuggestedProfile -ExtraSwitches $ExtraSwitches)
     }
 }
 
@@ -2777,15 +3105,46 @@ function Get-LogFormatRecommendation {
             -Reasons @('The .evtx extension identifies a Windows Event Log file.') `
             -Warnings @('EVTX is binary; the scrubber converts it to CSV before scrubbing.')
     }
+    if ($ext -eq '.etl') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'ETL trace' -SuggestedProfile 'Generic' -Confidence 45 `
+            -Reasons @('The .etl extension identifies a Windows Event Trace Log.') `
+            -Warnings @('ETL conversion is opt-in. Use -ConvertEtl to run Windows tracerpt.exe locally, or convert ETL to CSV/XML/text with your diagnostic workflow before scrubbing.') `
+            -ExtraSwitches '-ConvertEtl'
+    }
+    if ($ext -eq '.cab') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'CAB archive' -SuggestedProfile 'Text' -Confidence 20 `
+            -Reasons @('The .cab extension identifies a cabinet archive, commonly used inside Intune diagnostic bundles.') `
+            -Warnings @('CAB archives are not expanded by the scrubber in v4.15. Extract approved contents first, or remove archives that are not needed for review.')
+    }
     if ($ext -eq '.xlsx') {
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'XLSX' -SuggestedProfile 'Generic' -Confidence 90 `
             -Reasons @('The .xlsx extension identifies an Excel workbook.') `
-            -Warnings @('Workbook conversion happens locally before scrubbing.')
+            -Warnings @('Workbook conversion happens locally before scrubbing. In v4.15, the first worksheet is converted; export specific sheets or use BYOP for complex workbooks.')
+    }
+    if ($ext -eq '.docx') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'DOCX' -SuggestedProfile 'Text' -Confidence 90 `
+            -Reasons @('The .docx extension identifies an OpenXML Word document.') `
+            -Warnings @('DOCX text extraction happens locally under the work directory before scrubbing. The intermediate text is UNSCRUBBED until the scrub step completes.')
+    }
+    if ($ext -eq '.pptx') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'PPTX' -SuggestedProfile 'Text' -Confidence 90 `
+            -Reasons @('The .pptx extension identifies an OpenXML PowerPoint deck.') `
+            -Warnings @('PPTX text extraction happens locally under the work directory before scrubbing. The intermediate text is UNSCRUBBED until the scrub step completes.')
+    }
+    if ($ext -in @('.doc','.ppt')) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Legacy Office document' -SuggestedProfile 'Text' -Confidence 25 `
+            -Reasons @('The extension identifies a legacy binary Office format.') `
+            -Warnings @('Legacy .doc/.ppt files are not parsed natively. Export to .docx/.pptx or plain text, then scrub the exported file.')
     }
 
     if (@($lines | Where-Object { ([string]$_) -match '^#Fields:' }).Count -gt 0) {
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'W3C/IIS' -SuggestedProfile 'IIS' -Confidence 98 `
             -Reasons @('A #Fields: header was found.') -Warnings $warnings
+    }
+    if ($ext -in @('.log','.txt','.reg','.html','.htm','.xml') -and (Test-UlsIntuneDiagnosticsText -Text $text)) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Intune Diagnostics text/report' -SuggestedProfile 'IntuneDiagnostics' -Confidence 88 `
+            -Reasons @('The sample contains Intune, MDM, enrollment, policy, Windows Update, or registry diagnostics markers.') `
+            -Warnings $warnings
     }
     if ($text -match '(?m)^\s*CEF:\d+\|') {
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'CEF' -SuggestedProfile 'Cef' -Confidence 96 `
@@ -2795,6 +3154,10 @@ function Get-LogFormatRecommendation {
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'LEEF' -SuggestedProfile 'Cef' -Confidence 94 `
             -Reasons @('A LEEF prefix was found; the built-in CEF profile handles key=value SIEM extensions.') -Warnings $warnings
     }
+    if ($text -match '(?is)<!\[LOG\[.*?\]LOG\]!><time=' -or $text -match '(?i)\b(CCMExec|ConfigMgr|Configuration Manager|Software Center|Management Point|Distribution Point)\b') {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'SCCM/ConfigMgr client text' -SuggestedProfile 'SccmText' -Confidence 88 `
+            -Reasons @('The sample contains CMTrace or SCCM/ConfigMgr client-log markers.') -Warnings $warnings
+    }
 
     $jsonLinesOk = Test-JsonLines -Lines $lines
     $jsonLineExtensionOk = $jsonLinesOk
@@ -2803,17 +3166,27 @@ function Get-LogFormatRecommendation {
     }
     if ($jsonLinesOk -or $jsonLineExtensionOk) {
         $profile = 'Generic'
-        if ($text -match '(?i)"(eventSource|eventName|awsRegion|userIdentity|tenantId|operationName|operation|principal|resource|sourceIPAddress)"') { $profile = 'CloudAudit' }
+        $enterpriseHint = Get-UlsEnterpriseProfileHint -Text $text
+        if ($enterpriseHint) { $profile = [string]$enterpriseHint.Profile }
+        elseif ($text -match '(?i)"(IncidentNumber|IncidentName|AlertIds|Tactics|Entities|TimeGenerated|ProviderName)"|Microsoft Sentinel|Sentinel') { $profile = 'CloudAudit' }
+        elseif ((($text -match '(?i)"(alert_id|process_path|command_line|remote_domain|sha256)"') -and ($text -match '(?i)"(device_name|user_email|remote_ip|process_name)"')) -or ($text -match '(?i)\b(EDR|XDR|Defender for Endpoint)\b')) { $profile = 'Edr' }
+        elseif ($text -match '(?i)"(eventSource|eventName|awsRegion|userIdentity|tenantId|operationName|operation|principal|resource|sourceIPAddress)"') { $profile = 'CloudAudit' }
         elseif ($text -match '(?i)"(message|level|trace|span|api_key|client_secret|username|host)"') { $profile = 'AppJson' }
+        $reason = if ($enterpriseHint) { @('Multiple sampled lines parse as standalone JSON objects.', [string]$enterpriseHint.Reason) } else { @('Multiple sampled lines parse as standalone JSON objects.') }
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'JSON Lines / NDJSON' -SuggestedProfile $profile -Confidence 92 `
-            -Reasons @('Multiple sampled lines parse as standalone JSON objects.') -Warnings $warnings
+            -Reasons $reason -Warnings $warnings
     }
     if ((Test-JsonText -Text $text) -or ($ext -eq '.json' -and (Test-JsonText -Text $text))) {
         $profile = 'Generic'
-        if ($text -match '(?i)"(eventSource|eventName|awsRegion|userIdentity|tenantId|operationName|operation|principal|resource|sourceIPAddress)"') { $profile = 'CloudAudit' }
+        $enterpriseHint = Get-UlsEnterpriseProfileHint -Text $text
+        if ($enterpriseHint) { $profile = [string]$enterpriseHint.Profile }
+        elseif ($text -match '(?i)"(IncidentNumber|IncidentName|AlertIds|Tactics|Entities|TimeGenerated|ProviderName)"|Microsoft Sentinel|Sentinel') { $profile = 'CloudAudit' }
+        elseif ((($text -match '(?i)"(alert_id|process_path|command_line|remote_domain|sha256)"') -and ($text -match '(?i)"(device_name|user_email|remote_ip|process_name)"')) -or ($text -match '(?i)\b(EDR|XDR|Defender for Endpoint)\b')) { $profile = 'Edr' }
+        elseif ($text -match '(?i)"(eventSource|eventName|awsRegion|userIdentity|tenantId|operationName|operation|principal|resource|sourceIPAddress)"') { $profile = 'CloudAudit' }
         elseif ($text -match '(?i)"(message|level|trace|span|api_key|client_secret|username|host)"') { $profile = 'AppJson' }
+        $reason = if ($enterpriseHint) { @('The sampled content parses as JSON.', [string]$enterpriseHint.Reason) } else { @('The sampled content parses as JSON.') }
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'JSON' -SuggestedProfile $profile -Confidence 90 `
-            -Reasons @('The sampled content parses as JSON.') -Warnings $warnings
+            -Reasons $reason -Warnings $warnings
     }
 
     $jsonish = ($firstLine -match '^\s*[\{\[]')
@@ -2838,6 +3211,11 @@ function Get-LogFormatRecommendation {
             return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Windows Event CSV' -SuggestedProfile 'WindowsEventCsv' -Confidence 96 `
                 -Reasons @('CSV header contains Windows Event export columns.') -Warnings $warnings
         }
+        $enterpriseHint = Get-UlsEnterpriseProfileHint -Columns $columns -Text $text
+        if ($enterpriseHint) {
+            return New-LogFormatRecommendationObject -File $File -DetectedFormat ([string]$enterpriseHint.Format) -SuggestedProfile ([string]$enterpriseHint.Profile) -Confidence ([int]$enterpriseHint.Confidence) `
+                -Reasons @([string]$enterpriseHint.Reason) -Warnings $warnings
+        }
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'CSV' -SuggestedProfile 'Generic' -Confidence 82 `
             -Reasons @('The sample appears comma-delimited.') -Warnings $warnings
     }
@@ -2845,6 +3223,10 @@ function Get-LogFormatRecommendation {
     if ($text -match '(?m)^\S+\s+\S+\s+\S+\s+\[[^\]]+\]\s+"[A-Z]+ [^"]+ HTTP/[0-9.]+"\s+\d{3}\s+') {
         return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Apache/Nginx access log' -SuggestedProfile 'Apache' -Confidence 86 `
             -Reasons @('The sample matches common/combined web access log shape.') -Warnings $warnings
+    }
+    if (Test-UlsFirewallVpnText -Text $text) {
+        return New-LogFormatRecommendationObject -File $File -DetectedFormat 'Firewall/VPN text' -SuggestedProfile 'Firewall' -Confidence 88 `
+            -Reasons @('The sample contains firewall/VPN source, destination, user, action, policy, or rule fields.') -Warnings $warnings
     }
     $kvMatches = [regex]::Matches($text, '(?<!\S)[A-Za-z_][A-Za-z0-9_.-]*=("[^"]*"|''[^'']*''|\S+)')
     if ($kvMatches.Count -ge 2) {
@@ -2905,455 +3287,6 @@ function Test-LogFormat {
     foreach ($t in $targets) { $recs += Get-LogFormatRecommendation -File $t -SampleLines $SampleLines }
     if (-not $Quiet) { Write-LogFormatRecommendationSummary -Recommendations $recs }
     return $recs
-}
-
-# =====================================================================
-# REGION: External public corpus catalog and optional smoke tests
-# =====================================================================
-function Get-DefaultExternalCorpusRoot {
-    return (Join-Path (Get-Location).Path 'samples\external-corpora')
-}
-
-function Get-DefaultExternalCorpusWorkDir {
-    return (Join-Path (Get-Location).Path 'external-corpus-results')
-}
-
-function Get-SafeCorpusName {
-    param([Parameter(Mandatory)][string]$Name)
-    $safe = $Name -replace '[^A-Za-z0-9_.-]', '-'
-    if ([string]::IsNullOrWhiteSpace($safe)) { return 'corpus-sample' }
-    return $safe
-}
-
-function New-LogCorpusCatalogEntry {
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Description,
-        [Parameter(Mandatory)][string]$Homepage,
-        [string]$DownloadUrl,
-        [string]$InstructionsUrl,
-        [Parameter(Mandatory)][string]$FormatHint,
-        [Parameter(Mandatory)][string]$SuggestedProfile,
-        [string[]]$ExpectedFileTypes,
-        [string]$ApproxSize,
-        [string]$LicenseNote,
-        [string]$SafetyWarning,
-        [bool]$RequiresManualDownload,
-        [bool]$CanDownloadDirectly,
-        [string]$Notes
-    )
-
-    [pscustomobject]@{
-        Name                   = $Name
-        Source                 = $Source
-        Description            = $Description
-        Homepage               = $Homepage
-        DownloadUrl            = $DownloadUrl
-        InstructionsUrl        = $InstructionsUrl
-        FormatHint             = $FormatHint
-        SuggestedProfile       = $SuggestedProfile
-        ExpectedFileTypes      = @($ExpectedFileTypes)
-        ApproxSize             = $ApproxSize
-        LicenseNote            = $LicenseNote
-        SafetyWarning          = $SafetyWarning
-        RequiresManualDownload = [bool]$RequiresManualDownload
-        CanDownloadDirectly    = [bool]$CanDownloadDirectly
-        Notes                  = $Notes
-    }
-}
-
-function Get-LogCorpusCatalog {
-    [CmdletBinding()]
-    param()
-
-    $rawWarning = 'Public corpora may contain raw, unsanitized, offensive, realistic, or operational artifacts. Review source terms and run only in an approved local workspace.'
-    return @(
-        New-LogCorpusCatalogEntry `
-            -Name 'Loghub-Apache' `
-            -Source 'Loghub' `
-            -Description 'Small Apache access-log sample from the Loghub public log collection.' `
-            -Homepage 'https://github.com/logpai/loghub' `
-            -DownloadUrl 'https://raw.githubusercontent.com/logpai/loghub/master/Apache/Apache_2k.log' `
-            -InstructionsUrl 'https://github.com/logpai/loghub/tree/master/Apache' `
-            -FormatHint 'Apache/Nginx access log' `
-            -SuggestedProfile 'Apache' `
-            -ExpectedFileTypes @('.log') `
-            -ApproxSize 'Small; about 2,000 log lines.' `
-            -LicenseNote 'Review the Loghub repository license and dataset notes before use.' `
-            -SafetyWarning $rawWarning `
-            -RequiresManualDownload:$false `
-            -CanDownloadDirectly:$true `
-            -Notes 'Direct download is a small single-file raw GitHub sample.'
-
-        New-LogCorpusCatalogEntry `
-            -Name 'Loghub-OpenSSH' `
-            -Source 'Loghub' `
-            -Description 'Small OpenSSH authentication log sample from Loghub.' `
-            -Homepage 'https://github.com/logpai/loghub' `
-            -DownloadUrl 'https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log' `
-            -InstructionsUrl 'https://github.com/logpai/loghub/tree/master/OpenSSH' `
-            -FormatHint 'Syslog-like text' `
-            -SuggestedProfile 'Syslog' `
-            -ExpectedFileTypes @('.log') `
-            -ApproxSize 'Small; about 2,000 log lines.' `
-            -LicenseNote 'Review the Loghub repository license and dataset notes before use.' `
-            -SafetyWarning $rawWarning `
-            -RequiresManualDownload:$false `
-            -CanDownloadDirectly:$true `
-            -Notes 'Useful for auth/syslog-style smoke testing.'
-
-        New-LogCorpusCatalogEntry `
-            -Name 'Loghub2-Zenodo' `
-            -Source 'Loghub 2.0' `
-            -Description 'Expanded Loghub 2.0 collection with many log types packaged through public release/download pages.' `
-            -Homepage 'https://github.com/logpai/loghub-2.0' `
-            -InstructionsUrl 'https://github.com/logpai/loghub-2.0' `
-            -FormatHint 'Mixed' `
-            -SuggestedProfile 'Generic' `
-            -ExpectedFileTypes @('.log','.csv','.json','.txt') `
-            -ApproxSize 'Large; varies by package.' `
-            -LicenseNote 'Review Loghub 2.0 source and Zenodo/package license notes before use.' `
-            -SafetyWarning $rawWarning `
-            -RequiresManualDownload:$true `
-            -CanDownloadDirectly:$false `
-            -Notes 'Manual download is safer because packages can be large and versioned externally.'
-
-        New-LogCorpusCatalogEntry `
-            -Name 'OTRF-Security-Datasets-Mordor' `
-            -Source 'OTRF Security-Datasets / Mordor' `
-            -Description 'Security telemetry datasets for adversary emulation and detection engineering practice.' `
-            -Homepage 'https://github.com/OTRF/Security-Datasets' `
-            -InstructionsUrl 'https://github.com/OTRF/Security-Datasets' `
-            -FormatHint 'Security telemetry / mixed' `
-            -SuggestedProfile 'WindowsEventCsv' `
-            -ExpectedFileTypes @('.json','.evtx','.csv') `
-            -ApproxSize 'Varies; many datasets are large.' `
-            -LicenseNote 'Review OTRF repository license and individual dataset notes before use.' `
-            -SafetyWarning $rawWarning `
-            -RequiresManualDownload:$true `
-            -CanDownloadDirectly:$false `
-            -Notes 'Manual download avoids surprising large pulls and lets users choose exact datasets.'
-
-        New-LogCorpusCatalogEntry `
-            -Name 'EVTX-ATTACK-SAMPLES' `
-            -Source 'EVTX-ATTACK-SAMPLES' `
-            -Description 'Public EVTX samples for attack technique and Windows event workflow testing.' `
-            -Homepage 'https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES' `
-            -InstructionsUrl 'https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES' `
-            -FormatHint 'EVTX' `
-            -SuggestedProfile 'WindowsEventCsv' `
-            -ExpectedFileTypes @('.evtx') `
-            -ApproxSize 'Varies by sample folder.' `
-            -LicenseNote 'Review repository license and sample provenance before use.' `
-            -SafetyWarning $rawWarning `
-            -RequiresManualDownload:$true `
-            -CanDownloadDirectly:$false `
-            -Notes 'EVTX conversion is local; download samples manually to avoid large or unexpected pulls.'
-
-        New-LogCorpusCatalogEntry `
-            -Name 'Splunk-BOTS-v3' `
-            -Source 'Splunk Boss of the SOC / BOTS v3' `
-            -Description 'Boss of the SOC v3 security dataset for Splunk-oriented investigation practice.' `
-            -Homepage 'https://www.splunk.com/en_us/blog/security/botsv3-dataset-released.html' `
-            -InstructionsUrl 'https://www.splunk.com/en_us/blog/security/botsv3-dataset-released.html' `
-            -FormatHint 'Splunk indexed security dataset' `
-            -SuggestedProfile 'Generic' `
-            -ExpectedFileTypes @('.tgz','.json','.csv','.log') `
-            -ApproxSize 'Large; approximately hundreds of MB.' `
-            -LicenseNote 'Review Splunk dataset terms and blog instructions before use.' `
-            -SafetyWarning $rawWarning `
-            -RequiresManualDownload:$true `
-            -CanDownloadDirectly:$false `
-            -Notes 'Manual download only; the dataset is large and may require Splunk-specific handling.'
-    )
-}
-
-function __ULS_Legacy_Search_LogCorpusCatalog_2672 {
-    [CmdletBinding()]
-    param(
-        [string]$Query,
-        [string]$Source,
-        [string]$Format,
-        [string]$Profile
-    )
-
-    $items = @(Get-LogCorpusCatalog)
-    if (-not [string]::IsNullOrWhiteSpace($Query)) {
-        $q = [regex]::Escape($Query)
-        $items = @($items | Where-Object {
-            (@($_.Name,$_.Source,$_.Description,$_.FormatHint,$_.SuggestedProfile,$_.Notes) -join ' ') -match "(?i)$q"
-        })
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Source)) {
-        $items = @($items | Where-Object { $_.Source -like "*$Source*" })
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Format)) {
-        $items = @($items | Where-Object { $_.FormatHint -like "*$Format*" -or (@($_.ExpectedFileTypes) -join ' ') -like "*$Format*" })
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
-        $items = @($items | Where-Object { $_.SuggestedProfile -ieq $Profile })
-    }
-    return $items
-}
-
-function Resolve-LogCorpusCatalogEntry {
-    param([Parameter(Mandatory)][string]$Name)
-    $matches = @(Get-LogCorpusCatalog | Where-Object { $_.Name -ieq $Name })
-    if ($matches.Count -eq 1) { return $matches[0] }
-    if ($matches.Count -gt 1) { throw "Multiple corpus catalog entries matched '$Name'." }
-    throw "Unknown corpus catalog entry: $Name. Run Get-LogCorpusCatalog or Search-LogCorpusCatalog."
-}
-
-function Write-LogCorpusRiskWarning {
-    param($Entry)
-    Write-Warn "External corpus content may be raw, unsanitized, offensive, realistic, or license-restricted."
-    if ($Entry -and $Entry.SafetyWarning) { Write-Warn $Entry.SafetyWarning }
-    if ($Entry -and $Entry.LicenseNote) { Write-Info $Entry.LicenseNote }
-}
-
-function Save-LogCorpusManifest {
-    param(
-        [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)][string]$Path,
-        [string]$DownloadedFile,
-        [string]$Sha256,
-        [string]$Status
-    )
-    $manifest = [pscustomobject]@{
-        schemaVersion          = '4.12'
-        generatedUtc           = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
-        name                   = $Entry.Name
-        source                 = $Entry.Source
-        homepage               = $Entry.Homepage
-        downloadUrl            = $Entry.DownloadUrl
-        instructionsUrl        = $Entry.InstructionsUrl
-        destination            = $Path
-        downloadedFile         = $DownloadedFile
-        sha256                 = $Sha256
-        requiresManualDownload = $Entry.RequiresManualDownload
-        canDownloadDirectly    = $Entry.CanDownloadDirectly
-        status                 = $Status
-        licenseNote            = $Entry.LicenseNote
-        safetyWarning          = $Entry.SafetyWarning
-        notes                  = $Entry.Notes
-    }
-    $manifestPath = Join-Path $Path 'corpus-manifest.json'
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
-    return $manifestPath
-}
-
-function __ULS_Legacy_Save_LogCorpusSample_2746 {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [string]$Destination = (Get-DefaultExternalCorpusRoot),
-        [switch]$Force,
-        [switch]$AcceptRisk
-    )
-
-    $entry = Resolve-LogCorpusCatalogEntry -Name $Name
-    $destRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
-    $sampleDir = Join-Path $destRoot (Get-SafeCorpusName -Name $entry.Name)
-
-    Write-Rule "External corpus sample"
-    Write-Info "Name: $($entry.Name)"
-    Write-Info "Source: $($entry.Source)"
-    Write-Info "Destination: $sampleDir"
-    Write-LogCorpusRiskWarning -Entry $entry
-
-    if ((Test-Path -LiteralPath $sampleDir -PathType Container) -and -not $Force) {
-        $existing = @(Get-ChildItem -LiteralPath $sampleDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
-        if ($existing.Count -gt 0) {
-            throw "Corpus sample directory already has content: $sampleDir. Pass -Force to overwrite or update it."
-        }
-    }
-
-    if ($entry.RequiresManualDownload -or -not $entry.CanDownloadDirectly) {
-        New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
-        Write-Warn "This catalog entry requires manual download. No network download will be attempted."
-        if ($entry.InstructionsUrl) { Write-Info "Instructions: $($entry.InstructionsUrl)" }
-        if ($entry.Homepage) { Write-Info "Homepage: $($entry.Homepage)" }
-        $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -Status 'ManualDownloadRequired'
-        Write-Ok "Instructions manifest written: $manifestPath"
-        return [pscustomobject]@{
-            Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $null
-            ManifestPath = $manifestPath; RequiresManualDownload = $true
-            CanDownloadDirectly = $false; Status = 'ManualDownloadRequired'
-        }
-    }
-
-    if (-not $AcceptRisk) {
-        throw "Refusing to download '$($entry.Name)' without -AcceptRisk. Review the warning, source, size and license first."
-    }
-    if ([string]::IsNullOrWhiteSpace($entry.DownloadUrl)) { throw "Catalog entry '$($entry.Name)' has no direct DownloadUrl." }
-
-    New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
-    $uri = [Uri]$entry.DownloadUrl
-    $fileName = [System.IO.Path]::GetFileName($uri.AbsolutePath)
-    if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = ((Get-SafeCorpusName -Name $entry.Name) + '.log') }
-    $targetPath = Join-Path $sampleDir $fileName
-    if ((Test-Path -LiteralPath $targetPath) -and -not $Force) {
-        throw "Corpus sample already exists: $targetPath. Pass -Force to overwrite."
-    }
-
-    Write-Info "Downloading: $($entry.DownloadUrl)"
-    try {
-        Invoke-WebRequest -Uri $entry.DownloadUrl -OutFile $targetPath -UseBasicParsing -ErrorAction Stop
-    }
-    catch {
-        throw "Download failed for '$($entry.Name)': $($_.Exception.Message)"
-    }
-
-    $hash = ''
-    try { $hash = (Get-FileHash -Path $targetPath -Algorithm SHA256).Hash } catch { }
-    $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -DownloadedFile $targetPath -Sha256 $hash -Status 'Downloaded'
-    Write-Ok "Downloaded: $targetPath"
-    if ($hash) { Write-Info "SHA256: $hash" }
-    Write-Ok "Manifest written: $manifestPath"
-    return [pscustomobject]@{
-        Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $targetPath
-        ManifestPath = $manifestPath; Sha256 = $hash
-        RequiresManualDownload = $false; CanDownloadDirectly = $true; Status = 'Downloaded'
-    }
-}
-
-function ConvertTo-MarkdownTableCell {
-    param($Value)
-    $s = if ($null -eq $Value) { '' } else { [string]$Value }
-    return (($s -replace '\|','\|') -replace "`r?`n",' ')
-}
-
-function Write-ExternalCorpusSmokeTestSummary {
-    param(
-        [Parameter(Mandatory)][object[]]$Rows,
-        [Parameter(Mandatory)][string]$WorkDir
-    )
-
-    New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-    $csvPath = Join-Path $WorkDir 'external-corpus-summary.csv'
-    $jsonPath = Join-Path $WorkDir 'external-corpus-summary.json'
-    $mdPath = Join-Path $WorkDir 'external-corpus-summary.md'
-
-    $Rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-    $Rows | ConvertTo-Json -Depth 6 | Set-Content -Path $jsonPath -Encoding UTF8
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    [void]$lines.Add('# External Corpus Smoke Test Summary')
-    [void]$lines.Add('')
-    [void]$lines.Add(('Generated: {0}' -f ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))))
-    [void]$lines.Add('')
-    [void]$lines.Add('| File | Format | Profile | Mode | Result | RuntimeSeconds | Warning/Error |')
-    [void]$lines.Add('|---|---|---|---|---:|---:|---|')
-    foreach ($r in @($Rows)) {
-        $warnErr = @($r.Warning, $r.Error) -join ' '
-        [void]$lines.Add(('| {0} | {1} | {2} | {3} | {4} | {5} | {6} |' -f `
-            (ConvertTo-MarkdownTableCell $r.FilePath),
-            (ConvertTo-MarkdownTableCell $r.DetectedFormat),
-            (ConvertTo-MarkdownTableCell $r.SuggestedProfile),
-            (ConvertTo-MarkdownTableCell $r.Mode),
-            (ConvertTo-MarkdownTableCell $r.PassFail),
-            (ConvertTo-MarkdownTableCell $r.RuntimeSeconds),
-            (ConvertTo-MarkdownTableCell $warnErr)))
-    }
-    $lines | Set-Content -Path $mdPath -Encoding UTF8
-
-    return [pscustomobject]@{ Csv = $csvPath; Json = $jsonPath; Markdown = $mdPath }
-}
-
-function Invoke-ExternalCorpusSmokeTest {
-    [CmdletBinding()]
-    param(
-        [string]$CorpusRoot = (Get-DefaultExternalCorpusRoot),
-        [string]$WorkDir = (Get-DefaultExternalCorpusWorkDir),
-        [string]$Name,
-        [switch]$Recurse,
-        [switch]$DryRunOnly,
-        [switch]$UseRecommendations,
-        [switch]$NonInteractive,
-        [string]$Salt,
-        [string]$SaltFile,
-        [string]$SaltFromEnv
-    )
-
-    Write-Rule "External corpus smoke test"
-    Write-LogCorpusRiskWarning -Entry $null
-    $root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CorpusRoot)
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "CorpusRoot not found: $root" }
-    $outRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir)
-    New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
-
-    $targets = Resolve-LogRecommendationTargets -Path $root -Recurse:$Recurse
-    if ($Name) {
-        $safeName = Get-SafeCorpusName -Name $Name
-        $targets = @($targets | Where-Object { $_.FullName -match [regex]::Escape($safeName) -or $_.FullName -match [regex]::Escape($Name) })
-    }
-    if ($targets.Count -eq 0) { throw "No corpus candidate files found under: $root" }
-
-    $rows = @()
-    $i = 0
-    $targetCount = @($targets).Count
-    foreach ($t in $targets) {
-        $i++
-        $pct = [int](($i / [Math]::Max($targetCount, 1)) * 100)
-        Write-Progress -Activity "External corpus smoke test" -Status "File $i of ${targetCount}: $($t.Name)" -PercentComplete $pct
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $rec = $null
-        $mode = if ($DryRunOnly) { 'RecommendationAndDryRun' } else { 'RecommendationOnly' }
-        $passFail = 'Pass'
-        $cmd = ''
-        $outputPath = ''
-        $warning = ''
-        $errorText = ''
-        try {
-            $rec = Get-LogFormatRecommendation -File $t -SampleLines 50
-            $warning = (@($rec.Warnings) -join '; ')
-            if ($DryRunOnly) {
-                $profile = if ($UseRecommendations -and $rec.SuggestedProfile) { $rec.SuggestedProfile } else { 'Generic' }
-                $caseOut = Join-Path $outRoot ("dryrun-{0:000}-{1}" -f $i, (Get-SafeCorpusName -Name $t.BaseName))
-                $cmd = "Invoke-UniversalScrubber -Path '$($t.FullName)' -WorkDir '$caseOut' -Profile $profile -DryRun -MapSource Discover -NonInteractive"
-                $scrubArgs = @{
-                    Path = $t.FullName; WorkDir = $caseOut; Profile = $profile; DryRun = $true
-                    MapSource = 'Discover'; NonInteractive = [bool]$NonInteractive
-                }
-                if ($Salt) { $scrubArgs.Salt = $Salt }
-                if ($SaltFile) { $scrubArgs.SaltFile = $SaltFile }
-                if ($SaltFromEnv) { $scrubArgs.SaltFromEnv = $SaltFromEnv }
-                if (-not $Salt -and -not $SaltFile -and -not $SaltFromEnv) {
-                    throw "DryRunOnly requires -Salt, -SaltFile, or -SaltFromEnv."
-                }
-                $dry = @(Invoke-UniversalScrubber @scrubArgs)
-                $outputPath = (@($dry | ForEach-Object { $_.Output }) | Where-Object { $_ } | Select-Object -First 1)
-            }
-        }
-        catch {
-            $passFail = 'Fail'
-            $errorText = $_.Exception.Message
-        }
-        finally { $sw.Stop() }
-
-        $rows += [pscustomobject]@{
-            FilePath          = $t.FullName
-            Name              = $t.Name
-            DetectedFormat    = if ($rec) { $rec.DetectedFormat } else { '' }
-            SuggestedProfile  = if ($rec) { $rec.SuggestedProfile } else { '' }
-            Confidence        = if ($rec) { $rec.Confidence } else { 0 }
-            CommandUsed       = if ($cmd) { $cmd } elseif ($rec) { $rec.RecommendedCommand } else { '' }
-            PassFail          = $passFail
-            RuntimeSeconds    = [Math]::Round($sw.Elapsed.TotalSeconds, 3)
-            OutputPath        = $outputPath
-            Warning           = $warning
-            Error             = $errorText
-            Mode              = $mode
-        }
-    }
-    Write-Progress -Activity "External corpus smoke test" -Completed
-
-    $summary = Write-ExternalCorpusSmokeTestSummary -Rows $rows -WorkDir $outRoot
-    Write-Ok "External corpus summary CSV: $($summary.Csv)"
-    Write-Ok "External corpus summary JSON: $($summary.Json)"
-    Write-Ok "External corpus summary Markdown: $($summary.Markdown)"
-    return [pscustomobject]@{ WorkDir = $outRoot; Summary = $summary; Results = $rows }
 }
 
 # =====================================================================
@@ -3645,6 +3578,9 @@ function Invoke-UlsWindowsEventFlatJsonScrub {
         $key = $m.Groups['key'].Value
         $value = $m.Groups['value'].Value
         $tok = Invoke-UlsWindowsEventKeyValueToken -KeyName $key -Value $value -Text $Text -Index $m.Groups['value'].Index -Length $m.Groups['value'].Length
+        if ($tok -eq $value -and $key -match '(?i)(message|description|command\s*line|commandline|script\s*block|scriptblock|script|xml|payload|details|data|value)') {
+            $tok = Invoke-UlsWindowsEventMessageHardening -Text $value -ColumnName ("EventDataJson." + $key)
+        }
         if ($tok -eq $value) { return $m.Value }
         Add-DetectionTrace -Detector 'WindowsEventJsonKey' -Action 'Tokenized' -Value $value -Token $tok -Reason $key -ColumnName 'EventDataJson' -Context (Get-DetectionContext -Text $Text -Index $m.Index -Length $m.Length)
         return $m.Groups['prefix'].Value + $tok + $m.Groups['suffix'].Value
@@ -3691,6 +3627,7 @@ function Invoke-UlsWindowsEventMessageHardening {
     if ($out.IndexOf(':') -ge 0) {
         $out = [regex]::Replace($out, '(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{1,4}|::(?:[A-Fa-f0-9]{1,4}:){0,6}[A-Fa-f0-9]{1,4}|(?:[A-Fa-f0-9]{1,4}:){1,7}:', {
             param($m)
+            if (-not (Test-UlsValidIpv6Address -Value $m.Value)) { return $m.Value }
             if (Test-PreserveDetectedValue -Value $m.Value -Detector 'IPv6' -Prefix 'IP6' -Text $out -Index $m.Index -Length $m.Length) { return $m.Value }
             return (Get-Token -Value $m.Value -Prefix 'IP6')
         })
@@ -4003,7 +3940,11 @@ function Protect-SensitiveTerms {
 }
 
 function Test-ScrubbedForLeaks {
-    param([Parameter(Mandatory)][string]$CsvPath, [string[]]$SensitiveTerms = @())
+    param(
+        [Parameter(Mandatory)][string]$CsvPath,
+        [string[]]$SensitiveTerms = @(),
+        [switch]$ProbeOnly
+    )
     Write-Work "Leak check: $([System.IO.Path]::GetFileName($CsvPath))"
     $findings = New-Object System.Collections.Generic.List[object]
 
@@ -4043,7 +3984,7 @@ function Test-ScrubbedForLeaks {
     $resolvedLeakPath = (Resolve-Path -Path $CsvPath).Path
     foreach ($line in [System.IO.File]::ReadLines($resolvedLeakPath)) {
         $lcN++
-        if ($lcN % 2000 -eq 0) { Write-Progress -Activity "Leak check $lcName" -Status "Line $lcN" -PercentComplete -1 }
+        if ($lcN % 2000 -eq 0) { Write-UlsProgress -Activity "Leak check" -File $lcName -RowsDone $lcN }
         foreach ($termKey in @($termCounts.Keys)) {
             $termCounts[$termKey] = [int]$termCounts[$termKey] + ([regex]::Matches($line, [regex]::Escape($termKey), 'IgnoreCase')).Count
         }
@@ -4110,7 +4051,7 @@ function Test-ScrubbedForLeaks {
             }
         }
     }
-    Write-Progress -Activity "Leak check $lcName" -Completed
+    Write-UlsProgress -Activity "Leak check" -File $lcName -Completed
     foreach ($termKey in @($termCounts.Keys)) {
         $count = [int]$termCounts[$termKey]
         if ($count -gt 0) { $findings.Add([pscustomobject]@{ Type = "SensitiveTerm '$termKey'"; Count = $count; Samples = "" }) }
@@ -4135,7 +4076,12 @@ function Test-ScrubbedForLeaks {
     }
 
     if ($findings.Count -eq 0) { Write-Ok "Leak check PASSED: no residual identifiers or sensitive terms."; return $true }
-    Write-Fail "Leak check found POTENTIAL leaks -- review before uploading:"
+    if ($ProbeOnly) {
+        Write-Warn "Leak check found potential residue before final hardening:"
+    }
+    else {
+        Write-Fail "Leak check found POTENTIAL leaks -- review before uploading:"
+    }
     foreach ($f in $findings) {
         $msg = "{0}: {1} occurrence(s)" -f $f.Type, $f.Count
         if ($f.Samples) { $msg += "  e.g. $($f.Samples)" }
@@ -4257,7 +4203,7 @@ function Invoke-JsonSerializedKeyValueHardening {
             if (-not ([string]::IsNullOrWhiteSpace($key) -or [string]::IsNullOrWhiteSpace($value) -or (Is-AlreadyToken -Value $value))) {
                 $scrubbed = Invoke-JsonStringValueScrub -KeyName $key -Value $value -Profile $Profile
                 if ($scrubbed -ne $value) {
-                    if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $key; Original = $value; Token = $scrubbed }) }
+                    if ($null -ne $Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $key; Original = $value; Token = $scrubbed }) }
                     $replacement = $Match.Groups['prefix'].Value + '"' + $scrubbed + '"'
                 }
             }
@@ -4287,7 +4233,7 @@ function Invoke-JsonSerializedKeyValueHardening {
             if ($prefix) {
                 $token = Get-Token -Value $value -Prefix $prefix
                 if ($token -ne $value) {
-                    if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $key; Original = $value; Token = $token }) }
+                    if ($null -ne $Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $key; Original = $value; Token = $token }) }
                     $replacement = $Match.Groups['prefix'].Value + '"' + $token + '"'
                 }
             }
@@ -4313,13 +4259,13 @@ function Invoke-JsonNodeScrub {
     if ($null -eq $Seen) { $Seen = @{} }
     if ($Depth -ge $MaxDepth) {
         $marker = '[SCRUB_JSON_MAX_DEPTH_EXCEEDED]'
-        if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = '(json depth limit)'; Token = $marker }) }
+        if ($null -ne $Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = '(json depth limit)'; Token = $marker }) }
         return $marker
     }
     if ($null -eq $Node) { return $null }
     if ($Node -is [string]) {
         $s = Invoke-JsonStringValueScrub -KeyName $KeyName -Value $Node -Profile $Profile
-        if ($Changes -and ($s -ne $Node)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $Node; Token = $s }) }
+        if (($null -ne $Changes) -and ($s -ne $Node)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $Node; Token = $s }) }
         return $s
     }
     if (Test-JsonNumericNode -Node $Node) {
@@ -4327,7 +4273,7 @@ function Invoke-JsonNodeScrub {
         if ($numericPrefix) {
             $rawNumber = [System.Convert]::ToString($Node, [System.Globalization.CultureInfo]::InvariantCulture)
             $token = Get-Token -Value $rawNumber -Prefix $numericPrefix
-            if ($Changes -and ($token -ne $rawNumber)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $rawNumber; Token = $token }) }
+            if (($null -ne $Changes) -and ($token -ne $rawNumber)) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = $rawNumber; Token = $token }) }
             return $token
         }
         return $Node
@@ -4337,7 +4283,7 @@ function Invoke-JsonNodeScrub {
     $id = Get-JsonNodeIdentity -Node $Node
     if ($id -and $Seen.ContainsKey($id)) {
         $marker = '[SCRUB_JSON_CYCLIC_REFERENCE]'
-        if ($Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = '(json cycle)'; Token = $marker }) }
+        if ($null -ne $Changes) { [void]$Changes.Add([pscustomobject]@{ Field = $KeyName; Original = '(json cycle)'; Token = $marker }) }
         return $marker
     }
     if ($id) { $Seen[$id] = $true }
@@ -4384,7 +4330,7 @@ function Invoke-ScrubJsonText {
         $Changes,
         [int]$MaxDepth = 80
     )
-    if (-not $Changes) { $Changes = New-Object System.Collections.Generic.List[object] }
+    if ($null -eq $Changes) { $Changes = New-Object System.Collections.Generic.List[object] }
     $jsonDepth = [Math]::Min([Math]::Max($MaxDepth, 2), 100)
     if ($IsNdjson) {
         # One JSON object per line (NDJSON / JSON Lines).
@@ -4582,10 +4528,10 @@ function ConvertFrom-EvtxToCsv {
                 }
             }
             if ($total % 500 -eq 0) {
-                Write-Progress -Activity "Indexing EVTX fields in $name" -Status "$total events indexed ($($eventDataColumns.Count) event-data columns)" -PercentComplete -1
+                Write-UlsProgress -Activity "Index EVTX" -Phase ("cols {0}" -f $eventDataColumns.Count) -File $name -RowsDone $total
             }
         }
-        Write-Progress -Activity "Indexing EVTX fields in $name" -Completed
+        Write-UlsProgress -Activity "Index EVTX" -File $name -Completed
     }
 
     $columns = @('RecordId','TimeCreated','Id','LevelDisplayName','ProviderName','LogName','MachineName','UserId') + @($eventDataColumns) + @('EventDataJson','Message')
@@ -4622,7 +4568,7 @@ function ConvertFrom-EvtxToCsv {
                 Write-ScrubCsvRow -Writer $writer -Columns $columns -Row $row
                 if ($count % 100 -eq 0) {
                     $pct = if ($total -and $total -gt 0) { [int](($count / [Math]::Max($total, 1)) * 100) } else { -1 }
-                    Write-Progress -Activity "Converting EVTX -> CSV: $name" -Status "$count events (RecordId $($e.RecordId), $tc)" -PercentComplete $pct
+                    Write-UlsProgress -Activity "Convert EVTX" -Phase ("RecordId {0}" -f $e.RecordId) -File $name -RowsDone $count -RowsTotal $total
                 }
             }
             catch { }
@@ -4630,7 +4576,7 @@ function ConvertFrom-EvtxToCsv {
     }
     finally {
         $writer.Close()
-        Write-Progress -Activity "Converting EVTX -> CSV: $name" -Completed
+        Write-UlsProgress -Activity "Convert EVTX" -File $name -Completed
     }
     if ($count -eq 0) {
         [pscustomobject]@{ Note = 'No events could be read from this log.' } | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8
@@ -4705,7 +4651,7 @@ function Initialize-ScrubProfileRuntime {
         [void]$labelRules.Add((ConvertTo-UniversalLabelRule -Rule ([pscustomobject]@{ Name="Additional:$label"; Labels=@($label); Prefix='OBJECT' }) -Context 'additional label'))
     }
     $script:RuntimeLabelRules = @($labelRules.ToArray())
-    $script:RuntimeCustomRegexRules = if ($Profile.CustomRegexRules) { @($Profile.CustomRegexRules) } else { @() }
+    $script:RuntimeCustomRegexRules = if ($Profile.CustomRegexRules) { @(ConvertTo-CustomRegexRules -Rules $Profile.CustomRegexRules) } else { @() }
 }
 
 function Import-ScrubProfileFile {
@@ -4758,6 +4704,155 @@ function Import-ScrubProfileFile {
     }
     Write-Ok "Loaded custom profile '$($prof.Name)' from $([System.IO.Path]::GetFileName($Path))"
     return $prof
+}
+
+function Get-UlsObjectPropertyArray {
+    param($Object, [string]$Name)
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Name)) { return @() }
+    try {
+        if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name) -and $null -ne $Object[$Name]) {
+            return @($Object[$Name])
+        }
+    } catch { }
+    try {
+        $prop = $Object.PSObject.Properties[$Name]
+        if ($prop -and $null -ne $prop.Value) { return @($prop.Value) }
+    } catch { }
+    return @()
+}
+
+function Get-UlsObjectPropertyValue {
+    param($Object, [string]$Name, $Default = $null)
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Name)) { return $Default }
+    try {
+        if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name) -and $null -ne $Object[$Name]) {
+            return $Object[$Name]
+        }
+    } catch { }
+    try {
+        $prop = $Object.PSObject.Properties[$Name]
+        if ($prop -and $null -ne $prop.Value) { return $prop.Value }
+    } catch { }
+    return $Default
+}
+
+function Resolve-UlsProfileRelativePath {
+    param([string]$Path, [string]$BasePath)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ([System.IO.Path]::IsPathRooted($Path) -or [string]::IsNullOrWhiteSpace($BasePath)) { return $Path }
+    return (Join-Path $BasePath $Path)
+}
+
+function ConvertTo-UlsProfilePathList {
+    param($Values, [string]$BasePath)
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($v in @($Values)) {
+        $s = ([string]$v).Trim()
+        if ($s) { [void]$out.Add((Resolve-UlsProfileRelativePath -Path $s -BasePath $BasePath)) }
+    }
+    return @($out.ToArray())
+}
+
+function ConvertTo-UlsColumnPrefixRules {
+    param($Rules, [string]$Context = 'profile extension ColumnPrefix')
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($Rules)) {
+        if ($null -eq $r) { continue }
+        $pat = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Pattern')
+        $pre = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Prefix')
+        if ([string]::IsNullOrWhiteSpace($pat)) { throw "$Context entry requires Pattern." }
+        try { [void][regex]::new($pat) } catch { throw "Invalid $Context regex '$pat': $($_.Exception.Message)" }
+        $prefix = Resolve-ProfileTokenPrefix -Prefix $pre -Context $Context
+        [void]$out.Add(@{
+            Pattern = $pat
+            Prefix = $prefix
+            NotOid = [bool](Get-UlsObjectPropertyValue -Object $r -Name 'NotOid' -Default $false)
+            DollarComputer = [bool](Get-UlsObjectPropertyValue -Object $r -Name 'DollarComputer' -Default $false)
+        })
+    }
+    return @($out.ToArray())
+}
+
+function Import-ScrubProfileExtensionFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Profile extension file not found: $Path" }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $root = Split-Path -Parent $resolved
+    $ext = [System.IO.Path]::GetExtension($resolved).ToLowerInvariant()
+    $raw = if ($ext -eq '.psd1') { Import-PowerShellDataFile -Path $resolved } else { (Get-Content -LiteralPath $resolved -Raw) | ConvertFrom-Json }
+    if (-not $raw) { throw "Profile extension file is empty or invalid: $Path" }
+
+    $name = [string](Get-UlsObjectPropertyValue -Object $raw -Name 'Name' -Default ([System.IO.Path]::GetFileNameWithoutExtension($resolved)))
+    $schemaColumns = ConvertTo-ProfileColumnRules -Rules (Get-UlsObjectPropertyArray -Object $raw -Name 'SchemaColumns') -DefaultAction 'Scan' -DefaultPrefix 'OBJECT' -Context "profile extension '$name' SchemaColumns"
+    $wholeColumnRules = ConvertTo-ProfileColumnRules -Rules (Get-UlsObjectPropertyArray -Object $raw -Name 'WholeColumnRules') -DefaultAction 'Scrub' -DefaultPrefix 'OBJECT' -Context "profile extension '$name' WholeColumnRules"
+    $customRegexRules = ConvertTo-CustomRegexRules -Rules (Get-UlsObjectPropertyArray -Object $raw -Name 'CustomRegexRules')
+    $allowlistFiles = @()
+    $allowlistFiles += ConvertTo-UlsProfilePathList -Values (Get-UlsObjectPropertyArray -Object $raw -Name 'AllowlistFile') -BasePath $root
+    $allowlistFiles += ConvertTo-UlsProfilePathList -Values (Get-UlsObjectPropertyArray -Object $raw -Name 'AllowlistFiles') -BasePath $root
+    $seedFiles = ConvertTo-UlsProfilePathList -Values (Get-UlsObjectPropertyArray -Object $raw -Name 'SeedFiles') -BasePath $root
+
+    return [pscustomobject]@{
+        Name             = $name
+        Description      = [string](Get-UlsObjectPropertyValue -Object $raw -Name 'Description' -Default '')
+        Path             = $resolved
+        ProfileRoot      = $root
+        ColumnPrefix     = @(ConvertTo-UlsColumnPrefixRules -Rules (Get-UlsObjectPropertyArray -Object $raw -Name 'ColumnPrefix') -Context "profile extension '$name' ColumnPrefix")
+        SchemaColumns    = @($schemaColumns)
+        WholeColumnRules = @($wholeColumnRules)
+        LabelRules       = @(Get-UlsObjectPropertyArray -Object $raw -Name 'LabelRules')
+        CustomRegexRules = @($customRegexRules)
+        AllowedDomains   = @(Get-UlsObjectPropertyArray -Object $raw -Name 'AllowedDomains')
+        Allowlist        = @(Get-UlsObjectPropertyArray -Object $raw -Name 'Allowlist')
+        AllowlistFile    = @($allowlistFiles)
+        AllowlistFiles   = @()
+        SeedTerms        = @(Get-UlsObjectPropertyArray -Object $raw -Name 'SeedTerms')
+        SeedFiles        = @($seedFiles)
+    }
+}
+
+function Merge-ScrubProfileExtension {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Profile,
+        [string[]]$Path = @()
+    )
+    $paths = @($Path | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($paths.Count -eq 0) { return $Profile }
+
+    $merged = $Profile
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $paths) {
+        $extension = Import-ScrubProfileExtensionFile -Path $p
+        [void]$names.Add($extension.Name)
+        $description = [string](Get-UlsObjectPropertyValue -Object $merged -Name 'Description' -Default '')
+        if ($description -notmatch [regex]::Escape($extension.Name)) { $description = ($description + " + extension $($extension.Name)").Trim() }
+        $merged = [pscustomobject]@{
+            Name             = [string](Get-UlsObjectPropertyValue -Object $merged -Name 'Name' -Default 'ExtendedProfile')
+            Description      = $description
+            SchemaVersion    = [int](Get-UlsObjectPropertyValue -Object $merged -Name 'SchemaVersion' -Default 2)
+            Format           = [string](Get-UlsObjectPropertyValue -Object $merged -Name 'Format' -Default 'Auto')
+            Delimiter        = [string](Get-UlsObjectPropertyValue -Object $merged -Name 'Delimiter' -Default ',')
+            PassThroughRegex = Get-UlsObjectPropertyValue -Object $merged -Name 'PassThroughRegex' -Default $null
+            ColumnPrefix     = @($extension.ColumnPrefix + (Get-UlsObjectPropertyArray -Object $merged -Name 'ColumnPrefix'))
+            FreeTextRegex    = [string](Get-UlsObjectPropertyValue -Object $merged -Name 'FreeTextRegex' -Default '.*')
+            DenyByDefault    = [bool](Get-UlsObjectPropertyValue -Object $merged -Name 'DenyByDefault' -Default $true)
+            AllowedDomains   = @((Get-UlsObjectPropertyArray -Object $merged -Name 'AllowedDomains') + $extension.AllowedDomains)
+            SchemaColumns    = @($extension.SchemaColumns + (Get-UlsObjectPropertyArray -Object $merged -Name 'SchemaColumns'))
+            WholeColumnRules = @($extension.WholeColumnRules + (Get-UlsObjectPropertyArray -Object $merged -Name 'WholeColumnRules'))
+            LabelRules       = @((Get-UlsObjectPropertyArray -Object $merged -Name 'LabelRules') + $extension.LabelRules)
+            CustomRegexRules = @((Get-UlsObjectPropertyArray -Object $merged -Name 'CustomRegexRules') + $extension.CustomRegexRules)
+            Allowlist        = @((Get-UlsObjectPropertyArray -Object $merged -Name 'Allowlist') + $extension.Allowlist)
+            AllowlistFile    = @((Get-UlsObjectPropertyArray -Object $merged -Name 'AllowlistFile') + $extension.AllowlistFile)
+            AllowlistFiles   = @((Get-UlsObjectPropertyArray -Object $merged -Name 'AllowlistFiles') + $extension.AllowlistFiles)
+            SeedTerms        = @((Get-UlsObjectPropertyArray -Object $merged -Name 'SeedTerms') + $extension.SeedTerms)
+            SeedFiles        = @((Get-UlsObjectPropertyArray -Object $merged -Name 'SeedFiles') + $extension.SeedFiles)
+            ProfileRoot      = Get-UlsObjectPropertyValue -Object $merged -Name 'ProfileRoot' -Default $null
+            ProfileExtensions = @((Get-UlsObjectPropertyArray -Object $merged -Name 'ProfileExtensions') + $extension.Path)
+        }
+    }
+    Write-Ok ("Applied profile extension(s): {0}" -f (($names.ToArray()) -join ', '))
+    return $merged
 }
 
 function New-ScrubProfileTemplate {
@@ -5199,6 +5294,117 @@ function ConvertTo-GeneratedProfile {
     return $profile
 }
 
+function ConvertTo-UlsSerializableColumnPrefixRules {
+    param($Rules)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($Rules)) {
+        if ($null -eq $r) { continue }
+        $pat = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Pattern')
+        $pre = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Prefix')
+        if ([string]::IsNullOrWhiteSpace($pat) -or [string]::IsNullOrWhiteSpace($pre)) { continue }
+        $entry = [ordered]@{ Pattern=$pat; Prefix=$pre }
+        if ([bool](Get-UlsObjectPropertyValue -Object $r -Name 'NotOid' -Default $false)) { $entry.NotOid = $true }
+        if ([bool](Get-UlsObjectPropertyValue -Object $r -Name 'DollarComputer' -Default $false)) { $entry.DollarComputer = $true }
+        [void]$out.Add($entry)
+    }
+    return @($out.ToArray())
+}
+
+function ConvertTo-UlsSerializableCustomRegexRules {
+    param($Rules)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($Rules)) {
+        if ($null -eq $r) { continue }
+        $rx = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Regex')
+        if ([string]::IsNullOrWhiteSpace($rx)) { continue }
+        $entry = [ordered]@{
+            Name = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Name' -Default 'CustomRegex')
+            Regex = $rx
+            CaptureGroup = [int](Get-UlsObjectPropertyValue -Object $r -Name 'CaptureGroup' -Default 0)
+            Prefix = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Prefix' -Default 'OBJECT')
+            Keywords = @(Get-UlsObjectPropertyArray -Object $r -Name 'Keywords')
+            Entropy = Get-UlsObjectPropertyValue -Object $r -Name 'Entropy' -Default 0
+        }
+        $desc = [string](Get-UlsObjectPropertyValue -Object $r -Name 'Description' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($desc)) { $entry.Description = $desc }
+        [void]$out.Add($entry)
+    }
+    return @($out.ToArray())
+}
+
+function Import-UlsRawProfileLikeFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Profile extension file not found: $Path" }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $ext = [System.IO.Path]::GetExtension($resolved).ToLowerInvariant()
+    if ($ext -eq '.psd1') { return Import-PowerShellDataFile -Path $resolved }
+    return ((Get-Content -LiteralPath $resolved -Raw) | ConvertFrom-Json)
+}
+
+function Merge-UlsGeneratedProfileWithBase {
+    param(
+        [Parameter(Mandatory)]$GeneratedProfile,
+        [string]$BaseProfile,
+        [string[]]$ProfileExtensionFile = @()
+    )
+
+    $merged = $GeneratedProfile
+    if (-not [string]::IsNullOrWhiteSpace($BaseProfile)) {
+        $base = Get-ScrubProfile -Name $BaseProfile
+        if (-not $base) { throw "Unknown base profile for sample profile builder: $BaseProfile" }
+        $merged = [ordered]@{
+            SchemaVersion = 2
+            Name = [string](Get-UlsObjectPropertyValue -Object $GeneratedProfile -Name 'Name' -Default 'GeneratedSampleProfile')
+            Description = "Generated from a local sample and based on built-in profile '$($base.Name)'. Review before production use."
+            BaseProfile = $base.Name
+            Format = [string](Get-UlsObjectPropertyValue -Object $base -Name 'Format' -Default (Get-UlsObjectPropertyValue -Object $GeneratedProfile -Name 'Format' -Default 'Auto'))
+            Delimiter = [string](Get-UlsObjectPropertyValue -Object $base -Name 'Delimiter' -Default (Get-UlsObjectPropertyValue -Object $GeneratedProfile -Name 'Delimiter' -Default ','))
+            DenyByDefault = [bool](Get-UlsObjectPropertyValue -Object $base -Name 'DenyByDefault' -Default $true)
+        }
+        $pass = Get-UlsObjectPropertyValue -Object $base -Name 'PassThroughRegex' -Default $null
+        if ($pass) { $merged.PassThroughRegex = [string]$pass }
+        $free = Get-UlsObjectPropertyValue -Object $base -Name 'FreeTextRegex' -Default $null
+        if ($free) { $merged.FreeTextRegex = [string]$free }
+        $allowed = @(Get-UlsObjectPropertyArray -Object $base -Name 'AllowedDomains')
+        if ($allowed.Count -gt 0) { $merged.AllowedDomains = @($allowed) }
+        $baseColumns = @(ConvertTo-UlsSerializableColumnPrefixRules -Rules (Get-UlsObjectPropertyArray -Object $base -Name 'ColumnPrefix'))
+        if ($baseColumns.Count -gt 0) { $merged.ColumnPrefix = @($baseColumns) }
+        $merged.SchemaColumns = @(Get-UlsObjectPropertyArray -Object $GeneratedProfile -Name 'SchemaColumns')
+        $merged.WholeColumnRules = @(Get-UlsObjectPropertyArray -Object $GeneratedProfile -Name 'WholeColumnRules')
+        $merged.LabelRules = @((Get-UlsObjectPropertyArray -Object $base -Name 'LabelRules') + (Get-UlsObjectPropertyArray -Object $GeneratedProfile -Name 'LabelRules'))
+        $merged.CustomRegexRules = @((ConvertTo-UlsSerializableCustomRegexRules -Rules (Get-UlsObjectPropertyArray -Object $base -Name 'CustomRegexRules')) + (Get-UlsObjectPropertyArray -Object $GeneratedProfile -Name 'CustomRegexRules'))
+        foreach ($propName in @('SeedFiles','AllowlistFile')) {
+            $vals = @(Get-UlsObjectPropertyArray -Object $GeneratedProfile -Name $propName)
+            if ($vals.Count -gt 0) { $merged[$propName] = @($vals) }
+        }
+    }
+
+    foreach ($extensionPath in @($ProfileExtensionFile)) {
+        if ([string]::IsNullOrWhiteSpace([string]$extensionPath)) { continue }
+        $raw = Import-UlsRawProfileLikeFile -Path $extensionPath
+        if (-not $raw) { continue }
+        $extensionName = [string](Get-UlsObjectPropertyValue -Object $raw -Name 'Name' -Default ([System.IO.Path]::GetFileNameWithoutExtension($extensionPath)))
+        $existingExtensions = @(Get-UlsObjectPropertyArray -Object $merged -Name 'ProfileExtensions')
+        $merged.ProfileExtensions = @($existingExtensions + $extensionName)
+        foreach ($propName in @('SchemaColumns','WholeColumnRules','ColumnPrefix')) {
+            $vals = @(Get-UlsObjectPropertyArray -Object $raw -Name $propName)
+            if ($vals.Count -gt 0) {
+                $existing = @(Get-UlsObjectPropertyArray -Object $merged -Name $propName)
+                $merged[$propName] = @($vals + $existing)
+            }
+        }
+        foreach ($propName in @('LabelRules','CustomRegexRules','AllowedDomains','Allowlist','AllowlistFile','AllowlistFiles','SeedTerms','SeedFiles')) {
+            $vals = @(Get-UlsObjectPropertyArray -Object $raw -Name $propName)
+            if ($vals.Count -gt 0) {
+                $existing = @(Get-UlsObjectPropertyArray -Object $merged -Name $propName)
+                $merged[$propName] = @($existing + $vals)
+            }
+        }
+    }
+
+    return $merged
+}
+
 function Write-ProfileBuilderReport {
     param($Analysis, [string]$Path, [string]$ProfilePath)
     $lines = New-Object System.Collections.Generic.List[string]
@@ -5285,6 +5491,8 @@ function New-ScrubProfileFromSample {
         [Parameter(Mandatory)][string]$Path,
         [string]$ProfileOut,
         [string]$ProfileReportOut,
+        [string]$BaseProfile,
+        [string[]]$ProfileExtensionFile,
         [switch]$ProfileWizard,
         [int]$MaxSampleRows = 500,
         [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
@@ -5320,6 +5528,7 @@ function New-ScrubProfileFromSample {
     $name = 'GeneratedSampleProfile'
     try { $name = ('Generated-' + [System.IO.Path]::GetFileNameWithoutExtension($files[0])) -replace '[^A-Za-z0-9_.-]', '-' } catch { }
     $profile = ConvertTo-GeneratedProfile -Analysis $analysis -Name $name -IncludeSeeds:($optional.IncludeSeeds) -IncludeAllowlist:($optional.IncludeAllowlist)
+    $profile = Merge-UlsGeneratedProfileWithBase -GeneratedProfile $profile -BaseProfile $BaseProfile -ProfileExtensionFile $ProfileExtensionFile
     $profile | ConvertTo-Json -Depth 8 | Set-Content -Path $outPath -Encoding UTF8
     [void](Test-ScrubProfile -Path $outPath -Quiet)
     $report = Write-ProfileBuilderReport -Analysis $analysis -Path $reportPath -ProfilePath $outPath
@@ -5399,7 +5608,7 @@ function ConvertFrom-W3CToCsv {
             if (-not $fields -or [string]::IsNullOrWhiteSpace($line)) { continue }
             $dataRows++
             if ($dataRows % 1000 -eq 0) {
-                Write-Progress -Activity "Converting W3C/IIS -> CSV: $([System.IO.Path]::GetFileName($LogPath))" -Status "$dataRows data rows read ($lineNo lines scanned)" -PercentComplete -1
+                Write-UlsProgress -Activity "Convert W3C" -Phase ("lines {0}" -f $lineNo) -File ([System.IO.Path]::GetFileName($LogPath)) -RowsDone $dataRows
             }
             $vals = @($line -split '\s+')
             $obj = [ordered]@{}
@@ -5409,13 +5618,80 @@ function ConvertFrom-W3CToCsv {
     }
     finally {
         $reader.Close()
-        Write-Progress -Activity "Converting W3C/IIS -> CSV: $([System.IO.Path]::GetFileName($LogPath))" -Completed
+        Write-UlsProgress -Activity "Convert W3C" -File ([System.IO.Path]::GetFileName($LogPath)) -Completed
     }
     $out = Resolve-OutPath -Path $OutCsv
     if ($rows.Count -gt 0) { $rows | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8 }
     else { [pscustomobject]@{ Note = 'No data rows / no #Fields header found.' } | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8 }
     Write-Ok "W3C/IIS converted: $out  ($($rows.Count) rows)"
     Write-Detail "Note: this CSV is UNSCRUBBED -- it gets scrubbed next."
+    return $out
+}
+
+function Resolve-UlsTracerptPath {
+    [CmdletBinding()]
+    param([string]$TracerptPath)
+
+    $tried = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($TracerptPath)) {
+        [void]$tried.Add($TracerptPath)
+        if (Test-Path -LiteralPath $TracerptPath -PathType Leaf) {
+            return [pscustomobject]@{ Path = (Resolve-Path -LiteralPath $TracerptPath).Path; Tried = @($tried.ToArray()) }
+        }
+        return [pscustomobject]@{ Path = $null; Tried = @($tried.ToArray()) }
+    }
+
+    $cmd = Get-Command tracerpt.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        [void]$tried.Add($cmd.Source)
+        if (Test-Path -LiteralPath $cmd.Source -PathType Leaf) {
+            return [pscustomobject]@{ Path = $cmd.Source; Tried = @($tried.ToArray()) }
+        }
+    }
+
+    $windowsRoot = $env:windir
+    if ([string]::IsNullOrWhiteSpace($windowsRoot)) { $windowsRoot = $env:SystemRoot }
+    foreach ($candidate in @(
+        (Join-Path $windowsRoot 'System32\tracerpt.exe'),
+        (Join-Path $windowsRoot 'Sysnative\tracerpt.exe')
+    )) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        [void]$tried.Add($candidate)
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [pscustomobject]@{ Path = (Resolve-Path -LiteralPath $candidate).Path; Tried = @($tried.ToArray()) }
+        }
+    }
+
+    return [pscustomobject]@{ Path = $null; Tried = @($tried.ToArray()) }
+}
+
+function ConvertFrom-EtlToCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EtlPath,
+        [Parameter(Mandatory)][string]$OutCsv,
+        [string]$TracerptPath
+    )
+    if (-not (Test-Path -LiteralPath $EtlPath)) { throw "ETL not found: $EtlPath" }
+    $resolvedEtl = (Resolve-Path -LiteralPath $EtlPath).Path
+    $out = Resolve-OutPath -Path $OutCsv
+    $outDir = Split-Path -Parent $out
+    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
+    $tracerptInfo = Resolve-UlsTracerptPath -TracerptPath $TracerptPath
+    $tracerpt = [string]$tracerptInfo.Path
+    if ([string]::IsNullOrWhiteSpace($tracerpt)) {
+        $triedText = if ($tracerptInfo.Tried.Count -gt 0) { " Tried: $($tracerptInfo.Tried -join '; ')" } else { '' }
+        throw "tracerpt.exe was not found. ETL conversion is Windows-native but optional; run on Windows with tracerpt.exe available, pass -TracerptPath, or convert the ETL to CSV/XML/text before scrubbing.$triedText"
+    }
+
+    Write-Work "Converting ETL -> CSV with tracerpt.exe: $([System.IO.Path]::GetFileName($EtlPath))"
+    Write-Warn "ETL conversion output is UNSCRUBBED until the scrub step completes: $out"
+    $args = @($resolvedEtl, '-of', 'CSV', '-o', $out, '-y')
+    $proc = Start-Process -FilePath $tracerpt -ArgumentList $args -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { throw "tracerpt.exe failed with exit code $($proc.ExitCode)." }
+    if (-not (Test-Path -LiteralPath $out)) { throw "tracerpt.exe completed but did not create expected CSV: $out" }
+    Write-Ok "ETL converted: $out"
     return $out
 }
 
@@ -5501,6 +5777,101 @@ function ConvertFrom-XlsxToCsv {
         return $out
     }
     finally { $zip.Dispose() }
+}
+
+function Get-UlsOpenXmlEntryText {
+    param(
+        [Parameter(Mandatory)][System.IO.Compression.ZipArchive]$Zip,
+        [Parameter(Mandatory)][string]$EntryName
+    )
+
+    $entry = $Zip.GetEntry($EntryName)
+    if (-not $entry) { return '' }
+    $sr = New-Object System.IO.StreamReader($entry.Open())
+    try { $xmlText = $sr.ReadToEnd() } finally { $sr.Close() }
+    if ([string]::IsNullOrWhiteSpace($xmlText)) { return '' }
+
+    try { [xml]$xml = $xmlText } catch { return '' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($node in $xml.GetElementsByTagName('*')) {
+        if ($node.LocalName -eq 't' -and $null -ne $node.InnerText) {
+            $s = [string]$node.InnerText
+            if (-not [string]::IsNullOrWhiteSpace($s)) { [void]$parts.Add($s) }
+        }
+        elseif ($node.LocalName -match '^(br|cr|p)$') {
+            if ($parts.Count -gt 0 -and $parts[$parts.Count - 1] -ne '') { [void]$parts.Add('') }
+        }
+    }
+    $text = (($parts.ToArray()) -join "`r`n")
+    return ($text -replace "(`r`n){3,}", "`r`n`r`n").Trim()
+}
+
+function ConvertFrom-OpenXmlToText {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutText,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string[]]$PartPatterns
+    )
+
+    if (-not (Test-Path -LiteralPath $InputPath)) { throw "$Kind not found: $InputPath" }
+    try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    Write-Work "Converting $Kind -> text: $name"
+    $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $InputPath).Path)
+    $out = Resolve-OutPath -Path $OutText
+    try {
+        $entries = @($zip.Entries | Where-Object {
+            $entryName = $_.FullName
+            foreach ($pat in $PartPatterns) { if ($entryName -match $pat) { return $true } }
+            return $false
+        } | Sort-Object FullName)
+        if ($entries.Count -eq 0) { throw "No readable OpenXML text parts were found." }
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        $i = 0
+        foreach ($entry in $entries) {
+            $i++
+            Write-UlsProgress -Activity "Convert $Kind" -File $name -RowsDone $i -RowsTotal $entries.Count
+            $text = Get-UlsOpenXmlEntryText -Zip $zip -EntryName $entry.FullName
+            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+            [void]$lines.Add(("## {0}" -f $entry.FullName))
+            foreach ($line in ($text -split "`r?`n")) { [void]$lines.Add($line) }
+            [void]$lines.Add('')
+        }
+        Write-UlsProgress -Activity "Convert $Kind" -File $name -Completed
+        if ($lines.Count -eq 0) { throw "OpenXML package contained no extractable text." }
+        [System.IO.File]::WriteAllLines($out, [string[]]$lines.ToArray(), [System.Text.Encoding]::UTF8)
+        Write-Ok "$Kind converted to local text: $out"
+        Write-Detail "Note: this text is UNSCRUBBED -- it gets scrubbed next."
+        return $out
+    }
+    finally {
+        try { $zip.Dispose() } catch { }
+        Write-UlsProgress -Activity "Convert $Kind" -File $name -Completed
+    }
+}
+
+function ConvertFrom-DocxToText {
+    param([Parameter(Mandatory)][string]$DocxPath, [Parameter(Mandatory)][string]$OutText)
+    return ConvertFrom-OpenXmlToText -InputPath $DocxPath -OutText $OutText -Kind 'DOCX' -PartPatterns @(
+        '^word/document\.xml$',
+        '^word/header\d*\.xml$',
+        '^word/footer\d*\.xml$',
+        '^word/footnotes\.xml$',
+        '^word/endnotes\.xml$',
+        '^word/comments.*\.xml$'
+    )
+}
+
+function ConvertFrom-PptxToText {
+    param([Parameter(Mandatory)][string]$PptxPath, [Parameter(Mandatory)][string]$OutText)
+    return ConvertFrom-OpenXmlToText -InputPath $PptxPath -OutText $OutText -Kind 'PPTX' -PartPatterns @(
+        '^ppt/slides/slide\d+\.xml$',
+        '^ppt/notesSlides/notesSlide\d+\.xml$',
+        '^ppt/comments/comment\d+\.xml$',
+        '^ppt/commentAuthors\.xml$'
+    )
 }
 
 # =====================================================================
@@ -5800,7 +6171,7 @@ function Invoke-ScrubFileStreaming {
             Import-Csv -Path $InputPath -Delimiter $Delimiter | ForEach-Object {
                 $row = $_; $n++
                 & $updateWorkerProgress 'Running'
-                if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n rows" -PercentComplete -1 }
+                if ($n % 1000 -eq 0) { Write-UlsProgress -Activity "Stream scrub" -Phase $Format -File $name -RowsDone $n -RowsTotal $WorkerProgressRowsTotal }
                 if ($null -eq $headers) {
                     $headers = @($row.PSObject.Properties | ForEach-Object { [string]$_.Name })
                     if ($script:PerfReportEnabled) { $ulsPerfBlock = [System.Diagnostics.Stopwatch]::StartNew() }
@@ -5849,7 +6220,7 @@ function Invoke-ScrubFileStreaming {
                 while (-not $reader.EndOfStream) {
                     $line = $reader.ReadLine(); if ($null -eq $line) { break }
                     $t = $line.Trim(); if ($t -eq '') { continue }
-                    $n++; try { & $updateWorkerProgress 'Running' } catch { }; if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n lines" -PercentComplete -1 }
+                    $n++; try { & $updateWorkerProgress 'Running' } catch { }; if ($n % 1000 -eq 0) { Write-UlsProgress -Activity "Stream scrub" -Phase $Format -File $name -RowsDone $n -RowsTotal $WorkerProgressRowsTotal }
                     $scr = Invoke-ScrubJsonText -Text $t -IsNdjson -Profile $Profile
                     $scr = Protect-SensitiveTerms -Text $scr -SensitiveTerms $SensitiveTerms
                     $writer.WriteLine($scr)
@@ -5863,7 +6234,7 @@ function Invoke-ScrubFileStreaming {
             try {
                 while (-not $reader.EndOfStream) {
                     $line = $reader.ReadLine(); if ($null -eq $line) { break }
-                    $n++; try { & $updateWorkerProgress 'Running' } catch { }; if ($n % 1000 -eq 0) { Write-Progress -Activity "Streaming $name" -Status "$n lines" -PercentComplete -1 }
+                    $n++; try { & $updateWorkerProgress 'Running' } catch { }; if ($n % 1000 -eq 0) { Write-UlsProgress -Activity "Stream scrub" -Phase $Format -File $name -RowsDone $n -RowsTotal $WorkerProgressRowsTotal }
                     $h = if ($Format -eq 'Kv') { Invoke-KvValueOnlyText -Text $line } else { $line }
                     $h = Invoke-LeakHardeningText -Text $h
                     $h = Protect-SensitiveTerms -Text $h -SensitiveTerms $SensitiveTerms
@@ -5876,7 +6247,7 @@ function Invoke-ScrubFileStreaming {
     }
     finally {
         try { & $updateWorkerProgress 'Completed' -Force } catch { }
-        $writer.Close(); Write-Progress -Activity "Streaming $name" -Completed
+        $writer.Close(); Write-UlsProgress -Activity "Stream scrub" -File $name -Completed
     }
     if ($ulsPerfStreamTotal) { $ulsPerfStreamTotal.Stop() }
     if ($script:PerfReportEnabled) {
@@ -6116,7 +6487,9 @@ function Invoke-UlsRunspaceBatchPool {
 
         $runningCount = 0
         try { $runningCount = $state['Running'].Count } catch { $runningCount = 0 }
-        Write-Progress -Activity $Activity -Status ("completed={0} submitted={1} running={2}; rowsDone={3}; rowsSubmitted={4}{5}" -f ([int64]$state['Completed']),([int64]$state['Submitted']),$runningCount,([int64]$state['CompletedRows']),([int64]$state['SubmittedRows']),$mbStatus) -PercentComplete $percent
+        $progressBytes = [Math]::Max([int64]$state['CompletedBytes'], [int64]$state['SubmittedBytes'])
+        if ($TotalBytes -gt 0) { $progressBytes = [Math]::Min([int64]$TotalBytes, [int64]$progressBytes) }
+        Write-UlsProgress -Activity $Activity -Phase ("done {0}/{1}" -f ([int64]$state['Completed']), ([int64]$state['Submitted'])) -RowsDone ([int64]$state['CompletedRows']) -RowsTotal ([int64]$state['SubmittedRows']) -BytesDone ([int64]$progressBytes) -BytesTotal $TotalBytes -Workers $runningCount -Pending ([int]$pending.Count) -Force:$Force -MinIntervalMs 500
         $state['LastProgressUpdate'] = $nowProgress
     }
 
@@ -6187,7 +6560,7 @@ function Invoke-UlsRunspaceBatchPool {
         # Force a final 100% completion state before clearing the progress record.
         if ($TotalBytes -gt 0) { $state['CompletedBytes'] = [Math]::Max([int64]$state['CompletedBytes'], [int64]$TotalBytes) }
         & $writeProgress -Force
-        Write-Progress -Activity $Activity -Completed
+        Write-UlsProgress -Activity $Activity -Completed
     }
     finally {
         try {
@@ -6350,7 +6723,7 @@ function Invoke-ScrubFileStreamingParallelText {
             foreach ($line in @($r.Lines)) { $writer.WriteLine([string]$line); $writtenLines++ }
             $ready.Remove($nextWrite)
             Set-Variable -Name nextWrite -Scope 1 -Value ($nextWrite + 1)
-            Write-Progress -Activity "Streaming parallel scrub $name" -Status "written=$writtenLines read=$totalLines batchesDone=$nextWrite" -PercentComplete -1
+            Write-UlsProgress -Activity "Parallel scrub" -Phase "text" -File $name -RowsDone $writtenLines -RowsTotal $totalLines -CompletedBatches $nextWrite -Ready $ready.Count
         }
     }
     $sw = New-UlsPerfStopwatch
@@ -6491,7 +6864,7 @@ function Invoke-ScrubFileStreamingParallelCsv {
             }
             $ready.Remove($nextWrite)
             $csvParallelState['NextWrite'] = $nextWrite + 1
-            Write-Progress -Activity "Streaming parallel scrub $name" -Status "written=$($csvParallelState['WrittenRows']) read=$($csvParallelState['TotalRows']) batchesDone=$($csvParallelState['NextWrite']) ready=$($ready.Count)" -PercentComplete -1
+            Write-UlsProgress -Activity "Parallel scrub" -Phase "csv" -File $name -RowsDone ([int]$csvParallelState['WrittenRows']) -RowsTotal ([int]$csvParallelState['TotalRows']) -CompletedBatches ([int]$csvParallelState['NextWrite']) -Ready $ready.Count
         }
     }
 
@@ -6514,9 +6887,9 @@ function Invoke-ScrubFileStreamingParallelCsv {
         $clean = $true
     }
     else {
-        Write-Progress -Activity "Verifying $name" -Status "Final streaming leak check" -PercentComplete -1
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
-        Write-Progress -Activity "Verifying $name" -Completed
+        Write-UlsProgress -Activity "Verify" -Phase "leak check" -File $name -Force
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -ProbeOnly
+        Write-UlsProgress -Activity "Verify" -File $name -Completed
     }
     Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $writtenRows -Notes ('Streaming parallel CSV final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
     if ([int]$csvParallelState['FallbackCount'] -gt 0) {
@@ -7043,7 +7416,7 @@ Invoke-UniversalScrubber -Path $pathLiteral -WorkDir $workLiteral -Profile $prof
         $clean = $true
     }
     else {
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -ProbeOnly
     }
     Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $mergedRows -Notes ('Parallel final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
 
@@ -7204,6 +7577,52 @@ function Invoke-ScrubSelfTest {
         if ($cond) { Write-Ok $msg; $script:__stPass++ } else { Write-Fail $msg; $script:__stFail++ }
     }
     $reset = { $script:TokenByNorm = @{}; $script:TokenMapCacheKey = $null }
+    function New-UlsSelfTestZip {
+        param(
+            [Parameter(Mandatory)][string]$Path,
+            [Parameter(Mandatory)][hashtable]$Entries
+        )
+        try { Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop } catch { }
+        try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
+        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+        $zip = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($entryName in @($Entries.Keys)) {
+                $entry = $zip.CreateEntry([string]$entryName)
+                $stream = $entry.Open()
+                $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
+                try { $writer.Write([string]$Entries[$entryName]) }
+                finally { $writer.Dispose(); $stream.Dispose() }
+            }
+        }
+        finally { $zip.Dispose() }
+        return $Path
+    }
+    function Test-UlsSelfTestDelimitedFilesEqual {
+        param(
+            [Parameter(Mandatory)][string]$Left,
+            [Parameter(Mandatory)][string]$Right,
+            [string]$Delimiter = ','
+        )
+        $leftReader = New-Object System.IO.StreamReader($Left, [System.Text.Encoding]::UTF8, $true)
+        $rightReader = New-Object System.IO.StreamReader($Right, [System.Text.Encoding]::UTF8, $true)
+        try {
+            while ($true) {
+                $leftRow = Read-UlsDelimitedRecord -Reader $leftReader -Delimiter $Delimiter
+                $rightRow = Read-UlsDelimitedRecord -Reader $rightReader -Delimiter $Delimiter
+                if ($null -eq $leftRow -and $null -eq $rightRow) { return $true }
+                if ($null -eq $leftRow -or $null -eq $rightRow) { return $false }
+                if ($leftRow.Count -ne $rightRow.Count) { return $false }
+                for ($i = 0; $i -lt $leftRow.Count; $i++) {
+                    if (-not [string]::Equals([string]$leftRow[$i], [string]$rightRow[$i], [System.StringComparison]::Ordinal)) { return $false }
+                }
+            }
+        }
+        finally {
+            try { $leftReader.Close() } catch { }
+            try { $rightReader.Close() } catch { }
+        }
+    }
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("scrubtest_" + ([System.IO.Path]::GetRandomFileName().Replace('.', '')))
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     try {
@@ -7229,6 +7648,12 @@ function Invoke-ScrubSelfTest {
         & $assert ($guardErrors.Count -eq 0) "module parses without static errors"
         $duplicateFunctions = @($guardAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Group-Object Name | Where-Object { $_.Count -gt 1 })
         & $assert ($duplicateFunctions.Count -eq 0) "module has no duplicate function definitions"
+        try {
+            Write-UlsProgress -Activity 'Self-test progress' -Phase 'compact' -File 'sample.csv' -RowsDone 1 -RowsTotal 2 -Workers 2 -Pending 1 -Ready 0 -Force
+            Write-UlsProgress -Activity 'Self-test progress' -Completed
+            & $assert $true "compact progress helper accepts short status inputs"
+        }
+        catch { & $assert $false "compact progress helper accepts short status inputs" }
 
         # ---- 1) Local recommendation mode (no salt required) ----
         Write-Rule "Log format recommendations"
@@ -7244,7 +7669,19 @@ function Invoke-ScrubSelfTest {
             [pscustomobject]@{ Name='iis'; Ext='log'; ExpectedFormat='W3C/IIS'; ExpectedProfile='IIS'; Lines=@('#Software: Microsoft Internet Information Services 10.0','#Fields: date time c-ip cs-username cs-host cs-uri-stem sc-status','2026-01-01 00:00:00 10.0.0.1 CORP\alice intranet.corp.local /home 200') },
             [pscustomobject]@{ Name='cef'; Ext='log'; ExpectedFormat='CEF'; ExpectedProfile='Cef'; Lines=@('CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1 suser=alice shost=app01') },
             [pscustomobject]@{ Name='kv'; Ext='log'; ExpectedFormat='logfmt / key=value'; ExpectedProfile='Logfmt'; Lines=@('time=2026-01-01T00:00:00Z level=info user=alice host=app01') },
+            [pscustomobject]@{ Name='firewall-text'; Ext='log'; ExpectedFormat='Firewall/VPN text'; ExpectedProfile='Firewall'; Lines=@('2026-01-01T00:00:00Z firewall policy=Allow-VPN action=allow src_ip=10.40.1.10 dst_ip=10.40.2.20 src_user=CORP\alice dst_host=vpn-gw01.corp.local proto=tcp') },
+            [pscustomobject]@{ Name='firewall-csv'; Ext='csv'; ExpectedFormat='Firewall CSV export'; ExpectedProfile='FirewallCsv'; Lines=@('Time,Action,Rule,SourceIP,DestinationIP,SourceUser,DestinationHost,Protocol','2026-01-01T00:00:00Z,allow,VPN-Users,10.40.1.10,10.40.2.20,CORP\alice,vpn-gw01.corp.local,tcp') },
             [pscustomobject]@{ Name='apache'; Ext='log'; ExpectedFormat='Apache/Nginx access log'; ExpectedProfile='Apache'; Lines=@('10.0.0.1 - alice [01/Jan/2026:00:00:00 +0000] "GET / HTTP/1.1" 200 123 "-" "curl/8.0"') },
+            [pscustomobject]@{ Name='servicenow'; Ext='csv'; ExpectedFormat='ServiceNow export'; ExpectedProfile='ServiceNow'; Lines=@('sys_id,number,short_description,work_notes,caller_id,assigned_to,cmdb_ci,sys_created_on','abc123,INC001,VPN issue,"caller alice from 10.1.1.1",alice@corp.local,CORP\bob,host01.corp.local,2026-01-01T00:00:00Z') },
+            [pscustomobject]@{ Name='nexthink'; Ext='csv'; ExpectedFormat='Nexthink export'; ExpectedProfile='Nexthink'; Lines=@('device_uid,device_name,user_name,binary_name,remote_action,execution_status,collector','dev-001,laptop01,alice,notepad.exe,cleanup,success,collector01') },
+            [pscustomobject]@{ Name='sccm'; Ext='csv'; ExpectedFormat='SCCM/MECM export'; ExpectedProfile='Sccm'; Lines=@('ResourceID,SMSUniqueIdentifier,Name0,User_Name0,CollectionID,DeploymentID,SiteCode','1001,SMS-abc,WIN10-001,alice,COL00001,DEP00001,P01') },
+            [pscustomobject]@{ Name='sccm-text'; Ext='log'; ExpectedFormat='SCCM/ConfigMgr client text'; ExpectedProfile='SccmText'; Lines=@('<![LOG[Successfully processed deployment for user alice@corp.local on client SCCM-LAPTOP-01 IP 10.41.1.10]LOG]!><time="12:00:00.000+000" date="01-01-2026" component="ExecMgr" context="" type="1" thread="1001" file="execmgr.cpp:123">') },
+            [pscustomobject]@{ Name='intune'; Ext='csv'; ExpectedFormat='Intune export'; ExpectedProfile='Intune'; Lines=@('managedDeviceName,userPrincipalName,azureADDeviceId,complianceState,managementAgent,enrolledDateTime,deviceEnrollmentType','LAPTOP-01,alice@corp.local,11112222-3333-4444-5555-666677778888,compliant,mdm,2026-01-01T00:00:00Z,windowsAzureADJoin') },
+            [pscustomobject]@{ Name='intune-diagnostics'; Ext='reg'; ExpectedFormat='Intune Diagnostics text/report'; ExpectedProfile='IntuneDiagnostics'; Lines=@('Windows Registry Editor Version 5.00','[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Enrollments\{11112222-3333-4444-5555-666677778888}]','"UPN"="diag.user@corp.local"','"Provider"="DeviceManagement-Enterprise-Diagnostics-Provider"','"PolicyManager"="MDM policy source"') },
+            [pscustomobject]@{ Name='m365-audit'; Ext='csv'; ExpectedFormat='M365/identity audit export'; ExpectedProfile='IdentityProvider'; Lines=@('CreationTime,UserId,Operation,Workload,ClientIP,ActorIpAddress,DeviceName','2026-01-01T00:00:00Z,alice@corp.local,UserLoggedIn,AzureActiveDirectory,10.42.1.10,10.42.1.10,AAD-LAPTOP-01') },
+            [pscustomobject]@{ Name='sentinel-jsonl'; Ext='jsonl'; ExpectedFormat='JSON Lines / NDJSON'; ExpectedProfile='CloudAudit'; Lines=@('{"incidentNumber":"1234","incidentUrl":"https://portal.azure.com/incidents/1234","owner":{"assignedTo":"analyst@corp.local"},"alerts":[{"entities":[{"hostName":"sentinel-host01.corp.local","address":"10.43.1.10"}]}]}') },
+            [pscustomobject]@{ Name='edr-jsonl'; Ext='jsonl'; ExpectedFormat='JSON Lines / NDJSON'; ExpectedProfile='Edr'; Lines=@('{"alert_id":"edr-1234","device_name":"edr-host01.corp.local","user_email":"alice@corp.local","process_path":"C:\\Users\\alice\\malware.exe","remote_ip":"10.44.1.10","remote_domain":"c2.corp.local","sha256":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}') },
+            [pscustomobject]@{ Name='etl'; Ext='etl'; ExpectedFormat='ETL trace'; ExpectedProfile='Generic'; Lines=@('Synthetic ETL placeholder used only for detection; conversion is opt-in.') },
             [pscustomobject]@{ Name='plain'; Ext='txt'; ExpectedFormat='Generic text'; ExpectedProfile='Text'; Lines=@('plain diagnostic text with no structured delimiter') }
         )
         $recSalt = $script:Salt
@@ -7259,7 +7696,40 @@ function Invoke-ScrubSelfTest {
                     & $assert ($rec[0].DetectedFormat -eq $spec.ExpectedFormat) "Test-LogFormat [$($spec.Name)] detects $($spec.ExpectedFormat)"
                     & $assert ($rec[0].SuggestedProfile -eq $spec.ExpectedProfile) "Test-LogFormat [$($spec.Name)] suggests $($spec.ExpectedProfile)"
                     & $assert (-not [string]::IsNullOrWhiteSpace($rec[0].RecommendedCommand)) "Test-LogFormat [$($spec.Name)] includes command"
+                    if ($spec.Name -eq 'etl') {
+                        & $assert ($rec[0].RecommendedCommand -match '-ConvertEtl') "Test-LogFormat [etl] recommends explicit conversion switch"
+                        & $assert (($rec[0].Warnings -join ' ') -match 'opt-in') "Test-LogFormat [etl] warns conversion is opt-in"
+                    }
                 }
+            }
+            $officeDir = Join-Path $dir 'office'
+            New-Item -ItemType Directory -Path $officeDir -Force | Out-Null
+            $docxPath = Join-Path $officeDir 'office-sample.docx'
+            [void](New-UlsSelfTestZip -Path $docxPath -Entries @{
+                '[Content_Types].xml' = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>'
+                'word/document.xml' = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>docx.user@corp.local</w:t></w:r></w:p><w:p><w:r><w:t>docx-host.corp.local</w:t></w:r></w:p></w:body></w:document>'
+                'word/comments.xml' = '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment><w:p><w:r><w:t>comment secret docx-token-123</w:t></w:r></w:p></w:comment></w:comments>'
+            })
+            $pptxPath = Join-Path $officeDir 'office-sample.pptx'
+            [void](New-UlsSelfTestZip -Path $pptxPath -Entries @{
+                '[Content_Types].xml' = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>'
+                'ppt/slides/slide1.xml' = '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>pptx.user@corp.local</a:t></a:r></a:p><a:p><a:r><a:t>pptx-host.corp.local</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>'
+                'ppt/notesSlides/notesSlide1.xml' = '<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>speaker note private-token</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>'
+            })
+            foreach ($officeSpec in @(
+                [pscustomobject]@{ Path=$docxPath; Format='DOCX'; Profile='Text'; Converter='Docx'; Needle='docx.user@corp.local' },
+                [pscustomobject]@{ Path=$pptxPath; Format='PPTX'; Profile='Text'; Converter='Pptx'; Needle='pptx.user@corp.local' }
+            )) {
+                $officeRec = @(Test-LogFormat -Path $officeSpec.Path -Quiet | Select-Object -First 1)
+                & $assert ($officeRec.Count -eq 1 -and $officeRec[0].DetectedFormat -eq $officeSpec.Format -and $officeRec[0].SuggestedProfile -eq $officeSpec.Profile) "Test-LogFormat [$($officeSpec.Format)] recommends Text"
+                $officeTextPath = Join-Path $officeDir ("converted-{0}.txt" -f $officeSpec.Converter.ToLowerInvariant())
+                if ($officeSpec.Converter -eq 'Docx') { [void](ConvertFrom-DocxToText -DocxPath $officeSpec.Path -OutText $officeTextPath) }
+                else { [void](ConvertFrom-PptxToText -PptxPath $officeSpec.Path -OutText $officeTextPath) }
+                $officeText = Get-Content -Path $officeTextPath -Raw
+                & $assert ($officeText -match [regex]::Escape($officeSpec.Needle)) "$($officeSpec.Format) converter extracts body/slide text"
+                $officeRun = Invoke-UniversalScrubber -Path $officeSpec.Path -WorkDir (Join-Path $officeDir ("office-run-" + $officeSpec.Converter.ToLowerInvariant())) -Profile Text -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -SkipLeakCheck -NonInteractive
+                $officeOutText = Get-Content -Path $officeRun[0].Output -Raw
+                & $assert (-not ($officeOutText -match [regex]::Escape($officeSpec.Needle))) "$($officeSpec.Format) intake scrubs converted text"
             }
             'Generated artifact placeholder' | Set-Content -Path (Join-Path $recDir 'old_scrubbed.log') -Encoding UTF8
             'Generated artifact placeholder' | Set-Content -Path (Join-Path $recDir 'scrub_token_map_DO_NOT_UPLOAD.csv') -Encoding UTF8
@@ -7270,47 +7740,84 @@ function Invoke-ScrubSelfTest {
             & $assert ($recommend.Count -eq $recSpecs.Count) "RecommendOnly exits before salt is required"
             $safeFirst = @(Invoke-UniversalScrubber -Path $recDir -Recurse -SafeFirstRun -NonInteractive)
             & $assert ($safeFirst.Count -eq $recSpecs.Count) "SafeFirstRun exits before salt is required"
+            $etlRunRefused = $false
+            try {
+                [void](Invoke-UniversalScrubber -Path (Join-Path $recDir 'etl.etl') -WorkDir (Join-Path $recDir 'etl-out') -Salt 'selftest-fixed-salt' -NonInteractive)
+            }
+            catch { $etlRunRefused = ($_.Exception.Message -match 'requires -ConvertEtl') }
+            & $assert $etlRunRefused "ETL input refuses conversion unless -ConvertEtl is supplied"
+            $etlMissingTracerpt = $false
+            try {
+                [void](ConvertFrom-EtlToCsv -EtlPath (Join-Path $recDir 'etl.etl') -OutCsv (Join-Path $recDir 'etl.csv') -TracerptPath (Join-Path $recDir 'missing-tracerpt.exe'))
+            }
+            catch { $etlMissingTracerpt = ($_.Exception.Message -match 'tracerpt\.exe was not found') }
+            & $assert $etlMissingTracerpt "ETL converter reports missing tracerpt.exe clearly"
         }
         finally { $script:Salt = $recSalt }
 
-        # ---- 2) External corpus catalog and offline smoke test ----
-        Write-Rule "External corpus catalog"
-        $catalog = @(Get-LogCorpusCatalog)
-        & $assert ($catalog.Count -ge 5) "corpus catalog returns curated entries"
-        $requiredCatalogFields = @('Name','Source','Description','Homepage','DownloadUrl','InstructionsUrl','FormatHint','SuggestedProfile','ExpectedFileTypes','ApproxSize','LicenseNote','SafetyWarning','RequiresManualDownload','CanDownloadDirectly','Notes')
-        foreach ($field in $requiredCatalogFields) {
-            & $assert (($catalog | Where-Object { $_.PSObject.Properties.Name -contains $field }).Count -eq $catalog.Count) "corpus catalog field present: $field"
+        # ---- 3) Enterprise export profiles ----
+        Write-Rule "Enterprise export profiles"
+        $enterpriseDir = Join-Path $dir 'enterprise'
+        New-Item -ItemType Directory -Path $enterpriseDir -Force | Out-Null
+        $enterpriseSpecs = @(
+            [pscustomobject]@{
+                Profile='ServiceNow'; Lines=@(
+                    'number,sys_id,state,priority,caller_id,assigned_to,cmdb_ci,work_notes,sys_created_on',
+                    '"INC0010001","abc123def456","Closed","2","alice@corp.local","CORP\bob","app01.corp.local","caller alice from 10.31.1.10 visited https://snow-private.corp.local/task","2026-01-01T00:00:00Z"'
+                )
+                Preserve=@('INC0010001','Closed','2','2026-01-01T00:00:00Z')
+                Remove=@('alice@corp.local','CORP\bob','app01.corp.local','10.31.1.10','snow-private.corp.local')
+            },
+            [pscustomobject]@{
+                Profile='Nexthink'; Lines=@(
+                    'timestamp,device_uid,device_name,user_name,destination,binary_name,execution_status,comment',
+                    '"2026-01-01T00:00:00Z","dev-001","laptop01.corp.local","alice@corp.local","cache01.corp.local","agent.exe","success","remote action from 10.31.2.10"'
+                )
+                Preserve=@('2026-01-01T00:00:00Z','success','agent.exe')
+                Remove=@('dev-001','laptop01.corp.local','alice@corp.local','cache01.corp.local','10.31.2.10')
+            },
+            [pscustomobject]@{
+                Profile='Sccm'; Lines=@(
+                    'ResourceID,SMSUniqueIdentifier,Name0,User_Name0,CollectionID,DeploymentID,SiteCode,IPAddress0,MAC_Addresses0,SerialNumber0',
+                    '"1001","SMS-abc","WIN10-001.corp.local","CORP\charlie","COL00001","DEP00001","P01","10.31.3.10","00:11:22:33:44:55","ABC123SERIAL"'
+                )
+                Preserve=@('1001','COL00001','DEP00001','P01')
+                Remove=@('WIN10-001.corp.local','CORP\charlie','10.31.3.10','00:11:22:33:44:55','ABC123SERIAL')
+            },
+            [pscustomobject]@{
+                Profile='Intune'; Lines=@(
+                    'managedDeviceName,userPrincipalName,azureADDeviceId,complianceState,managementAgent,enrolledDateTime,serialNumber,wiFiMacAddress,ipAddress',
+                    '"LAPTOP-02.corp.local","delta@corp.local","11112222-3333-4444-5555-666677778888","compliant","mdm","2026-01-01T00:00:00Z","SERIAL98765","66:55:44:33:22:11","10.31.4.10"'
+                )
+                Preserve=@('compliant','mdm','2026-01-01T00:00:00Z')
+                Remove=@('LAPTOP-02.corp.local','delta@corp.local','11112222-3333-4444-5555-666677778888','SERIAL98765','66:55:44:33:22:11','10.31.4.10')
+            }
+        )
+        foreach ($es in $enterpriseSpecs) {
+            & $reset
+            $enterprisePath = Join-Path $enterpriseDir ("{0}.csv" -f $es.Profile)
+            $es.Lines | Set-Content -Path $enterprisePath -Encoding UTF8
+            $enterpriseOutDir = Join-Path $enterpriseDir ("out-" + $es.Profile)
+            $enterpriseRun = Invoke-UniversalScrubber -Path $enterprisePath -WorkDir $enterpriseOutDir -Profile $es.Profile -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -ScrubPolicy Balanced -SkipLeakCheck -NonInteractive
+            $enterpriseText = Get-Content -Path $enterpriseRun[0].Output -Raw
+            foreach ($keep in @($es.Preserve)) { & $assert ($enterpriseText -match [regex]::Escape($keep)) "[$($es.Profile)] preserved metadata: $keep" }
+            foreach ($gone in @($es.Remove)) { & $assert (-not ($enterpriseText -match [regex]::Escape($gone))) "[$($es.Profile)] removed sensitive value: $gone" }
         }
-        & $assert (($catalog | Where-Object { -not [string]::IsNullOrWhiteSpace($_.DownloadUrl) -or -not [string]::IsNullOrWhiteSpace($_.InstructionsUrl) }).Count -eq $catalog.Count) "corpus catalog has download or instructions URL"
-        $apacheCatalog = @(Search-LogCorpusCatalog -Query apache)
-        & $assert (@($apacheCatalog | Where-Object { $_.Name -eq 'Loghub-Apache' }).Count -eq 1) "corpus search query finds Loghub-Apache"
-        $profileCatalog = @(Search-LogCorpusCatalog -Profile WindowsEventCsv)
-        & $assert (@($profileCatalog | Where-Object { $_.Name -eq 'EVTX-ATTACK-SAMPLES' }).Count -eq 1) "corpus search profile filters entries"
-        $formatCatalog = @(Search-LogCorpusCatalog -Format evtx)
-        & $assert (@($formatCatalog | Where-Object { $_.FormatHint -match 'EVTX' }).Count -ge 1) "corpus search format filters entries"
-
-        $corpusDownloadDir = Join-Path $dir 'corpus-downloads'
-        $downloadRefused = $false
-        try { [void](Save-LogCorpusSample -Name Loghub-Apache -Destination $corpusDownloadDir -Force) }
-        catch { $downloadRefused = ($_.Exception.Message -match 'AcceptRisk') }
-        & $assert $downloadRefused "Save-LogCorpusSample refuses direct download without AcceptRisk"
-        $manual = Save-LogCorpusSample -Name Splunk-BOTS-v3 -Destination $corpusDownloadDir -Force
-        & $assert ($manual.RequiresManualDownload -and (Test-Path -LiteralPath $manual.ManifestPath)) "manual corpus entry writes instructions manifest without download"
-        $manualOverwriteRefused = $false
-        try { [void](Save-LogCorpusSample -Name Splunk-BOTS-v3 -Destination $corpusDownloadDir) }
-        catch { $manualOverwriteRefused = ($_.Exception.Message -match 'already has content') }
-        & $assert $manualOverwriteRefused "manual corpus manifest refuses overwrite without Force"
-
-        $localCorpus = Join-Path $dir 'local-corpus'
-        New-Item -ItemType Directory -Path $localCorpus -Force | Out-Null
+        & $reset
+        $diagPath = Join-Path $enterpriseDir 'IntuneDiagnostics.log'
         @(
-            '{"timestamp":"2026-01-01T00:00:00Z","level":"INFO","username":"corpus.user","host":"corpus01.internal.test","src_ip":"10.71.1.2","message":"synthetic external corpus row"}',
-            '{"timestamp":"2026-01-01T00:00:01Z","level":"WARN","username":"corpus.admin","host":"corpus02.internal.test","src_ip":"10.71.1.3","message":"synthetic external corpus warning"}'
-        ) | Set-Content -Path (Join-Path $localCorpus 'mini-app.jsonl') -Encoding UTF8
-        $corpusOut = Join-Path $dir 'external-corpus-results'
-        $corpusSmoke = Invoke-ExternalCorpusSmokeTest -CorpusRoot $localCorpus -WorkDir $corpusOut -UseRecommendations -DryRunOnly -Salt 'selftest-fixed-salt' -NonInteractive
-        & $assert ((Test-Path -LiteralPath $corpusSmoke.Summary.Csv) -and (Test-Path -LiteralPath $corpusSmoke.Summary.Json) -and (Test-Path -LiteralPath $corpusSmoke.Summary.Markdown)) "external corpus smoke test writes CSV/JSON/Markdown summaries"
-        & $assert (@($corpusSmoke.Results | Where-Object { $_.PassFail -eq 'Pass' }).Count -eq 1) "external corpus smoke test passes synthetic local corpus"
+            'IntuneManagementExtension PolicyManager MDM DeviceEnrollment diagnostic report',
+            'UPN: diag.user@corp.local',
+            'Device Name: diag-laptop.corp.local',
+            'Serial Number: DIAGSERIAL12345',
+            'Profile path HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\S-1-5-21-111-222-333-1001',
+            'Client IP Address: 10.31.5.10',
+            'Status: Completed Result: 0x0'
+        ) | Set-Content -Path $diagPath -Encoding UTF8
+        $diagRun = Invoke-UniversalScrubber -Path $diagPath -WorkDir (Join-Path $enterpriseDir 'out-IntuneDiagnostics') -Profile IntuneDiagnostics -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -ScrubPolicy Balanced -SkipLeakCheck -NonInteractive
+        $diagText = Get-Content -Path $diagRun[0].Output -Raw
+        foreach ($keep in @('IntuneManagementExtension','PolicyManager','MDM','Completed','0x0')) { & $assert ($diagText -match [regex]::Escape($keep)) "[IntuneDiagnostics] preserved diagnostic context: $keep" }
+        foreach ($gone in @('diag.user@corp.local','diag-laptop.corp.local','DIAGSERIAL12345','S-1-5-21-111-222-333-1001','10.31.5.10')) { & $assert (-not ($diagText -match [regex]::Escape($gone))) "[IntuneDiagnostics] removed sensitive value: $gone" }
 
         # ---- 3) One planted fixture per profile ----
         Write-Rule "Per-profile fixtures"
@@ -7493,6 +8000,50 @@ function Invoke-ScrubSelfTest {
         }
         $dry = Invoke-UniversalScrubber -Path $byopCsv -WorkDir (Join-Path $byop 'dryrun') -ProfileFile $profilePath -SeedFile $seedPath -AllowlistFile $allowPath -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -DryRun -NonInteractive
         & $assert ((@($dry) | Select-Object -First 1).DryRun -and ((@($dry) | Select-Object -First 1).ChangeCount -gt 0)) "BYOP dry-run uses profile and seed files"
+        $extensionPath = Join-Path $byop 'profile-extension.json'
+        $extensionJson = @'
+{
+  "Name": "SelfTestExtension",
+  "Description": "Additive overlay for self-test.",
+  "Allowlist": [ "public-extension.example.com" ],
+  "SchemaColumns": [
+    { "Exact": "ExtStatus", "Action": "PassThrough" }
+  ],
+  "WholeColumnRules": [
+    { "Exact": "CustomAsset", "Prefix": "COMPUTER" }
+  ],
+  "LabelRules": [
+    { "Name": "ExtensionLabels", "Labels": [ "asset owner" ], "Prefix": "PRINCIPAL" }
+  ],
+  "CustomRegexRules": [
+    {
+      "Name": "ExtensionCaseId",
+      "Regex": "(?i)\\b(case id\\s*[:=]\\s*)(CASE-[0-9]+)\\b",
+      "CaptureGroup": 2,
+      "Prefix": "OBJECT",
+      "Keywords": [ "case id", "CASE-" ],
+      "Entropy": 0
+    }
+  ]
+}
+'@
+        [System.IO.File]::WriteAllText($extensionPath, $extensionJson, [System.Text.Encoding]::UTF8)
+        $extension = Import-ScrubProfileExtensionFile -Path $extensionPath
+        & $assert ($extension.Name -eq 'SelfTestExtension' -and $extension.WholeColumnRules.Count -eq 1 -and $extension.CustomRegexRules.Count -eq 1) "profile extension imports additive rules"
+        $extensionCsv = Join-Path $byop 'extension.csv'
+        @(
+            'Timestamp,ExtStatus,CustomAsset,Message',
+            '"2026-01-01T00:00:00Z","Complete","EXT-LAPTOP-77","asset owner: ext.owner case id: CASE-778899 public-extension.example.com"'
+        ) | Set-Content -Path $extensionCsv -Encoding UTF8
+        & $reset
+        $extensionRun = Invoke-UniversalScrubber -Path $extensionCsv -WorkDir (Join-Path $byop 'extension-out') -Profile Generic -ProfileExtensionFile $extensionPath -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -NonInteractive
+        $extensionText = Get-Content -Path $extensionRun[0].Output -Raw
+        foreach ($gone in @('EXT-LAPTOP-77','ext.owner','CASE-778899')) {
+            & $assert (-not ($extensionText -match [regex]::Escape($gone))) "profile extension removed: $gone"
+        }
+        foreach ($keep in @('Complete','public-extension.example.com','2026-01-01T00:00:00Z')) {
+            & $assert ($extensionText -match [regex]::Escape($keep)) "profile extension preserved: $keep"
+        }
         $oldProfilePath = Join-Path $byop 'profile-v48.json'
         [System.IO.File]::WriteAllText($oldProfilePath, '{"Name":"Compat48","Format":"Csv","ColumnPrefix":[{"Pattern":"(?i)^User$","Prefix":"PRINCIPAL"}],"FreeTextRegex":".*"}', [System.Text.Encoding]::UTF8)
         $oldProfile = Import-ScrubProfileFile -Path $oldProfilePath
@@ -7557,10 +8108,37 @@ function Invoke-ScrubSelfTest {
         $overwriteFailed = $false
         try { [void](New-ScrubProfileFromSample -Path (Join-Path $builder 'sample_csv.csv') -ProfileOut (Join-Path $builder 'generated_csv.json') -ProfileReportOut (Join-Path $builder 'report_csv_DO_NOT_UPLOAD.md') -NonInteractive) } catch { $overwriteFailed = ($_.Exception.Message -match 'already exists') }
         & $assert $overwriteFailed "profile builder refuses overwrite without -Force"
+        $baseProfileOut = Join-Path $builder 'generated_kv_base_extension.json'
+        $baseReportOut = Join-Path $builder 'report_kv_base_extension_DO_NOT_UPLOAD.md'
+        $builtBase = New-ScrubProfileFromSample -Path (Join-Path $builder 'sample_kv.log') -ProfileOut $baseProfileOut -ProfileReportOut $baseReportOut -BaseProfile Logfmt -ProfileExtensionFile $extensionPath -MaxSampleRows 50 -Force -NonInteractive
+        $builtBaseText = Get-Content -Path $builtBase.ProfilePath -Raw
+        & $assert (Test-ScrubProfile -Path $builtBase.ProfilePath -Quiet) "profile builder base+extension profile imports"
+        & $assert ($builtBaseText -match '"BaseProfile"\s*:\s*"Logfmt"') "profile builder records base profile"
+        & $assert ($builtBaseText -match 'SelfTestExtension') "profile builder records extension source"
+        & $assert ($builtBaseText -match 'ExtensionCaseId') "profile builder merges extension rules into standalone profile"
 
         # ---- 6) Streaming vs normal equivalence ----
         Write-Rule "Streaming equivalence"
         $script:ScrubPolicy = 'Balanced'
+        $parserPath = Join-Path $dir 'parser-edge-cases.csv'
+        $parserLines = @(
+            (ConvertTo-UlsDelimitedLine -Values @('A','B','C') -Delimiter ','),
+            (ConvertTo-UlsDelimitedLine -Values @('one','comma, here','say "hi"') -Delimiter ','),
+            (ConvertTo-UlsDelimitedLine -Values @('two','',"line1`r`nline2") -Delimiter ',')
+        )
+        [System.IO.File]::WriteAllText($parserPath, (($parserLines -join "`r`n") + "`r`n"), [System.Text.Encoding]::UTF8)
+        $parserReader = New-Object System.IO.StreamReader($parserPath, [System.Text.Encoding]::UTF8, $true)
+        try {
+            $parserHeader = Read-UlsDelimitedRecord -Reader $parserReader -Delimiter ','
+            $parserRow1 = Read-UlsDelimitedRecord -Reader $parserReader -Delimiter ','
+            $parserRow2 = Read-UlsDelimitedRecord -Reader $parserReader -Delimiter ','
+            $parserEnd = Read-UlsDelimitedRecord -Reader $parserReader -Delimiter ','
+        }
+        finally { $parserReader.Close() }
+        & $assert ($parserHeader.Count -eq 3 -and $parserHeader[0] -eq 'A' -and $parserHeader[2] -eq 'C') "fast CSV parser reads header"
+        & $assert ($parserRow1[1] -eq 'comma, here' -and $parserRow1[2] -eq 'say "hi"') "fast CSV parser preserves quoted commas and doubled quotes"
+        & $assert ($parserRow2[1] -eq '' -and $parserRow2[2] -eq "line1`r`nline2") "fast CSV parser preserves empty and multiline quoted fields"
+        & $assert ($null -eq $parserEnd) "fast CSV parser reaches EOF cleanly"
         & $reset
         $sfx = New-SyntheticLog -Profile 'Generic' -Dir $dir -Name 'streamcase'
         $smap = Join-Path $dir 'map_stream_DO_NOT_UPLOAD.csv'
@@ -7621,7 +8199,7 @@ function Invoke-ScrubSelfTest {
         $pNormalText = Get-Content -Path $pNormal.Output -Raw
         $pParallelText = Get-Content -Path $pParallel.Output -Raw
         & $assert ($pNormal.Clean -and $pParallel.Clean -and $pParallel.StreamingParallel) "parallel CSV: normal and streaming-parallel modes leak-clean"
-        & $assert ([string]::Equals($pNormalText, $pParallelText, [System.StringComparison]::Ordinal)) "parallel CSV: output equals normal streaming output"
+        & $assert (Test-UlsSelfTestDelimitedFilesEqual -Left $pNormal.Output -Right $pParallel.Output -Delimiter ',') "parallel CSV: output matches normal streaming rows and cells"
         & $assert ($parallelFolderCountAfter -eq $parallelFolderCountBefore) "parallel CSV: no _parallel chunk folders are created"
         foreach ($gone in @('parallel.user','second.user','10.21.22.23','10.21.22.24','PARHOST01','PARHOST02','db01.corp.local')) {
             & $assert (-not ($pParallelText -match [regex]::Escape($gone))) "parallel CSV removed: $gone"
@@ -7725,7 +8303,7 @@ function Invoke-ScrubFile {
             Import-Csv -Path $InputPath -Delimiter $delim | ForEach-Object {
                 $row = $_
                 $rn++
-                if ($rn % 250 -eq 0) { Write-Progress -Activity "Dry-run scan $name" -Status "Row $rn" -PercentComplete -1 }
+                if ($rn % 250 -eq 0) { Write-UlsProgress -Activity "Dry run" -Phase $format -File $name -RowsDone $rn }
                 foreach ($prop in $row.PSObject.Properties) {
                     $cell = [string]$prop.Value
                     if ([string]::IsNullOrWhiteSpace($cell)) { continue }
@@ -7743,7 +8321,7 @@ function Invoke-ScrubFile {
                     }
                 }
             }
-            Write-Progress -Activity "Dry-run scan $name" -Completed
+            Write-UlsProgress -Activity "Dry run" -File $name -Completed
         }
         elseif ($format -eq 'Json') {
             $raw = [System.IO.File]::ReadAllText($InputPath)
@@ -7790,7 +8368,7 @@ function Invoke-ScrubFile {
         $scrubbed = foreach ($row in $raw) {
             $rn++
             if ($rn % 250 -eq 0) {
-                Write-Progress -Activity "Scrubbing $name" -Status "Row $rn of $total" -PercentComplete ([int](($rn / [Math]::Max($total,1)) * 100))
+                Write-UlsProgress -Activity "Scrub" -Phase $format -File $name -RowsDone $rn -RowsTotal $total
             }
             $new = [ordered]@{}
             foreach ($prop in $row.PSObject.Properties) {
@@ -7810,7 +8388,7 @@ function Invoke-ScrubFile {
             }
             [pscustomobject]$new
         }
-        Write-Progress -Activity "Scrubbing $name" -Completed
+        Write-UlsProgress -Activity "Scrub" -File $name -Completed
         $ulsPerfCells = if ($total -gt 0) { $total * (@($raw[0].PSObject.Properties).Count) } else { 0 }
         Add-UlsPerfPhase -Phase 'Scrub fields' -Stopwatch $ulsPerfScrub -File $name -Rows $total -Cells $ulsPerfCells -Notes 'In-memory row/cell scrub'
         if ($script:PerfReportDetailedEnabled) {
@@ -7843,29 +8421,29 @@ function Invoke-ScrubFile {
     }
     elseif ($format -eq 'Kv') {
         Write-Work "Scrubbing (key=value, profile '$($Profile.Name)'): $name"
-        Write-Progress -Activity "Scrubbing $name" -Status "Reading key=value content" -PercentComplete 10
+        Write-UlsProgress -Activity "Scrub" -Phase "read kv" -File $name -Force
         $text = [System.IO.File]::ReadAllText($InputPath)
-        Write-Progress -Activity "Scrubbing $name" -Status "Scrubbing key=value values" -PercentComplete 35
+        Write-UlsProgress -Activity "Scrub" -Phase "kv values" -File $name -Force
         $text = Invoke-KvValueOnlyText -Text $text
-        Write-Progress -Activity "Scrubbing $name" -Status "Running whole-file hardening" -PercentComplete 70
+        Write-UlsProgress -Activity "Scrub" -Phase "harden" -File $name -Force
         $text = Invoke-LeakHardeningText -Text $text
-        Write-Progress -Activity "Scrubbing $name" -Status "Applying explicit sensitive terms" -PercentComplete 85
+        Write-UlsProgress -Activity "Scrub" -Phase "seed terms" -File $name -Force
         $text = Protect-SensitiveTerms -Text $text -SensitiveTerms $SensitiveTerms
         [System.IO.File]::WriteAllText($outFull, $text, [System.Text.Encoding]::UTF8)
-        Write-Progress -Activity "Scrubbing $name" -Completed
+        Write-UlsProgress -Activity "Scrub" -File $name -Completed
         Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
     }
     else {
         Write-Work "Scrubbing (text, profile '$($Profile.Name)'): $name"
-        Write-Progress -Activity "Scrubbing $name" -Status "Reading text content" -PercentComplete 10
+        Write-UlsProgress -Activity "Scrub" -Phase "read text" -File $name -Force
         $text = [System.IO.File]::ReadAllText($InputPath)
         Write-Detail "Input size: $($text.Length) characters"
-        Write-Progress -Activity "Scrubbing $name" -Status "Running whole-file hardening" -PercentComplete 60
+        Write-UlsProgress -Activity "Scrub" -Phase "harden" -File $name -Force
         $text = Invoke-LeakHardeningText -Text $text
-        Write-Progress -Activity "Scrubbing $name" -Status "Applying explicit sensitive terms" -PercentComplete 85
+        Write-UlsProgress -Activity "Scrub" -Phase "seed terms" -File $name -Force
         $text = Protect-SensitiveTerms -Text $text -SensitiveTerms $SensitiveTerms
         [System.IO.File]::WriteAllText($outFull, $text, [System.Text.Encoding]::UTF8)
-        Write-Progress -Activity "Scrubbing $name" -Completed
+        Write-UlsProgress -Activity "Scrub" -File $name -Completed
         Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
     }
 
@@ -7879,7 +8457,7 @@ function Invoke-ScrubFile {
         $clean = $true
     }
     else {
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -ProbeOnly
         if (-not $clean) {
             Write-Warn "Residue detected -- attempting one in-place re-harden..."
             try {
@@ -7982,6 +8560,7 @@ function Invoke-UniversalScrubber {
         [int]$HmacLength = 24,
         [string]$Profile,
         [string]$ProfileFile,
+        [string[]]$ProfileExtensionFile,
         [string]$TokenMapCsv,
         [ValidateSet('Discover','ExistingMap','AD')][string]$MapSource,
         [ValidateSet('Merge','Replace')][string]$TokenMapMode = 'Merge',
@@ -7993,6 +8572,7 @@ function Invoke-UniversalScrubber {
         [switch]$BuildProfileFromSample,
         [string]$ProfileOut,
         [string]$ProfileReportOut,
+        [string]$BaseProfile,
         [switch]$ProfileWizard,
         [int]$MaxSampleRows = 500,
         [ValidateSet('Auto','Csv','Json','Kv','Text')][string]$SampleFormat = 'Auto',
@@ -8006,6 +8586,7 @@ function Invoke-UniversalScrubber {
         [string]$SaltFromEnv,
         [string]$SaltFile,
         [switch]$KeepIntermediate,
+        [switch]$ConvertEtl,
         [switch]$Recurse,
         [string[]]$Include,
         [string[]]$Exclude,
@@ -8127,7 +8708,7 @@ function Invoke-UniversalScrubber {
         }
         if ([string]::IsNullOrWhiteSpace($ProfileOut)) { $ProfileOut = Join-Path $WorkDir 'generated-profile.json' }
         if ([string]::IsNullOrWhiteSpace($ProfileReportOut)) { $ProfileReportOut = Join-Path $WorkDir 'profile_build_report_DO_NOT_UPLOAD.md' }
-        return New-ScrubProfileFromSample -Path $Path -ProfileOut $ProfileOut -ProfileReportOut $ProfileReportOut -ProfileWizard:$ProfileWizard -MaxSampleRows $MaxSampleRows -SampleFormat $SampleFormat -Force:$Force -NonInteractive:$NonInteractive
+        return New-ScrubProfileFromSample -Path $Path -ProfileOut $ProfileOut -ProfileReportOut $ProfileReportOut -BaseProfile $BaseProfile -ProfileExtensionFile $ProfileExtensionFile -ProfileWizard:$ProfileWizard -MaxSampleRows $MaxSampleRows -SampleFormat $SampleFormat -Force:$Force -NonInteractive:$NonInteractive
     }
 
     # --- Input file(s) ---
@@ -8184,17 +8765,17 @@ function Invoke-UniversalScrubber {
         }
     }
 
-    # --- Pre-convert special inputs (EVTX / XLSX / W3C-IIS) to CSV ---
+    # --- Pre-convert special inputs (EVTX / XLSX / Office / W3C-IIS) locally before scrubbing ---
     $evtxConverted = $false
     $iisConverted = $false
     $intermediateTargets = @()
-    if (@($targets | Where-Object { $_.Extension -imatch '^\.(evtx|xlsx|log)$' }).Count -gt 0) {
+    if (@($targets | Where-Object { $_.Extension -imatch '^\.(evtx|etl|xlsx|docx|pptx|doc|ppt|log)$' }).Count -gt 0) {
         Write-Host ""
-        Write-Step "Preparing special inputs (event logs / workbooks / IIS logs)"
+        Write-Step "Preparing special inputs (event logs / ETL / workbooks / Office / IIS logs)"
         $conversionNameCounts = @{}
         foreach ($ct in $targets) {
             $cext = ([string]$ct.Extension).ToLowerInvariant()
-            $suffix = if ($cext -eq '.evtx') { '.evtx.csv' } elseif ($cext -eq '.xlsx') { '.xlsx.csv' } elseif ($cext -eq '.log') { '.w3c.csv' } else { $null }
+            $suffix = if ($cext -eq '.evtx') { '.evtx.csv' } elseif ($cext -eq '.etl') { '.etl.csv' } elseif ($cext -eq '.xlsx') { '.xlsx.csv' } elseif ($cext -eq '.docx') { '.docx.txt' } elseif ($cext -eq '.pptx') { '.pptx.txt' } elseif ($cext -eq '.log') { '.w3c.csv' } else { $null }
             if (-not $suffix) { continue }
             $key = ([System.IO.Path]::GetFileNameWithoutExtension($ct.FullName) + $suffix).ToLowerInvariant()
             if (-not $conversionNameCounts.ContainsKey($key)) { $conversionNameCounts[$key] = 0 }
@@ -8211,11 +8792,35 @@ function Invoke-UniversalScrubber {
                     [void](ConvertFrom-EvtxToCsv -EvtxPath $t.FullName -OutCsv $outCsv -EvtxProgressMode $EvtxProgressMode)
                     if (Test-Path -LiteralPath $outCsv) { $converted = Get-Item -LiteralPath $outCsv; $evtxConverted = $true }
                 }
+                elseif ($ext2 -eq '.etl') {
+                    if (-not $ConvertEtl) {
+                        throw "ETL file '$($t.Name)' requires -ConvertEtl to run tracerpt.exe locally. Or convert the ETL to CSV/XML/text yourself and scrub the converted output."
+                    }
+                    $key = ($t.BaseName + '.etl.csv').ToLowerInvariant()
+                    $outCsv = Get-SafeDerivedPath -InputPath $t.FullName -OutDir $WorkDir -Suffix '.etl.csv' -UseHash:($conversionNameCounts[$key] -gt 1)
+                    [void](ConvertFrom-EtlToCsv -EtlPath $t.FullName -OutCsv $outCsv)
+                    if (Test-Path -LiteralPath $outCsv) { $converted = Get-Item -LiteralPath $outCsv }
+                }
                 elseif ($ext2 -eq '.xlsx') {
                     $key = ($t.BaseName + '.xlsx.csv').ToLowerInvariant()
                     $outCsv = Get-SafeDerivedPath -InputPath $t.FullName -OutDir $WorkDir -Suffix '.xlsx.csv' -UseHash:($conversionNameCounts[$key] -gt 1)
                     [void](ConvertFrom-XlsxToCsv -XlsxPath $t.FullName -OutCsv $outCsv)
                     if (Test-Path -LiteralPath $outCsv) { $converted = Get-Item -LiteralPath $outCsv }
+                }
+                elseif ($ext2 -eq '.docx') {
+                    $key = ($t.BaseName + '.docx.txt').ToLowerInvariant()
+                    $outTxt = Get-SafeDerivedPath -InputPath $t.FullName -OutDir $WorkDir -Suffix '.docx.txt' -UseHash:($conversionNameCounts[$key] -gt 1)
+                    [void](ConvertFrom-DocxToText -DocxPath $t.FullName -OutText $outTxt)
+                    if (Test-Path -LiteralPath $outTxt) { $converted = Get-Item -LiteralPath $outTxt }
+                }
+                elseif ($ext2 -eq '.pptx') {
+                    $key = ($t.BaseName + '.pptx.txt').ToLowerInvariant()
+                    $outTxt = Get-SafeDerivedPath -InputPath $t.FullName -OutDir $WorkDir -Suffix '.pptx.txt' -UseHash:($conversionNameCounts[$key] -gt 1)
+                    [void](ConvertFrom-PptxToText -PptxPath $t.FullName -OutText $outTxt)
+                    if (Test-Path -LiteralPath $outTxt) { $converted = Get-Item -LiteralPath $outTxt }
+                }
+                elseif ($ext2 -in @('.doc','.ppt')) {
+                    throw "Legacy Office file '$($t.Name)' is not parsed natively. Export it to .docx/.pptx or plain text, then scrub the exported file."
                 }
                 elseif ($ext2 -eq '.log') {
                     $head = @(Get-Content -LiteralPath $t.FullName -TotalCount 20 -ErrorAction SilentlyContinue)
@@ -8227,7 +8832,10 @@ function Invoke-UniversalScrubber {
                     }
                 }
             }
-            catch { Write-Fail "Conversion failed for $($t.Name): $($_.Exception.Message)" }
+            catch {
+                Write-Fail "Conversion failed for $($t.Name): $($_.Exception.Message)"
+                if ($ext2 -in @('.doc','.ppt','.etl')) { throw }
+            }
             if ($converted) { $newTargets += $converted; $intermediateTargets += $converted } else { $newTargets += $t }
         }
         $targets = @($newTargets)
@@ -8293,6 +8901,9 @@ function Invoke-UniversalScrubber {
         }
     }
     if (-not $prof) { throw "No profile resolved." }
+    if ($ProfileExtensionFile -and $ProfileExtensionFile.Count -gt 0) {
+        $prof = Merge-ScrubProfileExtension -Profile $prof -Path $ProfileExtensionFile
+    }
     Write-Ok "Profile: $($prof.Name) -- $($prof.Description)"
 
     # --- Sensitive seed terms ---
@@ -8502,13 +9113,13 @@ function Invoke-UniversalScrubber {
     return $results
 }
 
-# BEGIN ULS v4.13 current-version bugfixes: detection review, corpus filtering, LogHub online
+# BEGIN ULS v4.13 current-version bugfixes: detection review and artifact filtering
 
-# Override: broader generated/local artifact exclusion used by recommendations, smoke tests, and folder scrubs.
+# Override: broader generated/local artifact exclusion used by recommendations and folder scrubs.
 function Test-GeneratedScrubArtifactName {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
-    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|detection_review|scrub_run_manifest|corpus-manifest|manifest\.json|external-corpus-summary|profile_build_report|generated-profile|profile-template)') { return $true }
+    if ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|detection_review|scrub_run_manifest|manifest\.json|profile_build_report|generated-profile|profile-template)') { return $true }
     if ([System.IO.Path]::GetExtension($Name) -ieq '.zip') { return $true }
     return $false
 }
@@ -8683,424 +9294,10 @@ function Resolve-LogRecommendationTargets {
     return @($targets | Sort-Object FullName)
 }
 
-function Get-LogHubSuggestedProfile {
-    param([string]$Dataset, [string]$FileName)
-    $d = ([string]$Dataset).ToLowerInvariant()
-    $f = ([string]$FileName).ToLowerInvariant()
-    if ($d -match 'apache|nginx|http|web') { return 'Apache' }
-    if ($d -match 'openssh|linux|syslog|auth') { return 'Syslog' }
-    if ($d -match 'windows') { return 'Text' }
-    if ($f -match '\.json(l)?$') { return 'AppJson' }
-    if ($f -match '\.csv$') { return 'Generic' }
-    return 'Text'
-}
-
-function New-LogHubOnlineCatalogEntry {
-    param(
-        [Parameter(Mandatory)][string]$Dataset,
-        [Parameter(Mandatory)]$Item
-    )
-
-    $download = [string]$Item.download_url
-    if ([string]::IsNullOrWhiteSpace($download)) { return $null }
-    $fileName = [string]$Item.name
-    $safeDataset = Get-SafeCorpusName -Name $Dataset
-    $safeFile = Get-SafeCorpusName -Name ([System.IO.Path]::GetFileNameWithoutExtension($fileName))
-    $profile = Get-LogHubSuggestedProfile -Dataset $Dataset -FileName $fileName
-    $size = ''
-    try {
-        if ($null -ne $Item.size -and [int64]$Item.size -gt 0) {
-            $size = ('{0:N1} KB' -f ([double]([int64]$Item.size) / 1KB))
-        }
-    } catch { }
-
-    [pscustomobject]@{
-        Name                   = "Loghub-$safeDataset-$safeFile"
-        Source                 = 'Loghub'
-        Dataset                = $Dataset
-        FileName               = $fileName
-        Description            = "LogHub $Dataset sample file $fileName."
-        Homepage               = "https://github.com/logpai/loghub/tree/master/$Dataset"
-        DownloadUrl            = $download
-        InstructionsUrl        = "https://github.com/logpai/loghub/tree/master/$Dataset"
-        FormatHint             = "LogHub/$Dataset"
-        SuggestedProfile       = $profile
-        ExpectedFileTypes      = @([System.IO.Path]::GetExtension($fileName))
-        ApproxSize             = $size
-        LicenseNote            = 'Review the Loghub repository license and dataset notes before use.'
-        SafetyWarning          = 'Public corpora may contain raw, unsanitized, offensive, realistic, or operational artifacts. Review source terms and run only in an approved local workspace.'
-        RequiresManualDownload = $false
-        CanDownloadDirectly    = $true
-        Notes                  = 'Discovered dynamically from the public logpai/loghub GitHub repository.'
-        HtmlUrl                = [string]$Item.html_url
-    }
-}
-
-function __ULS_Legacy_Get_LogHubOnlineCatalog_6021 {
-    [CmdletBinding()]
-    param(
-        [string]$Dataset,
-        [switch]$Refresh
-    )
-
-    if (-not $Refresh -and $script:LogHubOnlineCatalogCache) {
-        $cached = @($script:LogHubOnlineCatalogCache)
-        if ([string]::IsNullOrWhiteSpace($Dataset)) { return $cached }
-        return @($cached | Where-Object { $_.Dataset -like "*$Dataset*" })
-    }
-
-    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.13' }
-    $rootUri = 'https://api.github.com/repos/logpai/loghub/contents'
-    try {
-        $root = @(Invoke-RestMethod -Uri $rootUri -Headers $headers -ErrorAction Stop)
-    }
-    catch {
-        throw "Could not query LogHub GitHub contents API: $($_.Exception.Message)"
-    }
-
-    $dirs = @($root | Where-Object { $_.type -eq 'dir' -and $_.name -notmatch '^\.' })
-    if (-not [string]::IsNullOrWhiteSpace($Dataset)) {
-        $dirs = @($dirs | Where-Object { $_.name -like "*$Dataset*" })
-    }
-
-    $entries = New-Object System.Collections.Generic.List[object]
-    foreach ($dir in $dirs) {
-        $datasetName = [string]($dir.name)
-        $uri = "https://api.github.com/repos/logpai/loghub/contents/$([uri]::EscapeDataString($datasetName))"
-        try {
-            $items = @(Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop)
-        }
-        catch {
-            Write-Warn "Could not query LogHub dataset '$datasetName': $($_.Exception.Message)"
-            continue
-        }
-        foreach ($item in $items) {
-            if ($item.type -ne 'file') { continue }
-            $name = [string]($item.name)
-            if ($name -notmatch '(?i)\.(log|txt|csv|json|jsonl|ndjson|zip|gz|tgz)$') { continue }
-            if (Test-GeneratedScrubArtifactName -Name $name) { continue }
-            $entry = New-LogHubOnlineCatalogEntry -Dataset $datasetName -Item $item
-            if ($entry) { [void]$entries.Add($entry) }
-        }
-    }
-
-    $script:LogHubOnlineCatalogCache = @($entries.ToArray())
-    return @($script:LogHubOnlineCatalogCache)
-}
-
-# Override: static catalog search plus dynamic LogHub online discovery.
-function Search-LogCorpusCatalog {
-    [CmdletBinding()]
-    param(
-        [string]$Query,
-        [string]$Source,
-        [string]$Format,
-        [string]$Profile,
-        [string]$Dataset,
-        [switch]$Online,
-        [switch]$Refresh
-    )
-
-    if ($Online) {
-        $items = @(Get-LogHubOnlineCatalog -Dataset $Dataset -Refresh:$Refresh)
-    }
-    else {
-        $items = @(Get-LogCorpusCatalog)
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($Query)) {
-        $q = [regex]::Escape($Query)
-        $items = @($items | Where-Object {
-            (@($_.Name,$_.Source,$_.Description,$_.FormatHint,$_.SuggestedProfile,$_.Notes,$_.Dataset,$_.FileName) -join ' ') -match "(?i)$q"
-        })
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Source)) {
-        $items = @($items | Where-Object { $_.Source -like "*$Source*" })
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Format)) {
-        $items = @($items | Where-Object { $_.FormatHint -like "*$Format*" -or (@($_.ExpectedFileTypes) -join ' ') -like "*$Format*" })
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Profile)) {
-        $items = @($items | Where-Object { $_.SuggestedProfile -ieq $Profile })
-    }
-    return @($items | Sort-Object Source,Dataset,Name)
-}
-
-function Resolve-OnlineLogCorpusEntry {
-    param([Parameter(Mandatory)][string]$Name, [string]$Dataset)
-    $items = @(Search-LogCorpusCatalog -Online -Dataset $Dataset)
-    $matches = @($items | Where-Object { $_.Name -ieq $Name })
-    if ($matches.Count -eq 1) { return $matches[0] }
-    if ($matches.Count -gt 1) { throw "Multiple online corpus entries matched '$Name'." }
-
-    $matches = @($items | Where-Object { $_.Name -like "*$Name*" -or $_.FileName -ieq $Name })
-    if ($matches.Count -eq 1) { return $matches[0] }
-    if ($matches.Count -gt 1) {
-        $preview = (($matches | Select-Object -First 10 | ForEach-Object { $_.Name }) -join ', ')
-        throw "Multiple online corpus entries matched '$Name'. Be more specific. Matches: $preview"
-    }
-    throw "Unknown online corpus entry: $Name. Run Search-LogCorpusCatalog -Online first and copy the exact Name."
-}
-
-# Override: static Save-LogCorpusSample behavior plus dynamic LogHub online download/extract.
-function Save-LogCorpusSample {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Name,
-        [string]$Destination = (Get-DefaultExternalCorpusRoot),
-        [switch]$Force,
-        [switch]$AcceptRisk,
-        [switch]$Online,
-        [string]$Dataset,
-        [switch]$ExtractArchive
-    )
-
-    if ($Online) {
-        $entry = Resolve-OnlineLogCorpusEntry -Name $Name -Dataset $Dataset
-        $destRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
-        $sampleDir = Join-Path $destRoot (Get-SafeCorpusName -Name $entry.Name)
-
-        Write-Rule 'External corpus sample'
-        Write-Info "Name: $($entry.Name)"
-        Write-Info "Source: $($entry.Source)"
-        Write-Info "Dataset: $($entry.Dataset)"
-        Write-Info "Destination: $sampleDir"
-        Write-LogCorpusRiskWarning -Entry $entry
-
-        if (-not $AcceptRisk) {
-            throw "Refusing to download '$($entry.Name)' without -AcceptRisk. Review the warning, source, size and license first."
-        }
-
-        if ((Test-Path -LiteralPath $sampleDir -PathType Container) -and -not $Force) {
-            $existing = @(Get-ChildItem -LiteralPath $sampleDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
-            if ($existing.Count -gt 0) {
-                throw "Corpus sample directory already has content: $sampleDir. Pass -Force to overwrite or update it."
-            }
-        }
-
-        New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
-        $targetPath = Join-Path $sampleDir $entry.FileName
-        if ((Test-Path -LiteralPath $targetPath) -and -not $Force) {
-            throw "Corpus sample already exists: $targetPath. Pass -Force to overwrite."
-        }
-
-        Write-Info "Downloading: $($entry.DownloadUrl)"
-        try {
-            Invoke-WebRequest -Uri $entry.DownloadUrl -OutFile $targetPath -UseBasicParsing -ErrorAction Stop
-        }
-        catch {
-            throw "Download failed for '$($entry.Name)': $($_.Exception.Message)"
-        }
-
-        $hash = ''
-        try { $hash = (Get-FileHash -Path $targetPath -Algorithm SHA256).Hash } catch { }
-        $extractPath = $null
-        if ($ExtractArchive) {
-            $extractPath = Join-Path $sampleDir 'extracted'
-            New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
-            if ($entry.FileName -match '(?i)\.zip$') {
-                Expand-Archive -Path $targetPath -DestinationPath $extractPath -Force
-                Write-Ok "Archive extracted: $extractPath"
-            }
-            elseif ($entry.FileName -match '(?i)\.(tgz|tar\.gz)$' -and (Get-Command tar -ErrorAction SilentlyContinue)) {
-                & tar -xzf $targetPath -C $extractPath
-                if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit code $LASTEXITCODE" }
-                Write-Ok "Archive extracted: $extractPath"
-            }
-            else {
-                Write-Warn "ExtractArchive was requested, but this file type is not supported for inline extraction: $($entry.FileName)"
-                $extractPath = $null
-            }
-        }
-        elseif ($entry.FileName -match '(?i)\.(zip|tgz|tar\.gz)$') {
-            Write-Warn "Downloaded archive but did not extract it. Re-run with -ExtractArchive to extract inline."
-        }
-
-        $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -DownloadedFile $targetPath -Sha256 $hash -Status 'Downloaded'
-        Write-Ok "Downloaded: $targetPath"
-        if ($hash) { Write-Info "SHA256: $hash" }
-        Write-Ok "Manifest written: $manifestPath"
-        return [pscustomobject]@{
-            Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $targetPath
-            ExtractedPath = $extractPath; ManifestPath = $manifestPath; Sha256 = $hash
-            RequiresManualDownload = $false; CanDownloadDirectly = $true; Status = 'Downloaded'
-        }
-    }
-
-    # Original static-catalog behavior retained.
-    $entry = Resolve-LogCorpusCatalogEntry -Name $Name
-    $destRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
-    $sampleDir = Join-Path $destRoot (Get-SafeCorpusName -Name $entry.Name)
-
-    Write-Rule 'External corpus sample'
-    Write-Info "Name: $($entry.Name)"
-    Write-Info "Source: $($entry.Source)"
-    Write-Info "Destination: $sampleDir"
-    Write-LogCorpusRiskWarning -Entry $entry
-
-    if ((Test-Path -LiteralPath $sampleDir -PathType Container) -and -not $Force) {
-        $existing = @(Get-ChildItem -LiteralPath $sampleDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
-        if ($existing.Count -gt 0) {
-            throw "Corpus sample directory already has content: $sampleDir. Pass -Force to overwrite or update it."
-        }
-    }
-
-    if ($entry.RequiresManualDownload -or -not $entry.CanDownloadDirectly) {
-        New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
-        Write-Warn 'This catalog entry requires manual download. No network download will be attempted.'
-        if ($entry.InstructionsUrl) { Write-Info "Instructions: $($entry.InstructionsUrl)" }
-        if ($entry.Homepage) { Write-Info "Homepage: $($entry.Homepage)" }
-        $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -Status 'ManualDownloadRequired'
-        Write-Ok "Instructions manifest written: $manifestPath"
-        return [pscustomobject]@{
-            Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $null
-            ManifestPath = $manifestPath; RequiresManualDownload = $true
-            CanDownloadDirectly = $false; Status = 'ManualDownloadRequired'
-        }
-    }
-
-    if (-not $AcceptRisk) {
-        throw "Refusing to download '$($entry.Name)' without -AcceptRisk. Review the warning, source, size and license first."
-    }
-    if ([string]::IsNullOrWhiteSpace($entry.DownloadUrl)) { throw "Catalog entry '$($entry.Name)' has no direct DownloadUrl." }
-
-    New-Item -ItemType Directory -Path $sampleDir -Force | Out-Null
-    $uri = [Uri]$entry.DownloadUrl
-    $fileName = [System.IO.Path]::GetFileName($uri.AbsolutePath)
-    if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = ((Get-SafeCorpusName -Name $entry.Name) + '.log') }
-    $targetPath = Join-Path $sampleDir $fileName
-    if ((Test-Path -LiteralPath $targetPath) -and -not $Force) {
-        throw "Corpus sample already exists: $targetPath. Pass -Force to overwrite."
-    }
-
-    Write-Info "Downloading: $($entry.DownloadUrl)"
-    try {
-        Invoke-WebRequest -Uri $entry.DownloadUrl -OutFile $targetPath -UseBasicParsing -ErrorAction Stop
-    }
-    catch {
-        throw "Download failed for '$($entry.Name)': $($_.Exception.Message)"
-    }
-
-    $hash = ''
-    try { $hash = (Get-FileHash -Path $targetPath -Algorithm SHA256).Hash } catch { }
-    $manifestPath = Save-LogCorpusManifest -Entry $entry -Path $sampleDir -DownloadedFile $targetPath -Sha256 $hash -Status 'Downloaded'
-    Write-Ok "Downloaded: $targetPath"
-    if ($hash) { Write-Info "SHA256: $hash" }
-    Write-Ok "Manifest written: $manifestPath"
-    return [pscustomobject]@{
-        Name = $entry.Name; Destination = $sampleDir; DownloadedFile = $targetPath
-        ManifestPath = $manifestPath; Sha256 = $hash
-        RequiresManualDownload = $false; CanDownloadDirectly = $true; Status = 'Downloaded'
-    }
-}
-
 # END ULS v4.13 current-version bugfixes
 
-# BEGIN ULS v4.13 hotfix: LogHub online flattening and positive detection review rows
+# BEGIN ULS v4.13 hotfix: positive detection review rows
 # Current-version bugfix only: no version/banner/schema bump.
-
-function ConvertTo-UlsFlatArray {
-    param([AllowNull()]$Value)
-
-    $flat = New-Object System.Collections.Generic.List[object]
-    $queue = New-Object System.Collections.Generic.List[object]
-
-    foreach ($item in @($Value)) {
-        [void]$queue.Add($item)
-    }
-
-    while ($queue.Count -gt 0) {
-        $item = $queue[0]
-        $queue.RemoveAt(0)
-
-        if ($null -eq $item) { continue }
-
-        if ($item -is [System.Array]) {
-            foreach ($child in $item) {
-                [void]$queue.Add($child)
-            }
-            continue
-        }
-
-        [void]$flat.Add($item)
-    }
-
-    return @($flat.ToArray())
-}
-
-function Test-GeneratedLogHubArtifactName {
-    param([string]$Name)
-
-    if ([string]::IsNullOrWhiteSpace($Name)) { return $true }
-
-    # Do not use Test-GeneratedScrubArtifactName here because online corpus files may
-    # legitimately be .zip/.gz archives. Only skip ULS-local/generated metadata.
-    return ($Name -match '(?i)(_scrubbed|\.scrubbed\.|token_map|DO_NOT_UPLOAD|false_positive|detection_report|detection_review|scrub_run_manifest|corpus-manifest|manifest\.json|external-corpus-summary|profile_build_report|generated-profile|profile-template)')
-}
-
-function Get-LogHubOnlineCatalog {
-    [CmdletBinding()]
-    param(
-        [string]$Dataset,
-        [switch]$Refresh
-    )
-
-    if (-not $Refresh -and $script:LogHubOnlineCatalogCache) {
-        $cached = @(ConvertTo-UlsFlatArray -Value $script:LogHubOnlineCatalogCache)
-        if ([string]::IsNullOrWhiteSpace($Dataset)) { return $cached }
-        return @($cached | Where-Object { $_.Dataset -like "*$Dataset*" })
-    }
-
-    $headers = @{ 'User-Agent' = 'UniversalLogScrubber-v4.13' }
-    $rootUri = 'https://api.github.com/repos/logpai/loghub/contents'
-
-    try {
-        $rootRaw = Invoke-RestMethod -Uri $rootUri -Headers $headers -ErrorAction Stop
-        $root = @(ConvertTo-UlsFlatArray -Value $rootRaw)
-    }
-    catch {
-        throw "Could not query LogHub GitHub contents API: $($_.Exception.Message)"
-    }
-
-    $dirs = @($root | Where-Object { ($null -ne $_) -and ([string]($_.type) -eq 'dir') -and ([string]($_.name) -notmatch '^\.') -and ([string]($_.name) -notmatch '^(docs?|test|tests?)$') })
-
-    if (-not [string]::IsNullOrWhiteSpace($Dataset)) {
-        $dirs = @($dirs | Where-Object { [string]($_.name) -like "*$Dataset*" })
-    }
-
-    $entries = New-Object System.Collections.Generic.List[object]
-
-    foreach ($dir in $dirs) {
-        $datasetName = [string]($dir.name)
-        if ([string]::IsNullOrWhiteSpace($datasetName)) { continue }
-
-        $uri = "https://api.github.com/repos/logpai/loghub/contents/$([uri]::EscapeDataString($datasetName))"
-
-        try {
-            $itemsRaw = Invoke-RestMethod -Uri $uri -Headers $headers -ErrorAction Stop
-            $items = @(ConvertTo-UlsFlatArray -Value $itemsRaw)
-        }
-        catch {
-            Write-Warn "Could not query LogHub dataset '$datasetName': $($_.Exception.Message)"
-            continue
-        }
-
-        foreach ($item in $items) {
-            if ($null -eq $item) { continue }
-            if ([string]($item.type) -ne 'file') { continue }
-
-            $name = [string]($item.name)
-            if ($name -notmatch '(?i)\.(log|txt|csv|json|jsonl|ndjson|zip|gz|tgz|tar\.gz)$') { continue }
-            if (Test-GeneratedLogHubArtifactName -Name $name) { continue }
-
-            $entry = New-LogHubOnlineCatalogEntry -Dataset $datasetName -Item $item
-            if ($entry) { [void]$entries.Add($entry) }
-        }
-    }
-
-    $script:LogHubOnlineCatalogCache = @($entries.ToArray())
-    return @($script:LogHubOnlineCatalogCache)
-}
 
 # Override: return detector/reason metadata and add Tokenized trace rows for positive dry-run detections.
 function __ULS_Legacy_Find_Identifiers_6388 {
@@ -9208,11 +9405,11 @@ function __ULS_Legacy_Find_Identifiers_6388 {
     return @($found.Values)
 }
 
-# END ULS v4.13 hotfix: LogHub online flattening and positive detection review rows
+# END ULS v4.13 hotfix: positive detection review rows
 
 
 
-# BEGIN ULS v4.13 OpenSSH corpus hardening hotfix
+# BEGIN ULS v4.13 OpenSSH log hardening hotfix
 # Addresses common sshd/syslog free-text forms that are not label:value pairs:
 #   - syslog emitter hostname after timestamp (for example: "Dec 10 06:55:46 LabSZ sshd[...]")
 #   - OpenSSH authentication usernames in prose (Invalid user, Failed password for ...)
@@ -9420,9 +9617,9 @@ function Invoke-LeakHardeningText {
     return [string](& $script:__ULS_InvokeLeakHardeningText_BeforeOpenSsh -Text $pre)
 }
 
-# END ULS v4.13 OpenSSH corpus hardening hotfix
+# END ULS v4.13 OpenSSH log hardening hotfix
 
-# BEGIN ULS v4.13 hotfix: LogHub mass-corpus dotted/label FP preservation
+# BEGIN ULS v4.13 hotfix: broad dotted/label FP preservation
 # Current-version bugfix only: no version/banner/schema bump.
 #
 # Purpose:
@@ -9596,7 +9793,7 @@ function __ULS_Legacy_Test_PreserveDetectedValue_6866 {
     $v = $Value.Trim()
     if (Is-AlreadyToken -Value $v) { return $true }
 
-    # New mass-corpus false-positive reducers.
+    # Additional broad false-positive reducers.
     if (Test-PreserveLikelyBenignUniversalLabelValue -Value $v -Detector $Detector -Prefix $Prefix -Text $Text -Index $Index -Length $Length) { return $true }
     if ($Prefix -eq 'SECRET' -and (Test-PreserveLikelyBenignSecretValue -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
     if ($Prefix -eq 'BLOB' -and (Test-PreserveLikelyBenignBase64FalsePositive -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
@@ -9642,9 +9839,9 @@ function __ULS_Legacy_Get_ValueShapePrefix_6907 {
     return $null
 }
 
-# END ULS v4.13 hotfix: LogHub mass-corpus dotted/label FP preservation
+# END ULS v4.13 hotfix: broad dotted/label FP preservation
 
-# BEGIN ULS v4.13 hotfix: LogHub mass-corpus FP preservation round 2
+# BEGIN ULS v4.13 hotfix: broad FP preservation round 2
 # Current-version bugfix only: no version/banner/schema bump.
 #
 # This later override intentionally shadows the earlier v4.13 preservation helpers.
@@ -9735,7 +9932,7 @@ function Test-PreserveNonSensitiveDottedArtifactName {
         if ($Text -match '(?i)(ACPI|PCI Interrupt|_PRT|BOOT_IMAGE|kernel command line|Thunderbird|BGL|HPC)') { return $true }
     }
 
-    # Explicit package/config/logger namespace families from the LogHub pass.
+    # Explicit package/config/logger namespace families from broad false-positive testing.
     if (Test-UlsLikelyCodeOrConfigNamespace -Value $v -Text $Text) { return $true }
 
     # Class/method/logger shapes. Avoid obvious public network domains.
@@ -9837,7 +10034,7 @@ function __ULS_Legacy_Test_PreserveDetectedValue_7107 {
     $v = $Value.Trim()
     if (Is-AlreadyToken -Value $v) { return $true }
 
-    # New mass-corpus false-positive reducers.
+    # Additional broad false-positive reducers.
     if (Test-PreserveLikelyBenignUniversalLabelValue -Value $v -Detector $Detector -Prefix $Prefix -Text $Text -Index $Index -Length $Length) { return $true }
     if ($Prefix -eq 'SECRET' -and (Test-PreserveLikelyBenignSecretValue -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
     if ($Prefix -eq 'BLOB' -and (Test-PreserveLikelyBenignBase64FalsePositive -Value $v -Text $Text -Index $Index -Length $Length)) { return $true }
@@ -9883,22 +10080,22 @@ function Get-ValueShapePrefix {
     return $null
 }
 
-# END ULS v4.13 hotfix: LogHub mass-corpus FP preservation round 2
+# END ULS v4.13 hotfix: broad FP preservation round 2
 
-# BEGIN ULS v4.13 LogHub mass false-positive preserve round 3
-# Current-version corpus hardening only: no version/banner/schema bump.
-# This pass suppresses low-signal LogHub false positives found after the Java/ZooKeeper
+# BEGIN ULS v4.13 broad false-positive preserve round 3
+# Current-version hardening only: no version/banner/schema bump.
+# This pass suppresses low-signal false positives found after the Java/ZooKeeper
 # and broad dotted-artifact preservation passes, while keeping real network/identity
 # identifiers tokenized.
 
-if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_TestPreserveDetectedValue_BeforeLogHubRound3 = ${function:__ULS_Legacy_Test_PreserveDetectedValue_7107}
+if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeBroadFpRound3 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_TestPreserveDetectedValue_BeforeBroadFpRound3 = ${function:__ULS_Legacy_Test_PreserveDetectedValue_7107}
 }
-if (-not (Get-Variable -Name __ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 = ${function:__ULS_Legacy_Find_UniversalLabeledIdentifiers_1040}
+if (-not (Get-Variable -Name __ULS_FindUniversalLabeledIdentifiers_BeforeBroadFpRound3 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_FindUniversalLabeledIdentifiers_BeforeBroadFpRound3 = ${function:__ULS_Legacy_Find_UniversalLabeledIdentifiers_1040}
 }
-if (-not (Get-Variable -Name __ULS_FindSecretIdentifiers_BeforeLogHubRound3 -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:__ULS_FindSecretIdentifiers_BeforeLogHubRound3 = ${function:__ULS_Legacy_Find_SecretIdentifiers_1204}
+if (-not (Get-Variable -Name __ULS_FindSecretIdentifiers_BeforeBroadFpRound3 -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:__ULS_FindSecretIdentifiers_BeforeBroadFpRound3 = ${function:__ULS_Legacy_Find_SecretIdentifiers_1204}
 }
 
 function Test-UlsRound3LowSignalUniversalLabel {
@@ -10024,7 +10221,7 @@ function __ULS_Legacy_Test_PreserveDetectedValue_7279 {
     )
 
     try {
-        if (& $script:__ULS_TestPreserveDetectedValue_BeforeLogHubRound3 `
+        if (& $script:__ULS_TestPreserveDetectedValue_BeforeBroadFpRound3 `
             -Value $Value `
             -Detector $Detector `
             -Prefix $Prefix `
@@ -10046,7 +10243,7 @@ function __ULS_Legacy_Test_PreserveDetectedValue_7279 {
 function Find-UniversalLabeledIdentifiers {
     param([Parameter(Mandatory)][string]$Text)
 
-    $items = @(& $script:__ULS_FindUniversalLabeledIdentifiers_BeforeLogHubRound3 -Text $Text)
+    $items = @(& $script:__ULS_FindUniversalLabeledIdentifiers_BeforeBroadFpRound3 -Text $Text)
     if ($script:ScrubPolicy -eq 'Strict') { return @($items) }
 
     $out = New-Object System.Collections.Generic.List[object]
@@ -10066,7 +10263,7 @@ function Find-UniversalLabeledIdentifiers {
 function Find-SecretIdentifiers {
     param([Parameter(Mandatory)][string]$Text)
 
-    $items = @(& $script:__ULS_FindSecretIdentifiers_BeforeLogHubRound3 -Text $Text)
+    $items = @(& $script:__ULS_FindSecretIdentifiers_BeforeBroadFpRound3 -Text $Text)
     if ($script:ScrubPolicy -eq 'Strict') { return @($items) }
 
     $out = New-Object System.Collections.Generic.List[object]
@@ -10081,9 +10278,9 @@ function Find-SecretIdentifiers {
     return @($out.ToArray())
 }
 
-# END ULS v4.13 LogHub mass false-positive preserve round 3
+# END ULS v4.13 broad false-positive preserve round 3
 
-# BEGIN ULS v4.13 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
+# BEGIN ULS v4.13 broad FP hardening round 4: C++ scope operator IPv6 fragments
 # Current-version bugfix only: no version/banner/schema bump.
 #
 # Some macOS/corecaptured/kernel lines contain C++/IOKit scope operators such as:
@@ -10170,7 +10367,7 @@ function Test-PreserveDetectedValue {
         -Length $Length)
 }
 
-# END ULS v4.13 LogHub mass FP hardening round 4: C++ scope operator IPv6 fragments
+# END ULS v4.13 broad FP hardening round 4: C++ scope operator IPv6 fragments
 
 # BEGIN ULS v4.14 performance and precision policy layer
 if (-not (Get-Variable -Name __ULS_TestPreserveDetectedValue_BeforeV414 -Scope Script -ErrorAction SilentlyContinue)) {
@@ -10410,20 +10607,13 @@ ${function:Find-Identifiers} = ${function:Find-UlsV414Identifiers}
 Set-Alias -Name Invoke-UniversalLogScrubber -Value Invoke-UniversalScrubber
 Set-Alias -Name Invoke-ULSScrubSelfTest -Value Invoke-ScrubSelfTest
 Set-Alias -Name Test-ULSLogFormat -Value Test-LogFormat
-Set-Alias -Name Get-ULSLogCorpusCatalog -Value Get-LogCorpusCatalog
-Set-Alias -Name Search-ULSLogCorpusCatalog -Value Search-LogCorpusCatalog
-Set-Alias -Name Save-ULSLogCorpusSample -Value Save-LogCorpusSample
-Set-Alias -Name Invoke-ULSExternalCorpusSmokeTest -Value Invoke-ExternalCorpusSmokeTest
 
 Export-ModuleMember -Function `
-    Invoke-UniversalScrubber, Test-LogFormat, Get-LogCorpusCatalog, Search-LogCorpusCatalog, `
-    Save-LogCorpusSample, Invoke-ExternalCorpusSmokeTest, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
+    Invoke-UniversalScrubber, Test-LogFormat, New-ScrubTokenMap, New-ScrubTokenMapFromAD, `
     Import-ScrubTokenMap, Invoke-ScrubFile, Test-ScrubbedForLeaks, Get-ScrubProfile, `
     Invoke-UlsScrubTextBatch, Invoke-UlsDiscoverTextBatch, Invoke-UlsScrubCsvBatch, `
-    ConvertFrom-EvtxToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, `
-    Import-ScrubProfileFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
+    ConvertFrom-EvtxToCsv, ConvertFrom-EtlToCsv, ConvertFrom-W3CToCsv, ConvertFrom-XlsxToCsv, ConvertFrom-DocxToText, ConvertFrom-PptxToText, `
+    Import-ScrubProfileFile, Import-ScrubProfileExtensionFile, Test-ScrubProfile, New-ScrubProfileTemplate, New-ScrubProfileFromSample, `
     Invoke-ScrubSelfTest, Restore-ScrubbedFile, New-SyntheticLog `
     -Alias `
-    Invoke-UniversalLogScrubber, Invoke-ULSScrubSelfTest, Test-ULSLogFormat, `
-    Get-ULSLogCorpusCatalog, Search-ULSLogCorpusCatalog, Save-ULSLogCorpusSample, `
-    Invoke-ULSExternalCorpusSmokeTest
+    Invoke-UniversalLogScrubber, Invoke-ULSScrubSelfTest, Test-ULSLogFormat

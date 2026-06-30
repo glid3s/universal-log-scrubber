@@ -31,8 +31,22 @@ $cases = @(
     @{ Name='Cloud audit JSONL'; Path='cloud-audit.jsonl'; Profile='CloudAudit' },
     @{ Name='Gateway key/value'; Path='gateway-kv.log'; Profile='Logfmt' },
     @{ Name='VPN/firewall text'; Path='vpn-firewall.log'; Profile='Firewall' },
+    #@{ Name='VPN/firewall text'; Path='vpn-firewall.log'; Profile='WebAccess' },
     @{ Name='Web access text'; Path='web-access.log'; Profile='WebAccess' },
     @{ Name='Windows event CSV'; Path='windows-event-sample.csv'; Profile='WindowsEventCsv' }
+
+    # New synthetic product samples
+    @{ Name='ServiceNow incidents CSV'; Path='servicenow_incidents.csv'; Profile='ServiceNow' },
+    @{ Name='Nexthink devices/executions CSV'; Path='nexthink_devices_executions.csv'; Profile='Nexthink' },
+    @{ Name='M365 unified audit CSV'; Path='m365_unified_audit_log.csv'; Profile='IdentityProvider' },
+    @{ Name='Sentinel incidents/alerts JSONL'; Path='sentinel_incidents_alerts.jsonl'; Profile='CloudAudit' },
+    @{ Name='Firewall/VPN syslog text'; Path='firewall_vpn_syslog.log'; Profile='Firewall' },
+    @{ Name='EDR alerts JSONL'; Path='edr_alerts.jsonl'; Profile='Edr' },
+    @{ Name='Intune managed devices CSV'; Path='intune_managed_devices.csv'; Profile='Intune' },
+    @{ Name='SCCM CMTrace client log'; Path='sccm_cmtrace_client.log'; Profile='SccmText' },
+    @{ Name='Intune registry export'; Path='intune_registry_export.reg'; Profile='IntuneDiagnostics' },
+    @{ Name='Intune MDM HTML report'; Path='intune_mdm_report.html'; Profile='IntuneDiagnostics' },
+    @{ Name='Intune policy XML report'; Path='intune_policy_report.xml'; Profile='IntuneDiagnostics' }
 )
 
 $failures = New-Object System.Collections.Generic.List[string]
@@ -86,6 +100,7 @@ $built = Invoke-UniversalScrubber `
     -BuildProfileFromSample `
     -Path (Join-Path $sampleRoot 'gateway-kv.log') `
     -WorkDir $builderOut `
+    -BaseProfile Logfmt `
     -ProfileOut (Join-Path $builderOut 'generated-gateway-profile.json') `
     -ProfileReportOut (Join-Path $builderOut 'generated-gateway-profile-report_DO_NOT_UPLOAD.md') `
     -Force `
@@ -103,4 +118,3 @@ if ($failures.Count -gt 0) {
 
 Write-Host ""
 Write-Host "Sample log smoke test passed." -ForegroundColor Green
-

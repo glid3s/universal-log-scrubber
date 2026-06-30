@@ -12,7 +12,7 @@
 RootModule = 'UniversalLogScrubber.psm1'
 
 # Version number of this module.
-ModuleVersion = '4.14.0'
+ModuleVersion = '4.15.0'
 
 # Supported PSEditions
 CompatiblePSEditions = 'Desktop', 'Core'
@@ -69,13 +69,12 @@ PowerShellVersion = '5.1'
 # NestedModules = @()
 
 # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
-FunctionsToExport = 'Invoke-UniversalScrubber', 'Test-LogFormat', 'Get-LogCorpusCatalog', 
-               'Search-LogCorpusCatalog', 'Save-LogCorpusSample', 
-               'Invoke-ExternalCorpusSmokeTest', 'New-ScrubTokenMap', 
+FunctionsToExport = 'Invoke-UniversalScrubber', 'Test-LogFormat', 'New-ScrubTokenMap', 
                'New-ScrubTokenMapFromAD', 'Import-ScrubTokenMap', 'Get-ScrubProfile', 
                'New-ScrubProfileTemplate', 'New-ScrubProfileFromSample', 
-               'Test-ScrubProfile', 'ConvertFrom-EvtxToCsv', 'ConvertFrom-W3CToCsv', 
-               'ConvertFrom-XlsxToCsv', 'Invoke-ScrubFile', 'Test-ScrubbedForLeaks', 
+               'Test-ScrubProfile', 'ConvertFrom-EvtxToCsv', 'ConvertFrom-EtlToCsv', 
+               'ConvertFrom-W3CToCsv', 'ConvertFrom-XlsxToCsv', 'ConvertFrom-DocxToText', 
+               'ConvertFrom-PptxToText', 'Import-ScrubProfileExtensionFile', 'Invoke-ScrubFile', 'Test-ScrubbedForLeaks', 
                'Invoke-UlsScrubCsvBatch', 'Invoke-ScrubSelfTest',
                'Restore-ScrubbedFile', 'New-SyntheticLog'
 
@@ -87,9 +86,7 @@ VariablesToExport = @()
 
 # Aliases to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no aliases to export.
 AliasesToExport = 'Invoke-UniversalLogScrubber', 'Invoke-ULSScrubSelfTest', 
-               'Test-ULSLogFormat', 'Get-ULSLogCorpusCatalog', 
-               'Search-ULSLogCorpusCatalog', 'Save-ULSLogCorpusSample', 
-               'Invoke-ULSExternalCorpusSmokeTest'
+               'Test-ULSLogFormat'
 
 # DSC resources to export from this module
 # DscResourcesToExport = @()
@@ -119,7 +116,7 @@ PrivateData = @{
         # IconUri = ''
 
         # ReleaseNotes of this module
-        ReleaseNotes = 'v4.14.0 performance and precision release: conservative default detection, faster Windows Event CSV streaming, true pass-through metadata handling, validated IPv6, reduced false positives, and stronger BYOP/Strict separation.'
+        ReleaseNotes = 'v4.15.0 QA and enterprise export release: compact byte-aware progress, profile extension overlays, base-profile sample generation, opt-in ETL conversion, native DOCX/PPTX text extraction, XLSX intake, and ServiceNow/Nexthink/SCCM/Intune/M365/Sentinel/EDR/firewall recommendations.'
 
         # Prerelease string of this module
         # Prerelease = ''

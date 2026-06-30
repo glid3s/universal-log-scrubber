@@ -11,6 +11,34 @@ Use BYOP when:
 - Your environment has shapeless names that patterns cannot infer.
 - Public diagnostic values are being scrubbed and should stay readable.
 
+## Built-In Profiles Added In v4.15
+
+The scrubber includes conservative starting profiles for common enterprise
+exports:
+
+- `ServiceNow`: incident/change/task/CMDB CSV exports. Preserves ticket numbers,
+  states, priorities, timestamps, and common workflow metadata while tokenizing
+  callers, assignees, users, CIs, hosts, private IPs, URLs, secrets, work notes,
+  comments, and descriptions.
+- `Nexthink`: device, user, binary, destination, campaign, and remote-action
+  CSV exports. Preserves operational state/version/count fields while tokenizing
+  users, devices, hosts, destinations, private IPs, and comment-like text.
+- `Sccm`: SCCM/MECM inventory, deployment, client, and collection CSV exports.
+  Preserves numeric resource/deployment/collection/site metadata while
+  tokenizing users, devices, hostnames, private IPs, MACs, serial-like IDs, and
+  server fields.
+- `Intune`: Intune/Endpoint Manager device, enrollment, app, policy, and
+  compliance CSV exports. Preserves compliance/status/platform/policy metadata
+  while tokenizing UPNs, users, devices, serial-like IDs, IMEI/MEID, MACs,
+  private IPs, tenant/domain fields, and secrets.
+- `IntuneDiagnostics`: text-style Intune diagnostic bundle content, including
+  `.log`, `.txt`, `.reg`, `.html`, and `.xml` report files. ETL traces must be
+  converted first; CAB archives should be extracted only when approved.
+
+These profiles are intentionally not a substitute for local review. Use
+`Test-LogFormat`, dry runs, and BYOP rules for organization-specific fields,
+custom vendor labels, local asset IDs, and report/comment edge cases.
+
 ## Mental Model
 
 The scrubber works in layers:
@@ -330,3 +358,32 @@ This folder includes ready-to-edit examples:
 - `seed.example.txt`
 - `allowlist.example.txt`
 
+# v4.15 Profile Extensions
+
+Use `-ProfileExtensionFile` when a built-in profile is close but your organization has extra fields, labels, ticket templates, or vendor identifiers that should be scrubbed. Extensions are additive overlays; they do not replace the selected profile.
+
+Example:
+
+```powershell
+Invoke-UniversalScrubber `
+  -Path .\exports\incidents.csv `
+  -Profile ServiceNow `
+  -ProfileExtensionFile .\docs\profiles\profile-extension-example.json `
+  -SaltFile .\salt.txt `
+  -NonInteractive
+```
+
+Profile builder can also start from a built-in profile and merge extension rules into a standalone editable profile:
+
+```powershell
+Invoke-UniversalScrubber `
+  -BuildProfileFromSample `
+  -Path .\samples\logs\servicenow_incidents.csv `
+  -BaseProfile ServiceNow `
+  -ProfileExtensionFile .\docs\profiles\profile-extension-example.json `
+  -ProfileOut .\servicenow-custom.json `
+  -Force `
+  -NonInteractive
+```
+
+Prefer profile extensions for local edge cases instead of making default detection broader. That keeps `Balanced` mode predictable and reduces false positives for everyone.

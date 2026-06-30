@@ -28,13 +28,21 @@ logs/
 
 # Keep intentional sample logs tracked
 
+!samples/
+!samples/logs/
 !samples/logs/*.log
+!samples/logs/*.txt
+!samples/logs/*.csv
+!samples/logs/*.json
+!samples/logs/*.jsonl
+!samples/logs/*.ndjson
+!samples/logs/*.reg
+!samples/logs/*.html
+!samples/logs/*.xml
 
 # Sample/test output
 
 samples/out/
-samples/external-corpora/
-external-corpus-results/
 
 # Downloaded helper packages / temporary overlay folders
 

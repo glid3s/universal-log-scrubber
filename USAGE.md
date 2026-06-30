@@ -4,6 +4,8 @@ This guide is written for people who need to safely prepare logs for external
 analysis, including LLM-assisted analysis, without sending sensitive values out
 of a secure environment.
 
+This guide covers Universal Log Scrubber v4.15.0.
+
 The short version:
 
 1. Use a dry run first.
@@ -50,51 +52,6 @@ Invoke-UniversalScrubber `
 
 If a folder contains mixed log types, `-AutoProfile -NonInteractive` stops and
 asks you to pass `-Profile` explicitly or split the files by type.
-
-## Optional External Corpus Testing
-
-v4.13.0 can help you test against public log corpora without adding those corpora
-to this repository. Public corpora can be raw, unsanitized, operationally
-realistic, offensive, or license-restricted. Review the source and terms before
-download, and keep downloaded corpora in an approved local folder.
-
-List the built-in catalog without network access:
-
-```powershell
-Get-LogCorpusCatalog
-
-Search-LogCorpusCatalog -Query apache
-```
-
-Save a small direct-download sample. Downloads require `-AcceptRisk`:
-
-```powershell
-.\scripts\Get-SampleLogs.ps1 `
-  -Name Loghub-Apache `
-  -AcceptRisk
-```
-
-Downloaded samples default to `.\samples\external-corpora`, which is ignored by
-git. Use `-Destination D:\log-corpora` when you want an explicit location.
-Large or source-controlled datasets write manual instructions instead of
-downloading automatically.
-
-Run an optional local smoke test over a corpus folder:
-
-```powershell
-Invoke-ExternalCorpusSmokeTest `
-  -CorpusRoot .\samples\external-corpora `
-  -Recurse `
-  -UseRecommendations `
-  -DryRunOnly `
-  -Salt "preview-only" `
-  -NonInteractive
-```
-
-The smoke test writes CSV, JSON, and Markdown summaries under
-`.\external-corpus-results` by default. GitHub Actions does not download or test
-external corpora. v4.13.0 does not support real scrubbing from this smoke-test
-command; use it for recommendations and dry-run previews only.
 
 Set a salt. The salt makes the same real value become the same token every time.
 Use the same salt when multiple logs need to correlate with each other.
@@ -180,6 +137,15 @@ Use `Generic` when unsure. Use a specific profile when the log type is known:
 - `WebAccess` or `Proxy` for access/proxy logs.
 - `CloudAudit`, `Firewall`, `Vpn`, `Database`, `Container`, `Kubernetes`, or
   `IdentityProvider` when those labels match the source.
+- `ServiceNow` for incident/change/task/CMDB CSV exports.
+- `Nexthink` for device, user, binary, destination, campaign, and remote-action
+  CSV exports.
+- `Sccm` for SCCM/MECM inventory, deployment, client, and collection CSV
+  exports.
+- `Intune` for Intune/Endpoint Manager device, enrollment, app, policy, and
+  compliance CSV exports.
+- `IntuneDiagnostics` for Intune diagnostic `.log`, `.txt`, `.reg`, `.html`,
+  and `.xml` reports and command-output dumps.
 
 Example:
 
@@ -191,6 +157,72 @@ Example:
   -SaltFromEnv SCRUB_SALT `
   -NonInteractive
 ```
+
+## Enterprise Export Recipes
+
+ServiceNow ticket dumps:
+
+```powershell
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\exports\ServiceNowTickets.csv `
+  -WorkDir C:\scrubbed\ServiceNow `
+  -Profile ServiceNow `
+  -SaltFromEnv SCRUB_SALT `
+  -DryRun `
+  -ExplainDetections `
+  -NonInteractive
+```
+
+Nexthink, SCCM/MECM, and Intune CSV exports use the same pattern:
+
+```powershell
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\exports\NexthinkDevices.csv `
+  -WorkDir C:\scrubbed\Nexthink `
+  -Profile Nexthink `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\exports\SccmInventory.csv `
+  -WorkDir C:\scrubbed\Sccm `
+  -Profile Sccm `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\exports\IntuneDevices.csv `
+  -WorkDir C:\scrubbed\Intune `
+  -Profile Intune `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+```
+
+Intune Diagnostics bundles are usually mixed text-like files. Use
+`Test-LogFormat` first, then scrub approved contents with `IntuneDiagnostics`.
+
+```powershell
+Test-LogFormat -Path C:\IntuneDiagnostics -Recurse
+
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\IntuneDiagnostics `
+  -WorkDir C:\scrubbed\IntuneDiagnostics `
+  -Profile IntuneDiagnostics `
+  -Recurse `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+```
+
+Notes for Intune Diagnostics:
+
+- `.log`, `.txt`, `.reg`, `.html`, and `.xml` are treated as local text/report
+  inputs.
+- ETL traces are not parsed natively in v4.15. Convert them to `.log`,
+  `.txt`, or `.csv` with your existing workflow first.
+- CAB archives are not expanded by the scrubber. Extract approved contents or
+  remove archives that are not needed for review.
+- Keep using BYOP for organization-specific report fields, vendor labels, or
+  local asset IDs that are not caught by the built-in profile.
 
 ## Build A Profile From A Sample
 
@@ -401,6 +433,44 @@ shows progress so large event logs do not look hung.
 Use `CountFirst` when you want true percentage progress. It does a pre-pass to
 count events, then writes CSV rows with EventData/UserData columns when present.
 
+## XLSX, DOCX, And PPTX Intake
+
+XLSX, DOCX, and PPTX files are converted locally before scrubbing. The converted
+intermediate files are UNSCRUBBED until the scrub step completes, so keep
+`-WorkDir` in an approved local location.
+
+```powershell
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\exports\Tickets.xlsx `
+  -WorkDir C:\scrubbed\TicketsWorkbook `
+  -SaltFromEnv SCRUB_SALT `
+  -AutoProfile `
+  -NonInteractive
+
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\reports\handoff.docx `
+  -WorkDir C:\scrubbed\WordReport `
+  -Profile Text `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+
+.\scripts\Run-UniversalScrubber.ps1 `
+  -Path C:\reports\deck.pptx `
+  -WorkDir C:\scrubbed\Deck `
+  -Profile Text `
+  -SaltFromEnv SCRUB_SALT `
+  -NonInteractive
+```
+
+XLSX conversion uses the first worksheet in v4.15. For complex workbooks,
+export important sheets separately or build a BYOP profile from a representative
+sheet export.
+
+DOCX and PPTX extraction uses native OpenXML zip parsing. It includes document
+body/slide text plus common comments, notes, headers, and footers when present.
+Legacy `.doc` and `.ppt` files are not parsed natively; export them to DOCX,
+PPTX, or plain text first.
+
 ## Token Maps
 
 The token map is the private lookup table that lets local reviewers re-identify
@@ -500,3 +570,74 @@ Test-LogFormat -Path .\samples\logs -Recurse
 Use synthetic or approved local logs for dry-run validation. The dry run previews
 what would be detected and tokenized without writing scrubbed output files.
 
+# v4.15 Usage Addendum
+
+## Enterprise Exports
+
+Use `-AutoProfile` for discovery, then rerun with the recommended profile when you want a repeatable command:
+
+```powershell
+Test-LogFormat -Path .\exports -Recurse
+Invoke-UniversalScrubber -Path .\exports -Recurse -AutoProfile -SaltFile .\salt.txt -NonInteractive
+```
+
+Useful built-in profiles in v4.15:
+
+- `ServiceNow` for incident/change/task CSV exports.
+- `Nexthink` for device, user, execution, and remote-action CSV/XLSX exports.
+- `Sccm` for structured SCCM/MECM/ConfigMgr CSV exports.
+- `SccmText` for CMTrace/client text logs.
+- `Intune` for Intune managed-device CSV exports.
+- `IntuneDiagnostics` for Intune diagnostic `.log`, `.txt`, `.reg`, `.html`, and `.xml` reports.
+- `IdentityProvider` for M365/Entra/identity audit CSV exports.
+- `CloudAudit` for Sentinel and cloud audit JSON/JSONL.
+- `Edr` for EDR/XDR alert JSON/JSONL.
+- `Firewall` or `FirewallText` for firewall/VPN syslog and key=value text.
+- `FirewallCsv` for structured firewall CSV exports.
+
+## Profile Extension Overlays
+
+`-ProfileExtensionFile` adds local BYOP rules on top of a built-in or custom profile. This is the preferred path for organization-specific columns, vendor fields, ticket templates, and edge-case identifiers.
+
+```powershell
+Invoke-UniversalScrubber `
+  -Path .\servicenow-incidents.csv `
+  -Profile ServiceNow `
+  -ProfileExtensionFile .\servicenow-local-extension.json `
+  -SaltFile .\salt.txt `
+  -NonInteractive
+```
+
+Extensions can add `SchemaColumns`, `WholeColumnRules`, `LabelRules`, `CustomRegexRules`, `SeedTerms`, `SeedFiles`, `Allowlist`, and `AllowlistFile` values. They are additive; they do not replace the base profile.
+
+## Build A BYOP Profile From A Sample
+
+Generated profiles can now start from a built-in profile and include extension rules:
+
+```powershell
+Invoke-UniversalScrubber `
+  -BuildProfileFromSample `
+  -Path .\sample-ticket-export.csv `
+  -BaseProfile ServiceNow `
+  -ProfileExtensionFile .\local-ticket-extension.json `
+  -ProfileOut .\servicenow-custom.json `
+  -ProfileReportOut .\servicenow-profile-report_DO_NOT_UPLOAD.md `
+  -Force `
+  -NonInteractive
+```
+
+The profile output is designed to be edited and committed if it contains no raw sensitive values. The report, seed files, token maps, salts, converted intermediates, and scrub manifests remain local-only.
+
+## ETL, Office, And Converted Intermediates
+
+ETL conversion is opt-in:
+
+```powershell
+Invoke-UniversalScrubber -Path .\diagnostic.etl -ConvertEtl -Profile Generic -SaltFile .\salt.txt -NonInteractive
+```
+
+The command uses Windows `tracerpt.exe` when available. If `tracerpt.exe` is unavailable, convert the ETL to CSV, XML, or text with your normal diagnostic workflow, then scrub the converted file.
+
+DOCX, PPTX, XLSX, HTML, XML, REG, ETL, and other converted intermediates may contain raw sensitive data until the scrub step completes. Keep work directories local and do not upload token maps, salts, manifests, converted intermediates, or `*_DO_NOT_UPLOAD*` reports.
+
+For Intune diagnostic bundles, scrub the extracted `.log`, `.txt`, `.reg`, `.html`, and `.xml` files. Cabinet archives (`.cab`) are not expanded by default in v4.15; extract them locally with your normal Windows tools only when the contents are needed.
