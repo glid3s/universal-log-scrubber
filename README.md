@@ -236,7 +236,7 @@ and more readable. You can add your own allowlist values in a profile or
 UniversalLogScrubber/  module manifest and script module
 scripts/               launcher and sample tests
 docs/                  security and operational notes
-docs/profiles/         BYOP handbook and ready-to-edit profile examples
+docs/profiles/         Ready-to-edit BYOP profile and extension examples
 .github/               CI self-test workflow
 ```
 
@@ -246,12 +246,10 @@ docs/profiles/         BYOP handbook and ready-to-edit profile examples
 Test-ModuleManifest .\UniversalLogScrubber\UniversalLogScrubber.psd1
 Import-Module .\UniversalLogScrubber\UniversalLogScrubber.psd1 -Force
 Invoke-UniversalScrubber -Version
-Invoke-UniversalLogScrubber -Version
 Test-LogFormat -Path .\samples\logs -Recurse
 Invoke-UniversalScrubber -Path .\samples\logs -Recurse -RecommendOnly -NonInteractive
 Invoke-UniversalScrubber -Path .\samples\logs -Recurse -SafeFirstRun -NonInteractive
 Invoke-ScrubSelfTest
-Invoke-ULSScrubSelfTest
 .\scripts\Test-SampleLogs.ps1
 
 .\scripts\Run-UniversalScrubber.ps1 `
@@ -271,6 +269,10 @@ detections without writing scrubbed output files.
 See [USAGE.md](USAGE.md) for step-by-step workflows, profile generation,
 profile authoring, seed and allowlist file formats, policy modes, token map
 handling, EVTX conversion guidance, and safe-upload checklists.
+
+For deeper BYOP walkthroughs, see the
+[BYOP Profile Authoring wiki page](https://github.com/glid3s/universal-log-scrubber/wiki/BYOP-Profile-Authoring).
+Ready-to-edit profile examples live in [docs/profiles](docs/profiles).
 
 # Universal Log Scrubber v4.15 Quick Notes
 

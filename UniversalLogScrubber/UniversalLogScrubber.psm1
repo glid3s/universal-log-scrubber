@@ -289,13 +289,19 @@ function Write-UlsProgress {
         [int]$Ready = -1,
         [int]$CompletedBatches = -1,
         [switch]$Completed,
+        [switch]$Reset,
         [switch]$Force,
         [int]$MinIntervalMs = 1000
     )
 
+    if ($Reset) {
+        [void]$script:UlsProgressState.Remove($Activity)
+        return
+    }
+
     if ($Completed) {
         Write-Progress -Activity $Activity -Completed
-        $script:UlsProgressState.Remove($Activity)
+        [void]$script:UlsProgressState.Remove($Activity)
         return
     }
 
@@ -318,7 +324,7 @@ function Write-UlsProgress {
         if ($BytesTotal -gt 0) { [void]$bits.Add(("{0}/{1} MB" -f $mbDone, [Math]::Round(($BytesTotal / 1MB), 1))) }
         else { [void]$bits.Add(("{0} MB" -f $mbDone)) }
     }
-    if ($Workers -ge 0) { [void]$bits.Add(("workers {0}" -f $Workers)) }
+    if ($Workers -ge 0) { [void]$bits.Add(("active {0}" -f $Workers)) }
     if ($Pending -ge 0) { [void]$bits.Add(("pending {0}" -f $Pending)) }
     if ($Ready -ge 0) { [void]$bits.Add(("ready {0}" -f $Ready)) }
     if ($CompletedBatches -ge 0) { [void]$bits.Add(("batches {0}" -f $CompletedBatches)) }
@@ -2133,7 +2139,7 @@ function New-ScrubTokenMap {
             # Large line-oriented discovery can now use true streaming parallel batches: no physical input chunks.
             $useParallelDiscovery = (-not $NoParallelDiscovery -and -not [string]::IsNullOrWhiteSpace($WorkDir) -and -not [string]::IsNullOrWhiteSpace($ProfileName) -and ($ParallelDiscovery -or $autoParallelDiscoveryCandidate))
             if ($autoParallelDiscoveryCandidate -and -not $ParallelDiscovery) {
-                Write-Info ("Auto streaming-parallel discovery ({0} MB; throttle={1}; batchSize={2}; no input chunk files). Use -NoParallelDiscovery to disable." -f [Math]::Round(($fileLength / 1MB),1), $ThrottleLimit, $(if ($ChunkSize -gt 0) { $ChunkSize } else { 5000 }))
+                Write-Info ("Auto streaming-parallel discovery ({0} MB; throttle={1}; batchSize={2}; no input chunk files). Use -NoParallelDiscovery to disable." -f [Math]::Round(($fileLength / 1MB),1), $ThrottleLimit, $(if ($ChunkSize -gt 0) { $ChunkSize } else { 20000 }))
             }
             if ($useParallelDiscovery) {
                 $workerRows = @(Invoke-DiscoverFileParallelText -InputPath $file -TokenMapCsv $out -WorkDir $WorkDir -ProfileName $ProfileName -SensitiveTerms $SeedTerms -AllowlistFile $AllowlistFile -ScrubPolicy $ScrubPolicy -ThrottleLimit $ThrottleLimit -ChunkSize $ChunkSize -NoCorrelate:$NoCorrelate -KeepIntermediate:$KeepIntermediate)
@@ -2724,7 +2730,17 @@ function Get-ScrubProfile {
             @{ Pattern='campaign|survey|question|answer|comment|description'; Prefix='OBJECT' },
             @{ Pattern='token|secret|password|credential|key'; Prefix='SECRET' }
         )
-        FreeTextRegex='comment|description|campaign|question|answer|url|uri|destination'
+        FreeTextRegex='comment|description|campaign|question|answer|url|uri|destination|execution\.output|output|message|details|path|file'
+        CustomRegexRules=@(
+            @{
+                Name='NexthinkActionDevice'
+                Regex='(?i)(\bAction\s+run\s+by\s+\S+\s+on\s+)([A-Za-z][A-Za-z0-9_-]{2,})'
+                CaptureGroup=2
+                Prefix='COMPUTER'
+                Keywords=@('Action run by')
+                Entropy=0
+            }
+        )
         DenyByDefault=$false; AllowedDomains=@('nexthink.com')
     }
     $sccm = [pscustomobject]@{
@@ -3939,10 +3955,51 @@ function Protect-SensitiveTerms {
     return $out
 }
 
+function Invoke-UlsLineWiseFileHardening {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$SensitiveTerms = @(),
+        [switch]$SkipFirstLine
+    )
+    $resolved = (Resolve-Path -Path $Path).Path
+    $dir = Split-Path -Parent $resolved
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = (Get-Location).Path }
+    $tmp = Join-Path $dir ('.{0}.reharden.{1}.tmp' -f ([System.IO.Path]::GetFileName($resolved)), ([guid]::NewGuid().ToString('N')))
+    $reader = $null
+    $writer = $null
+    $completed = $false
+    try {
+        $reader = [System.IO.StreamReader]::new($resolved)
+        $writer = [System.IO.StreamWriter]::new($tmp, $false, [System.Text.Encoding]::UTF8)
+        $lineNo = 0
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            $lineNo++
+            if ($SkipFirstLine -and $lineNo -eq 1) {
+                $writer.WriteLine($line)
+                continue
+            }
+            $line = Invoke-LeakHardeningText -Text $line
+            $line = Protect-SensitiveTerms -Text $line -SensitiveTerms $SensitiveTerms
+            $writer.WriteLine($line)
+        }
+        $completed = $true
+    }
+    finally {
+        if ($writer) { $writer.Close() }
+        if ($reader) { $reader.Close() }
+        if (-not $completed -and (Test-Path -LiteralPath $tmp)) {
+            try { Remove-Item -LiteralPath $tmp -Force } catch { }
+        }
+    }
+    Move-Item -LiteralPath $tmp -Destination $resolved -Force
+}
+
 function Test-ScrubbedForLeaks {
     param(
         [Parameter(Mandatory)][string]$CsvPath,
         [string[]]$SensitiveTerms = @(),
+        [switch]$SkipFirstLine,
         [switch]$ProbeOnly
     )
     Write-Work "Leak check: $([System.IO.Path]::GetFileName($CsvPath))"
@@ -3985,6 +4042,7 @@ function Test-ScrubbedForLeaks {
     foreach ($line in [System.IO.File]::ReadLines($resolvedLeakPath)) {
         $lcN++
         if ($lcN % 2000 -eq 0) { Write-UlsProgress -Activity "Leak check" -File $lcName -RowsDone $lcN }
+        if ($SkipFirstLine -and $lcN -eq 1) { continue }
         foreach ($termKey in @($termCounts.Keys)) {
             $termCounts[$termKey] = [int]$termCounts[$termKey] + ([regex]::Matches($line, [regex]::Escape($termKey), 'IgnoreCase')).Count
         }
@@ -5556,6 +5614,8 @@ function New-SafeScrubBundle {
     )
     $clean = @($Results | Where-Object { $_.Clean -and $_.Output -and (Test-Path -LiteralPath $_.Output) })
     if ($clean.Count -eq 0) { throw "No clean scrubbed outputs are available for bundling." }
+    $unverified = @($clean | Where-Object { $_.LeakCheckSkipped })
+    if ($unverified.Count -gt 0) { throw "Safe bundle requires leak-verified outputs; $($unverified.Count) clean output(s) skipped leak check." }
     $out = Resolve-OutPath -Path $OutputPath
     if ((Test-Path -LiteralPath $out) -and -not $Force) { throw "Safe bundle already exists: $out. Use -Force to overwrite." }
     if ((Test-Path -LiteralPath $out) -and $Force) { Remove-Item -LiteralPath $out -Force }
@@ -6270,7 +6330,21 @@ function Invoke-ScrubFileStreaming {
     }
     $clean = $true
     if ($SkipLeakCheck) { Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified." }
-    else { $clean = ($leakCounts.Keys.Count -eq 0) }
+    else {
+        $clean = ($leakCounts.Keys.Count -eq 0)
+        if (-not $clean -and ($Format -eq 'Csv' -or $Format -eq 'Tsv' -or $Format -eq 'Psv')) {
+            Write-Warn "Residue detected -- attempting one in-place re-harden..."
+            try {
+                Invoke-UlsLineWiseFileHardening -Path $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine
+                $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine
+                if ($clean) { $leakCounts = @{}; $leakSamples = @{} }
+            }
+            catch {
+                Write-Warn "In-place re-harden could not complete ($($_.Exception.GetType().Name)); leaving output and flagging for review."
+                $clean = $false
+            }
+        }
+    }
     if ($clean -and -not $SkipLeakCheck) { Write-Ok "Leak check PASSED (streaming): $name" }
     else {
         if (-not $SkipLeakCheck) {
@@ -6449,10 +6523,12 @@ function Invoke-UlsRunspaceBatchPool {
         [long]$TotalBytes = 0
     )
     if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
+    Write-UlsProgress -Activity $Activity -Reset
 
     $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ThrottleLimit)
     $pool.ApartmentState = 'MTA'
     $pool.Open()
+    $progressCompleted = $false
 
     # Mutable state is stored in hashtable keys and updated through the indexer.
     # Avoid $state.Completed++ / $state.CompletedRows += ... here: under nested
@@ -6475,21 +6551,11 @@ function Invoke-UlsRunspaceBatchPool {
         $last = [datetime]$state['LastProgressUpdate']
         if (-not $Force -and (($nowProgress - $last).TotalMilliseconds -lt 500)) { return }
 
-        $percent = -1
-        $mbStatus = ''
-        if ($TotalBytes -gt 0) {
-            $basisBytes = [Math]::Max([int64]$state['CompletedBytes'], [int64]0)
-            $percent = [Math]::Min(99, [Math]::Max(0, [int](($basisBytes * 100.0) / [double]$TotalBytes)))
-            $mbDone = [Math]::Round(($basisBytes / 1MB), 1)
-            $mbTotal = [Math]::Round(($TotalBytes / 1MB), 1)
-            $mbStatus = ("; {0}/{1} MB" -f $mbDone,$mbTotal)
-        }
-
         $runningCount = 0
         try { $runningCount = $state['Running'].Count } catch { $runningCount = 0 }
-        $progressBytes = [Math]::Max([int64]$state['CompletedBytes'], [int64]$state['SubmittedBytes'])
+        $progressBytes = [Math]::Max([int64]$state['CompletedBytes'], [int64]0)
         if ($TotalBytes -gt 0) { $progressBytes = [Math]::Min([int64]$TotalBytes, [int64]$progressBytes) }
-        Write-UlsProgress -Activity $Activity -Phase ("done {0}/{1}" -f ([int64]$state['Completed']), ([int64]$state['Submitted'])) -RowsDone ([int64]$state['CompletedRows']) -RowsTotal ([int64]$state['SubmittedRows']) -BytesDone ([int64]$progressBytes) -BytesTotal $TotalBytes -Workers $runningCount -Pending ([int]$pending.Count) -Force:$Force -MinIntervalMs 500
+        Write-UlsProgress -Activity $Activity -Phase ("batches {0}/{1}" -f ([int64]$state['Completed']), ([int64]$state['Submitted'])) -RowsDone ([int64]$state['CompletedRows']) -RowsTotal ([int64]$state['SubmittedRows']) -BytesDone ([int64]$progressBytes) -BytesTotal $TotalBytes -Workers $runningCount -Force:$Force -MinIntervalMs 500
         $state['LastProgressUpdate'] = $nowProgress
     }
 
@@ -6561,8 +6627,12 @@ function Invoke-UlsRunspaceBatchPool {
         if ($TotalBytes -gt 0) { $state['CompletedBytes'] = [Math]::Max([int64]$state['CompletedBytes'], [int64]$TotalBytes) }
         & $writeProgress -Force
         Write-UlsProgress -Activity $Activity -Completed
+        $progressCompleted = $true
     }
     finally {
+        if (-not $progressCompleted) {
+            try { Write-UlsProgress -Activity $Activity -Completed } catch { }
+        }
         try {
             foreach ($item in @($state['Running'])) {
                 try { $item.PowerShell.Stop() } catch { }
@@ -6591,7 +6661,7 @@ function Invoke-DiscoverFileStreamingParallelText {
         [switch]$KeepIntermediate
     )
     if ($ThrottleLimit -lt 1) { $ThrottleLimit = 1 }
-    $batchSize = if ($ChunkSize -gt 0) { $ChunkSize } else { 5000 }
+    $batchSize = if ($ChunkSize -gt 0) { $ChunkSize } else { 20000 }
     $name = [System.IO.Path]::GetFileName($InputPath)
     $modulePath = Get-UlsCurrentModulePath
     $saltValue = Get-SessionSalt
@@ -6888,7 +6958,18 @@ function Invoke-ScrubFileStreamingParallelCsv {
     }
     else {
         Write-UlsProgress -Activity "Verify" -Phase "leak check" -File $name -Force
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -ProbeOnly
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine -ProbeOnly
+        if (-not $clean) {
+            Write-Warn "Residue detected -- attempting one in-place re-harden..."
+            try {
+                Invoke-UlsLineWiseFileHardening -Path $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine
+                $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine
+            }
+            catch {
+                Write-Warn "In-place re-harden could not complete ($($_.Exception.GetType().Name)); leaving output and flagging for review."
+                $clean = $false
+            }
+        }
         Write-UlsProgress -Activity "Verify" -File $name -Completed
     }
     Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $writtenRows -Notes ('Streaming parallel CSV final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
@@ -7416,7 +7497,18 @@ Invoke-UniversalScrubber -Path $pathLiteral -WorkDir $workLiteral -Profile $prof
         $clean = $true
     }
     else {
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -ProbeOnly
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine -ProbeOnly
+        if (-not $clean) {
+            Write-Warn "Residue detected -- attempting one in-place re-harden..."
+            try {
+                Invoke-UlsLineWiseFileHardening -Path $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine
+                $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine
+            }
+            catch {
+                Write-Warn "In-place re-harden could not complete ($($_.Exception.GetType().Name)); leaving output and flagging for review."
+                $clean = $false
+            }
+        }
     }
     Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Rows $mergedRows -Notes ('Parallel final leak check; SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
 
@@ -7568,7 +7660,7 @@ function New-SyntheticLog {
 function Invoke-ScrubSelfTest {
     [CmdletBinding()]
     param([switch]$KeepFiles)
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v$script:ModuleVersion -- SELF-TEST" "Synthetic data only; no real logs touched."
+    Write-Banner ">_ ULS  v$script:ModuleVersion" "   self-test  ::  synthetic data only  ::  no real logs touched"
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
@@ -7648,8 +7740,15 @@ function Invoke-ScrubSelfTest {
         & $assert ($guardErrors.Count -eq 0) "module parses without static errors"
         $duplicateFunctions = @($guardAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Group-Object Name | Where-Object { $_.Count -gt 1 })
         & $assert ($duplicateFunctions.Count -eq 0) "module has no duplicate function definitions"
+        & $assert (("  >_ ULS  v$script:ModuleVersion").Length -le ($script:UiWidth - 2)) "compact banner title fits configured width"
+        & $assert (("     map first  ::  scrub second  ::  verify before upload").Length -le ($script:UiWidth - 2)) "compact banner subtitle fits configured width"
+        & $assert (("     self-test  ::  synthetic data only  ::  no real logs touched").Length -le ($script:UiWidth - 2)) "compact self-test banner subtitle fits configured width"
         try {
             Write-UlsProgress -Activity 'Self-test progress' -Phase 'compact' -File 'sample.csv' -RowsDone 1 -RowsTotal 2 -Workers 2 -Pending 1 -Ready 0 -Force
+            Write-UlsProgress -Activity 'Self-test progress stale' -Phase 'old' -RowsDone 1 -Force
+            & $assert ($script:UlsProgressState.ContainsKey('Self-test progress stale')) "compact progress helper records active state"
+            Write-UlsProgress -Activity 'Self-test progress stale' -Reset
+            & $assert (-not $script:UlsProgressState.ContainsKey('Self-test progress stale')) "compact progress helper reset clears stale state"
             Write-UlsProgress -Activity 'Self-test progress' -Completed
             & $assert $true "compact progress helper accepts short status inputs"
         }
@@ -8054,6 +8153,33 @@ function Invoke-ScrubSelfTest {
         try { [void](Import-ScrubProfileFile -Path $badProfilePath) } catch { $badFailed = ($_.Exception.Message -match 'custom regex rule') }
         & $assert $badFailed "BYOP invalid regex reports rule context"
 
+        # ---- 5b) Nexthink CSV header and execution-output regression ----
+        Write-Rule "Nexthink CSV header and execution output hardening"
+        $script:ScrubPolicy = 'Balanced'
+        & $reset
+        $nexDir = Join-Path $dir 'nexthink'
+        New-Item -ItemType Directory -Path $nexDir -Force | Out-Null
+        $nexCsv = Join-Path $nexDir 'nexthink.csv'
+        @(
+            'device.name,user.email,binary.path,binary.sha256,execution.status,execution.output',
+            '"VDI-CALL-0902","marco.silva@northstar.example","C:\Users\marco.silva\AppData\Local\Google\Chrome\Application\chrome.exe","0899cd856fba9b131050135138cd87c5e5222f0a0657b94730901988d5cabdbb","success","Action run by marco.silva@northstar.example on VDI-CALL-0902; traceId=f06be575-39a5-4198-98a0-ce7b7ae8983e"'
+        ) | Set-Content -Path $nexCsv -Encoding UTF8
+        $nexPathCell = Scrub-Field -ColumnName 'binary.path' -Value 'C:\Users\marco.silva\AppData\Local\Google\Chrome\Application\chrome.exe' -Profile (Get-ScrubProfile -Name Nexthink)
+        & $assert (-not ([string]$nexPathCell -match [regex]::Escape('C:\Users\marco.silva'))) "Nexthink binary.path first-pass removes user path segment"
+        $nexRun = Invoke-UniversalScrubber -Path $nexCsv -WorkDir (Join-Path $nexDir 'out') -Profile Nexthink -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -NonInteractive
+        $nexResult = @($nexRun)[0]
+        $nexText = Get-Content -Path $nexResult.Output -Raw
+        $nexHeader = Get-Content -Path $nexResult.Output -TotalCount 1
+        & $assert ([bool]$nexResult.Clean) "Nexthink CSV verifies clean without default rehardening"
+        & $assert ($nexHeader -match 'device\.name' -and $nexHeader -match 'execution\.output') "Nexthink CSV header names are preserved"
+        & $assert (-not ($nexHeader -match '(?:COMPUTER|DNS|PRINCIPAL|OBJECT)_[A-F0-9]+')) "Nexthink CSV header is not tokenized"
+        foreach ($gone in @('VDI-CALL-0902','marco.silva@northstar.example','C:\Users\marco.silva','0899cd856fba9b131050135138cd87c5e5222f0a0657b94730901988d5cabdbb','f06be575-39a5-4198-98a0-ce7b7ae8983e')) {
+            & $assert (-not ($nexText -match [regex]::Escape($gone))) "Nexthink CSV removed raw value: $gone"
+        }
+        $nexRow = @(Import-Csv -Path $nexResult.Output)[0]
+        & $assert ([string]$nexRow.'device.name' -match '^COMPUTER_[A-F0-9]+$') "Nexthink device column uses COMPUTER token"
+        & $assert ([string]$nexRow.'execution.output' -match [regex]::Escape([string]$nexRow.'device.name')) "Nexthink output reuses device token"
+
         # ---- 5) Sample profile builder ----
         Write-Rule "Sample profile builder"
         $builder = Join-Path $dir 'builder'
@@ -8102,6 +8228,13 @@ function Invoke-ScrubSelfTest {
             foreach ($raw in $spec.Raw) { & $assert (-not ($scrubText -match [regex]::Escape($raw))) "profile builder [$($spec.Name)] scrub removes: $raw" }
             & $assert ((Test-Path -LiteralPath $bundleOut) -and ((Get-Item -LiteralPath $bundleOut).Length -gt 0)) "safe bundle [$($spec.Name)] created"
         }
+        $skipBundleOut = Join-Path $builder 'safe_skip_leak.zip'
+        $skipOut = Join-Path $builder 'out_skip_leak'
+        $skipRun = Invoke-UniversalScrubber -Path (Join-Path $builder 'sample_csv.csv') -WorkDir $skipOut -ProfileFile (Join-Path $builder 'generated_csv.json') -Salt 'selftest-fixed-salt' -MapSource Discover -TokenMapMode Replace -SkipLeakCheck -SafeBundleOut $skipBundleOut -Force -NonInteractive
+        & $assert ([bool](@($skipRun)[0].LeakCheckSkipped)) "safe bundle guard records skipped leak check"
+        & $assert (-not (Test-Path -LiteralPath $skipBundleOut)) "safe bundle refuses skipped leak-check output"
+        $skipManifest = Get-Content -Path (Join-Path $skipOut 'scrub_run_manifest.json') -Raw | ConvertFrom-Json
+        & $assert ([bool](@($skipManifest.scrubbedFiles)[0].leakCheckSkipped)) "manifest records skipped leak check"
         $missingFailed = $false
         try { [void](New-ScrubProfileFromSample -Path (Join-Path $builder 'missing.log') -ProfileOut (Join-Path $builder 'missing.json') -NonInteractive) } catch { $missingFailed = ($_.Exception.Message -match 'Sample path not found') }
         & $assert $missingFailed "profile builder invalid path reports clearly"
@@ -8352,7 +8485,7 @@ function Invoke-ScrubFile {
         Write-DryRunSummary -Name $name -Changes $changes
         if ($script:__scrubFallback -gt 0) { Write-Warn "$($script:__scrubFallback) cell(s) couldn't be fully hardened and were handled safely (fail-closed). First column: '$($script:__scrubFallbackCol)'." }
         if ($FalsePositiveReport) { [void](Write-DetectionReport -Path $FalsePositiveReport) }
-        return [pscustomobject]@{ Input = $InputPath; Output = $null; Clean = $true; DryRun = $true; ChangeCount = $changes.Count }
+        return [pscustomobject]@{ Input = $InputPath; Output = $null; Clean = $true; DryRun = $true; ChangeCount = $changes.Count; LeakCheckSkipped = $false }
     }
 
     if ($format -eq 'Csv' -or $format -eq 'Tsv' -or $format -eq 'Psv') {
@@ -8452,23 +8585,21 @@ function Invoke-ScrubFile {
     # the per-cell scrub still ran in full; only the separate re-scan is skipped. Use when you trust
     # the scrub config for the data set (e.g. bulk re-runs of vetted log types).
     $ulsPerfLeak = New-UlsPerfStopwatch
+    $skipLeakHeader = ($format -eq 'Csv' -or $format -eq 'Tsv' -or $format -eq 'Psv')
     if ($SkipLeakCheck) {
         Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified."
         $clean = $true
     }
     else {
-        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -ProbeOnly
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine:$skipLeakHeader -ProbeOnly
         if (-not $clean) {
             Write-Warn "Residue detected -- attempting one in-place re-harden..."
             try {
-                $reText = [System.IO.File]::ReadAllText($outFull)
-                $reText = Invoke-LeakHardeningText -Text $reText
-                $reText = Protect-SensitiveTerms -Text $reText -SensitiveTerms $SensitiveTerms
-                [System.IO.File]::WriteAllText($outFull, $reText, [System.Text.Encoding]::UTF8)
-                $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms
+                Invoke-UlsLineWiseFileHardening -Path $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine:$skipLeakHeader
+                $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine:$skipLeakHeader
             }
             catch {
-                # ULS perf patch 3: on a large file the whole-file re-harden can hit the regex timeout.
+                # On a large file, even line-wise re-hardening can hit a regex timeout.
                 # Do not abort the run -- leave the per-cell-scrubbed output in place and report it as
                 # needing review (fail-loud; the per-cell pass already scrubbed every non-pass-through
                 # column, and the leak check above flagged exactly what remains).
@@ -8480,7 +8611,7 @@ function Invoke-ScrubFile {
     Add-UlsPerfPhase -Phase 'Leak check' -Stopwatch $ulsPerfLeak -File $name -Notes ('SkipLeakCheck={0}' -f [bool]$SkipLeakCheck)
     if ($script:__scrubFallback -gt 0) { Write-Warn "$($script:__scrubFallback) cell(s) couldn't be fully hardened and were replaced with a safe token (fail-closed, no leak). First column: '$($script:__scrubFallbackCol)'." }
     if ($FalsePositiveReport) { [void](Write-DetectionReport -Path $FalsePositiveReport) }
-    return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $clean }
+    return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $clean; LeakCheckSkipped = [bool]$SkipLeakCheck }
 }
 
 # =====================================================================
@@ -8523,6 +8654,7 @@ function Write-RunManifest {
             bytes          = $bytes
             tokenCount     = $tokenCount
             leakCheckClean = [bool]$r.Clean
+            leakCheckSkipped = [bool]$r.LeakCheckSkipped
             error          = [string]$r.Error
         }
     }
@@ -8638,7 +8770,7 @@ function Invoke-UniversalScrubber {
     $script:PerfReportPath = $null
     $script:PerfReportTextPath = $null
 
-    Write-Banner "UNIVERSAL LOG SCRUBBER  v$script:ModuleVersion" "Token-map first, then scrub. Nothing leaves until it's clean."
+    Write-Banner ">_ ULS  v$script:ModuleVersion" "   map first  ::  scrub second  ::  verify before upload"
     if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
     if ($SafeFirstRun) { Write-Info "SAFE FIRST RUN mode -- local sample analysis only." }
     if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
@@ -9062,7 +9194,7 @@ function Invoke-UniversalScrubber {
             Write-Fail "Failed on $($t.Name): $($_.Exception.Message)"
             Write-Detail "type: $($_.Exception.GetType().FullName)"
             foreach ($frame in (@($_.ScriptStackTrace -split "`r?`n") | Select-Object -First 5)) { if ($frame -and $frame.Trim()) { Write-Detail $frame.Trim() } }
-            $results += [pscustomobject]@{ Input = $t.FullName; Output = $null; Clean = $false; Error = $_.Exception.Message }
+            $results += [pscustomobject]@{ Input = $t.FullName; Output = $null; Clean = $false; LeakCheckSkipped = $false; Error = $_.Exception.Message }
         }
     }
 

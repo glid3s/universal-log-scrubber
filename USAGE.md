@@ -413,8 +413,9 @@ Example:
 }
 ```
 
-More detailed BYOP guidance and copy/paste examples are in
-[docs/profiles/README.md](docs/profiles/README.md).
+More detailed BYOP guidance and tuning workflow examples are in the
+[BYOP Profile Authoring wiki page](https://github.com/glid3s/universal-log-scrubber/wiki/BYOP-Profile-Authoring).
+Ready-to-edit profile examples live in [docs/profiles](docs/profiles).
 
 ## EVTX Conversion
 
@@ -609,6 +610,9 @@ Invoke-UniversalScrubber `
 ```
 
 Extensions can add `SchemaColumns`, `WholeColumnRules`, `LabelRules`, `CustomRegexRules`, `SeedTerms`, `SeedFiles`, `Allowlist`, and `AllowlistFile` values. They are additive; they do not replace the base profile.
+
+Ready-to-edit extension examples for ticketing, endpoint management, security
+audit, and network edge exports are in [docs/profiles](docs/profiles).
 
 ## Build A BYOP Profile From A Sample
 

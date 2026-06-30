@@ -37,7 +37,7 @@ $cases = @(
 
     # New synthetic product samples
     @{ Name='ServiceNow incidents CSV'; Path='servicenow_incidents.csv'; Profile='ServiceNow' },
-    @{ Name='Nexthink devices/executions CSV'; Path='nexthink_devices_executions.csv'; Profile='Nexthink' },
+    @{ Name='Nexthink devices/executions CSV'; Path='nexthink_devices_executions.csv'; Profile='Nexthink'; RawAbsent=@('VDI-CALL-0902','marco.silva@northstar.example','C:\Users\marco.silva','0899cd856fba9b131050135138cd87c5e5222f0a0657b94730901988d5cabdbb','f06be575-39a5-4198-98a0-ce7b7ae8983e') },
     @{ Name='M365 unified audit CSV'; Path='m365_unified_audit_log.csv'; Profile='IdentityProvider' },
     @{ Name='Sentinel incidents/alerts JSONL'; Path='sentinel_incidents_alerts.jsonl'; Profile='CloudAudit' },
     @{ Name='Firewall/VPN syslog text'; Path='firewall_vpn_syslog.log'; Profile='Firewall' },
@@ -89,6 +89,14 @@ foreach ($case in $cases) {
 
         foreach ($r in @($real)) {
             if (-not $r.Clean) { [void]$failures.Add("Leak check did not pass for $($case.Name): $($r.Input)") }
+            if ($case.RawAbsent -and $r.Output -and (Test-Path -LiteralPath $r.Output)) {
+                $scrubbedText = Get-Content -Path $r.Output -Raw
+                foreach ($raw in @($case.RawAbsent)) {
+                    if ($scrubbedText -match [regex]::Escape([string]$raw)) {
+                        [void]$failures.Add("Raw value remained for $($case.Name): $raw")
+                    }
+                }
+            }
         }
     }
 }
