@@ -12,7 +12,7 @@
 RootModule = 'UniversalLogScrubber.psm1'
 
 # Version number of this module.
-ModuleVersion = '4.15.0'
+ModuleVersion = '4.15.1'
 
 # Supported PSEditions
 CompatiblePSEditions = 'Desktop', 'Core'
@@ -116,7 +116,7 @@ PrivateData = @{
         # IconUri = ''
 
         # ReleaseNotes of this module
-        ReleaseNotes = 'v4.15.0 QA and enterprise export release: compact byte-aware progress, profile extension overlays, base-profile sample generation, opt-in ETL conversion, native DOCX/PPTX text extraction, XLSX intake, and ServiceNow/Nexthink/SCCM/Intune/M365/Sentinel/EDR/firewall recommendations.'
+        ReleaseNotes = 'v4.15.1 adds native Get-WinEvent ETL conversion with tracerpt.exe fallback, -EtlConverter/-TracerptPath controls, and runnable protected generated profiles that store sample-derived field/label matches as salted HMAC tokens.'
 
         # Prerelease string of this module
         # Prerelease = ''
