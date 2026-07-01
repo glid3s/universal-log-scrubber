@@ -4,7 +4,7 @@ This guide is written for people who need to safely prepare logs for external
 analysis, including LLM-assisted analysis, without sending sensitive values out
 of a secure environment.
 
-This guide covers Universal Log Scrubber v4.15.1.
+This guide covers Universal Log Scrubber v4.16.0.
 
 The short version:
 
@@ -217,7 +217,7 @@ Notes for Intune Diagnostics:
 
 - `.log`, `.txt`, `.reg`, `.html`, and `.xml` are treated as local text/report
   inputs.
-- ETL conversion is explicit with `-ConvertEtl`. By default, v4.15.1 tries
+- ETL conversion is explicit with `-ConvertEtl`. By default, v4.16 tries
   `Get-WinEvent` first and falls back to `tracerpt.exe`.
 - CAB archives are not expanded by the scrubber. Extract approved contents or
   remove archives that are not needed for review.
@@ -426,7 +426,7 @@ Ready-to-edit profile examples live in [docs/profiles](docs/profiles).
 ## EVTX Conversion
 
 EVTX files are converted to CSV before scrubbing. Conversion streams rows and
-shows progress so large event logs do not look hung.
+prints phase messages so large event logs do not look hung.
 
 ```powershell
 .\scripts\Run-UniversalScrubber.ps1 `
@@ -437,8 +437,9 @@ shows progress so large event logs do not look hung.
   -NonInteractive
 ```
 
-Use `CountFirst` when you want true percentage progress. It does a pre-pass to
-count events, then writes CSV rows with EventData/UserData columns when present.
+Use `CountFirst` when you want conversion to count events before streaming.
+Console progress bars are disabled by default for speed. Conversion still writes
+CSV rows with EventData/UserData columns when present.
 
 ## XLSX, DOCX, And PPTX Intake
 
@@ -577,7 +578,7 @@ Test-LogFormat -Path .\samples\logs -Recurse
 Use synthetic or approved local logs for dry-run validation. The dry run previews
 what would be detected and tokenized without writing scrubbed output files.
 
-# v4.15.1 Usage Addendum
+# v4.16.0 Usage Addendum
 
 ## Enterprise Exports
 
@@ -588,7 +589,7 @@ Test-LogFormat -Path .\exports -Recurse
 Invoke-UniversalScrubber -Path .\exports -Recurse -AutoProfile -SaltFile .\salt.txt -NonInteractive
 ```
 
-Useful built-in profiles in v4.15:
+Useful built-in enterprise profiles:
 
 - `ServiceNow` for incident/change/task CSV exports.
 - `Nexthink` for device, user, execution, and remote-action CSV/XLSX exports.
@@ -652,6 +653,52 @@ Invoke-UniversalScrubber `
   -NonInteractive
 ```
 
+## Optional Python Processing Engine
+
+PowerShell remains the default engine:
+
+```powershell
+Invoke-UniversalScrubber -Path .\logs -Profile Generic -SaltFile .\salt.txt -NonInteractive
+```
+
+Use `-ProcessingEngine Auto` when you want the scrubber to try Python only when
+it is available, the selected file/profile is eligible, and a bounded benchmark
+shows a meaningful win:
+
+```powershell
+Invoke-UniversalScrubber `
+  -Path .\large-access.log `
+  -WorkDir .\out\access `
+  -Profile WebAccess `
+  -SaltFile .\salt.txt `
+  -MapSource Discover `
+  -ProcessingEngine Auto `
+  -PythonMinSpeedupPercent 15 `
+  -NonInteractive
+```
+
+Use `-ProcessingEngine Python` only for diagnostics or controlled testing. It
+requires Python 3 and an eligible input/profile; unsupported cases fail clearly.
+`-PythonPath` can point at an approved enterprise Python install.
+
+The v4.16.0 Python path is intentionally conservative:
+
+- It can accelerate eligible map-driven scrubbing.
+- Discovery/map building and leak checking remain PowerShell-authoritative.
+- PowerShell still orchestrates profile loading, salt resolution, manifests,
+  safe bundles, intake conversion, final messaging, and all unsupported paths.
+- It passes salt and run context through stdin JSON, not command-line arguments.
+- If `-SkipLeakCheck` is set, Python can still scrub; only verification is
+  skipped. The output is marked unverified and must not be uploaded until a
+  leak check passes.
+- Dry runs, detection reports, protected generated profiles, custom regex
+  profiles, and allowlist-file-heavy profiles stay on PowerShell.
+- Progress bars are disabled by default for speed. Normal phase messages still
+  show when work starts, finishes, warns, or fails.
+
+Run manifests and performance reports record the requested/chosen engine, Python
+path/version, eligibility decision, benchmark result, and fallback reason.
+
 ## ETL, Office, And Converted Intermediates
 
 ETL conversion is opt-in:
@@ -666,6 +713,11 @@ Windows `tracerpt.exe`. Use `-EtlConverter GetWinEvent` or
 installed in a nonstandard location. If conversion is unsupported for a trace,
 convert the ETL to CSV, XML, or text with your normal diagnostic workflow, then
 scrub the converted file.
+
+EVTX/ETL/Office/W3C intake conversion remains PowerShell/Windows-native even
+when `-ProcessingEngine Python` is requested. Python mode means "use Python for
+eligible processing after intake conversion," not "Python parses every source
+format."
 
 DOCX, PPTX, XLSX, HTML, XML, REG, ETL, and other converted intermediates may contain raw sensitive data until the scrub step completes. Keep work directories local and do not upload token maps, salts, manifests, converted intermediates, or `*_DO_NOT_UPLOAD*` reports.
 

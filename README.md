@@ -8,9 +8,9 @@ events can still be correlated without exposing the original identifiers.
 It works offline against Windows Event exports, EVTX files, CSV/TSV/PSV,
 JSON/NDJSON, IIS/W3C, web access/proxy logs, key=value/logfmt/CEF-style logs,
 syslog, enterprise CSV/XLSX exports, Office documents, and mixed diagnostic
-text. Version 4.15.1 adds native `Get-WinEvent` ETL conversion with
-`tracerpt.exe` fallback and protected generated profiles for sample-derived
-field/label names that should not appear in profile JSON.
+text. Version 4.16.0 adds optional standard-library Python acceleration for
+eligible map-driven scrubbing while keeping PowerShell as the default
+orchestrator, token-map authority, and leak-check safety authority.
 
 ## Safety First
 
@@ -84,7 +84,7 @@ Use local recommendations first when a folder has mixed exports:
 Test-LogFormat -Path C:\exports -Recurse
 ```
 
-Built-in v4.15 profiles include:
+Current built-in enterprise profiles include:
 
 - `ServiceNow` for incident/change/task/CMDB CSV exports with callers,
   assignees, CIs, URLs, work notes, and comments.
@@ -189,6 +189,49 @@ domains, and common built-in Windows accounts are preserved where that is safer
 and more readable. You can add your own allowlist values in a profile or
 `-AllowlistFile`.
 
+## v4.16.0 Highlights
+
+- `-ProcessingEngine PowerShell` remains the default and never probes Python.
+- `-ProcessingEngine Auto` probes Python, checks whether the current
+  input/profile is eligible, benchmarks a bounded sample, and uses Python only
+  when the measured speedup clears `-PythonMinSpeedupPercent` (default `15`).
+- `-ProcessingEngine Python` is an explicit diagnostic mode. It requires a
+  usable Python 3 runtime and an eligible input/profile, and fails clearly
+  instead of silently falling back.
+- Python accelerates the final eligible map-driven scrub phase only. Discovery,
+  AD map building, and leak checking remain PowerShell-authoritative in v4.16.
+- EVTX/ETL/Office/W3C intake conversion remains PowerShell/Windows-native even
+  when `-ProcessingEngine Python` is requested; Python can scrub the eligible
+  converted CSV/text output after intake.
+- Progress bars were disabled by default for speed. Normal `[ .. ]`, `[ OK ]`,
+  and warning messages still mark phase changes.
+- `-SkipLeakCheck` skips only verification. Python can still scrub, but the
+  output is marked unverified and must not be uploaded until a leak check
+  passes.
+- Python acceleration does not make token maps, salts, manifests, reports,
+  skipped-check outputs, or converted intermediates upload-safe.
+- `-PythonPath` can point at a locked-down enterprise Python install.
+
+Example:
+
+```powershell
+Invoke-UniversalScrubber `
+  -Path .\logs\access.log `
+  -WorkDir .\output\access `
+  -Profile WebAccess `
+  -SaltFile .\salt.txt `
+  -MapSource Discover `
+  -ProcessingEngine Auto `
+  -NonInteractive
+```
+
+Use Python acceleration for large CSV/TSV/PSV, Text/Kv, and JSONL/NDJSON runs
+where the map-driven scrub phase dominates runtime.
+PowerShell remains the path for dry runs, detection reports, protected
+generated profiles, custom regex profiles, and allowlist-file-heavy profiles in
+v4.16. Converted intermediates can use Python after PowerShell intake when the
+resulting CSV/text target is otherwise eligible.
+
 ## v4.15.1 Highlights
 
 - `-ConvertEtl` still stays explicit, but `-EtlConverter Auto` now tries native
@@ -200,8 +243,6 @@ and more readable. You can add your own allowlist values in a profile or
 
 ## v4.15.0 Highlights
 
-- Unified compact progress feedback for discovery, scrub, streaming parallel
-  scrub, conversion, leak checks, and smoke tests.
 - Native OpenXML text intake for DOCX and PPTX, with local-only UNSCRUBBED text
   intermediates under `-WorkDir`.
 - Built-in profile recommendations for ServiceNow, Nexthink, SCCM/MECM, Intune,
@@ -288,11 +329,11 @@ For deeper BYOP walkthroughs, see the
 [BYOP Profile Authoring wiki page](https://github.com/glid3s/universal-log-scrubber/wiki/BYOP-Profile-Authoring).
 Ready-to-edit profile examples live in [docs/profiles](docs/profiles).
 
-# Universal Log Scrubber v4.15.1 Quick Notes
+# Universal Log Scrubber v4.16.0 Quick Notes
 
-Universal Log Scrubber 4.15.1 keeps the default `Balanced` policy conservative and BYOP-first: built-in detection targets well-known sensitive values, while local/vendor edge cases are best handled with profiles, seed files, allowlists, or the additive `-ProfileExtensionFile` overlay.
+Universal Log Scrubber 4.16.0 keeps the default `Balanced` policy conservative and BYOP-first: built-in detection targets well-known sensitive values, while local/vendor edge cases are best handled with profiles, seed files, allowlists, or the additive `-ProfileExtensionFile` overlay.
 
-Common v4.15 examples:
+Common v4.16 examples:
 
 ```powershell
 # Run a normal scrub with the built-in recommendation for a folder of logs.
@@ -309,6 +350,10 @@ Invoke-UniversalScrubber -Path .\trace.etl -ConvertEtl -EtlConverter Auto -Profi
 
 # Protect sample-derived generated profile field/label names with the same salt.
 Invoke-UniversalScrubber -BuildProfileFromSample -Path .\sample.csv -ProfileOut .\sample-profile.json -ProtectGeneratedProfile -SaltFile .\salt.txt -Force -NonInteractive
+
+# Optional accelerator for eligible map-driven scrub phases.
+# Auto benchmarks first and keeps PowerShell if Python is missing, unsupported, or not meaningfully faster.
+Invoke-UniversalScrubber -Path .\large-access.log -Profile WebAccess -SaltFile .\salt.txt -MapSource Discover -ProcessingEngine Auto -NonInteractive
 ```
 
-New or improved v4.15 recommendations include Intune diagnostics (`.log`, `.txt`, `.reg`, `.html`, `.xml`), ServiceNow, Nexthink, SCCM/ConfigMgr, Intune CSV exports, M365/identity audit exports, Sentinel/cloud audit JSONL, EDR/XDR JSONL, firewall/VPN text, structured firewall CSV exports, XLSX, DOCX, PPTX, and ETL traces.
+Current recommendations include Intune diagnostics (`.log`, `.txt`, `.reg`, `.html`, `.xml`), ServiceNow, Nexthink, SCCM/ConfigMgr, Intune CSV exports, M365/identity audit exports, Sentinel/cloud audit JSONL, EDR/XDR JSONL, firewall/VPN text, structured firewall CSV exports, XLSX, DOCX, PPTX, and ETL traces.

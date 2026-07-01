@@ -1,5 +1,36 @@
 # Changelog
 
+## v4.16.0
+
+- Added opt-in `-ProcessingEngine` selection:
+  - `PowerShell` remains the default and never probes Python.
+  - `Auto` probes Python, checks eligibility, benchmarks the current file, and
+    uses Python only when the measured speedup clears the configured threshold.
+  - `Python` is an explicit diagnostic mode and fails clearly when Python or the
+    selected input/profile is unsupported.
+- Added `-PythonPath` for locked-down hosts and
+  `-PythonMinSpeedupPercent` (default `15`) for Auto decisions.
+- Added a standard-library-only Python helper under the module folder. Salt and
+  token-map context are passed through stdin JSON, not command-line arguments.
+- Added Python acceleration for eligible map-driven scrubbing across
+  CSV/TSV/PSV, Text/Kv, and JSONL/NDJSON inputs.
+- Kept discovery/map building and leak checking on PowerShell for v4.16 after
+  parity testing showed Python map building over-detected on Windows Event CSV
+  inputs.
+- Disabled console progress bars by default for speed. Normal phase messages
+  still show activity without row/byte polling overhead.
+- `-SkipLeakCheck` now skips only verification; Python acceleration can still
+  run, and skipped outputs are clearly marked unverified/not upload-safe.
+- Run manifests and performance reports now record the requested/chosen engine,
+  Python path/version, phase eligibility, benchmark result, and fallback reason.
+- Python offload is intentionally conservative: dry runs, detection reports,
+  protected generated profiles, custom regex profiles, and allowlist-file-heavy
+  profiles stay on PowerShell in v4.16.
+- EVTX/ETL/Office/W3C intake conversion remains PowerShell/Windows-native; when
+  `-ProcessingEngine Python` is requested, Python is used only after conversion
+  for eligible scrub targets.
+- Final run messaging no longer calls skipped-leak-check outputs upload-safe.
+
 ## v4.15.1
 
 - Added `-EtlConverter` for explicit ETL conversion selection:

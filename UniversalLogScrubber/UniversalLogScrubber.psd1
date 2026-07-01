@@ -12,7 +12,7 @@
 RootModule = 'UniversalLogScrubber.psm1'
 
 # Version number of this module.
-ModuleVersion = '4.15.1'
+ModuleVersion = '4.16.0'
 
 # Supported PSEditions
 CompatiblePSEditions = 'Desktop', 'Core'

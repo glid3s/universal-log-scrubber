@@ -184,6 +184,13 @@
     * -ProtectGeneratedProfile writes runnable sample-built profiles with salted
       FIELD_/LABEL_ HMAC tokens for sample-derived column/key names and labels.
 
+  v4.16 ADDS
+  ----------
+    * -ProcessingEngine adds an optional Python accelerator gate. PowerShell stays
+      the default and the safety authority; Auto/Python use the helper only for
+      eligible, map-driven scrubs that are still verified by the PowerShell leak
+      check. Salts and map context are passed through stdin JSON, never argv.
+
   CONSISTENCY GUARANTEE
   ---------------------
   Map-build, scrub and leak-harden all share ONE salt, ONE HMAC length and ONE
@@ -217,7 +224,7 @@
 # REGION: Session state (shared by every stage)
 # =====================================================================
 $script:ModuleName       = 'UniversalLogScrubber'
-$script:ModuleVersion    = '4.15.1'
+$script:ModuleVersion    = '4.16.0'
 $script:Salt             = $null
 $script:HmacLength       = 24
 $script:TokenByNorm      = @{}     # normalized-value -> token (the loaded map)
@@ -233,6 +240,14 @@ $script:DetectionSummaryReport = $null
 $script:CurrentTokenMapCsv = $null
 $script:TokenMapMode = 'Merge'
 $script:EvtxProgressMode = 'Fast'
+$script:ProcessingEngineRequested = 'PowerShell'
+$script:ProcessingEngineChosen = 'PowerShell'
+$script:PythonPath = ''
+$script:PythonVersion = ''
+$script:PythonMinSpeedupPercent = 15
+$script:ProcessingEngineFallbackReason = ''
+$script:ProcessingEngineDecisions = New-Object System.Collections.Generic.List[object]
+$script:PythonCapability = $null
 $script:RegexTimeout = [TimeSpan]::FromMilliseconds(250)
 $script:CurrentProfile = $null
 $script:RuntimeLabelRules = @()
@@ -279,8 +294,9 @@ $script:PerfReportRows = $null
 $script:PerfReportPath = $null
 $script:PerfReportTextPath = $null
 
-# Compact, consistent progress rendering. Keep status short because hosts often
-# truncate Write-Progress status text before the most useful data.
+# Progress calls are intentionally accepted but not rendered by default. The old
+# row/byte progress bars added measurable overhead on hot paths; phase messages
+# remain the user-facing activity signal.
 $script:UlsProgressState = @{}
 function Write-UlsProgress {
     [CmdletBinding()]
@@ -302,51 +318,8 @@ function Write-UlsProgress {
         [int]$MinIntervalMs = 1000
     )
 
-    if ($Reset) {
-        [void]$script:UlsProgressState.Remove($Activity)
-        return
-    }
-
-    if ($Completed) {
-        Write-Progress -Activity $Activity -Completed
-        [void]$script:UlsProgressState.Remove($Activity)
-        return
-    }
-
-    $now = [datetime]::UtcNow
-    $state = $script:UlsProgressState[$Activity]
-    if ($null -eq $state) {
-        $state = [pscustomobject]@{ LastUtc = $now.AddMilliseconds(-1 * ($MinIntervalMs + 1)); StartUtc = $now }
-        $script:UlsProgressState[$Activity] = $state
-    }
-    if (-not $Force -and (($now - $state.LastUtc).TotalMilliseconds -lt $MinIntervalMs)) { return }
-
-    $bits = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($Phase)) { [void]$bits.Add($Phase) }
-    if ($RowsDone -ge 0) {
-        if ($RowsTotal -gt 0) { [void]$bits.Add(("rows {0}/{1}" -f $RowsDone, $RowsTotal)) }
-        else { [void]$bits.Add(("rows {0}" -f $RowsDone)) }
-    }
-    if ($BytesDone -ge 0) {
-        $mbDone = [Math]::Round(($BytesDone / 1MB), 1)
-        if ($BytesTotal -gt 0) { [void]$bits.Add(("{0}/{1} MB" -f $mbDone, [Math]::Round(($BytesTotal / 1MB), 1))) }
-        else { [void]$bits.Add(("{0} MB" -f $mbDone)) }
-    }
-    if ($Workers -ge 0) { [void]$bits.Add(("active {0}" -f $Workers)) }
-    if ($Pending -ge 0) { [void]$bits.Add(("pending {0}" -f $Pending)) }
-    if ($Ready -ge 0) { [void]$bits.Add(("ready {0}" -f $Ready)) }
-    if ($CompletedBatches -ge 0) { [void]$bits.Add(("batches {0}" -f $CompletedBatches)) }
-    $elapsed = [Math]::Max(0.001, ($now - $state.StartUtc).TotalSeconds)
-    if ($RowsDone -gt 0) { [void]$bits.Add(("{0}/s" -f [Math]::Round(($RowsDone / $elapsed), 0))) }
-    [void]$bits.Add(("elapsed {0}" -f ([TimeSpan]::FromSeconds([Math]::Round($elapsed)).ToString("mm\:ss"))))
-
-    $pct = -1
-    if ($BytesTotal -gt 0 -and $BytesDone -ge 0) { $pct = [Math]::Min(100, [Math]::Max(0, [int](($BytesDone / [double]$BytesTotal) * 100))) }
-    elseif ($RowsTotal -gt 0 -and $RowsDone -ge 0) { $pct = [Math]::Min(100, [Math]::Max(0, [int](($RowsDone / [double]$RowsTotal) * 100))) }
-
-    $label = if ([string]::IsNullOrWhiteSpace($File)) { $Activity } else { ("{0}: {1}" -f $Activity, $File) }
-    Write-Progress -Activity $label -Status (($bits.ToArray()) -join '; ') -PercentComplete $pct
-    $state.LastUtc = $now
+    if ($Reset -or $Completed) { [void]$script:UlsProgressState.Remove($Activity) }
+    return
 }
 
 function New-UlsPerfStopwatch {
@@ -6624,6 +6597,906 @@ function Get-UlsCurrentModulePath {
     return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($modulePath)
 }
 
+function Join-UlsProcessArguments {
+    param([string[]]$Arguments)
+    $quoted = New-Object System.Collections.Generic.List[string]
+    foreach ($argObj in @($Arguments)) {
+        $arg = [string]$argObj
+        if ($null -eq $arg) { $arg = '' }
+        if ($arg.Length -gt 0 -and $arg -notmatch '[\s"]') {
+            [void]$quoted.Add($arg)
+            continue
+        }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('"')
+        $slashes = 0
+        foreach ($ch in $arg.ToCharArray()) {
+            if ($ch -eq '\') {
+                $slashes++
+                continue
+            }
+            if ($ch -eq '"') {
+                if ($slashes -gt 0) { [void]$sb.Append(('\' * ($slashes * 2))) }
+                [void]$sb.Append('\"')
+                $slashes = 0
+                continue
+            }
+            if ($slashes -gt 0) { [void]$sb.Append(('\' * $slashes)); $slashes = 0 }
+            [void]$sb.Append($ch)
+        }
+        if ($slashes -gt 0) { [void]$sb.Append(('\' * ($slashes * 2))) }
+        [void]$sb.Append('"')
+        [void]$quoted.Add($sb.ToString())
+    }
+    return (($quoted.ToArray()) -join ' ')
+}
+
+function Reset-UlsProcessingEngineState {
+    param(
+        [ValidateSet('PowerShell','Auto','Python')][string]$Requested = 'PowerShell',
+        [string]$PythonPath = '',
+        [int]$PythonMinSpeedupPercent = 15
+    )
+    if ($PythonMinSpeedupPercent -lt 0) { throw "-PythonMinSpeedupPercent must be zero or greater." }
+    $script:ProcessingEngineRequested = $Requested
+    $script:ProcessingEngineChosen = 'PowerShell'
+    $script:PythonPath = ''
+    $script:PythonVersion = ''
+    $script:PythonMinSpeedupPercent = $PythonMinSpeedupPercent
+    $script:ProcessingEngineFallbackReason = ''
+    $script:ProcessingEngineDecisions = New-Object System.Collections.Generic.List[object]
+    $script:PythonCapability = $null
+    $script:PythonCandidate = $null
+    if (-not [string]::IsNullOrWhiteSpace($PythonPath)) { $script:PythonPath = [string]$PythonPath }
+}
+
+function Get-UlsPythonHelperPath {
+    $modulePath = Get-UlsCurrentModulePath
+    $moduleDir = Split-Path -Parent $modulePath
+    return (Join-Path $moduleDir 'uls_python_processor.py')
+}
+
+function New-UlsPythonCandidate {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$PrefixArgs = @(),
+        [string]$DisplayPath
+    )
+    if ([string]::IsNullOrWhiteSpace($DisplayPath)) {
+        if ($PrefixArgs -and $PrefixArgs.Count -gt 0) { $DisplayPath = ((@($FilePath) + @($PrefixArgs)) -join ' ') }
+        else { $DisplayPath = $FilePath }
+    }
+    return [pscustomobject]@{
+        FilePath    = $FilePath
+        PrefixArgs  = [string[]]@($PrefixArgs)
+        DisplayPath = $DisplayPath
+    }
+}
+
+function New-UlsPythonProgressPath {
+    param(
+        [string]$BasePath = '',
+        [string]$Phase = 'processing'
+    )
+    $dir = ''
+    if (-not [string]::IsNullOrWhiteSpace($BasePath)) {
+        try {
+            if (Test-Path -LiteralPath $BasePath -PathType Container) {
+                $dir = (Resolve-Path -LiteralPath $BasePath).Path
+            }
+            else {
+                $parent = Split-Path -Parent $BasePath
+                if (-not [string]::IsNullOrWhiteSpace($parent)) {
+                    if (Test-Path -LiteralPath $parent -PathType Container) { $dir = (Resolve-Path -LiteralPath $parent).Path }
+                    else { $dir = $parent }
+                }
+            }
+        } catch { }
+    }
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = [System.IO.Path]::GetTempPath() }
+    $safePhase = ([string]$Phase) -replace '[^A-Za-z0-9_.-]', '_'
+    return (Join-Path $dir ('.uls_python_{0}_{1}.progress.json' -f $safePhase, ([guid]::NewGuid().ToString('N'))))
+}
+
+function Write-UlsPythonProgressFromFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [hashtable]$Control = @{},
+        [switch]$Completed
+    )
+    $activity = 'Python processing'
+    $file = ''
+    try {
+        if ($Control.ContainsKey('progressActivity') -and -not [string]::IsNullOrWhiteSpace([string]$Control.progressActivity)) { $activity = [string]$Control.progressActivity }
+        if ($Control.ContainsKey('progressFileName')) { $file = [string]$Control.progressFileName }
+    } catch { }
+    if ($Completed) {
+        Write-UlsProgress -Activity $activity -File $file -Completed
+        return $activity
+    }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $activity }
+    try {
+        $raw = [System.IO.File]::ReadAllText($Path)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $activity }
+        $p = $raw | ConvertFrom-Json
+        if ($p.Phase) { $activity = [string]$p.Phase }
+        $bits = New-Object System.Collections.Generic.List[string]
+        if ($p.Status) { [void]$bits.Add([string]$p.Status) }
+        if ($p.Unique -ge 0) { [void]$bits.Add(("unique {0}" -f [int64]$p.Unique)) }
+        if ($p.Findings -ge 0) { [void]$bits.Add(("findings {0}" -f [int64]$p.Findings)) }
+        Write-UlsProgress `
+            -Activity $activity `
+            -Phase (($bits.ToArray()) -join '; ') `
+            -File $file `
+            -RowsDone ([int64]$p.RowsDone) `
+            -RowsTotal ([int64]$p.RowsTotal) `
+            -BytesDone ([int64]$p.BytesDone) `
+            -BytesTotal ([int64]$p.BytesTotal)
+    }
+    catch { }
+    return $activity
+}
+
+function ConvertTo-UlsPythonColumnRuleContract {
+    param($Rules)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($rule in @($Rules)) {
+        if ($null -eq $rule) { continue }
+        $regexText = ''
+        try { if ($rule.RegexObject) { $regexText = [string]$rule.RegexObject.ToString() } } catch { }
+        [void]$out.Add([ordered]@{
+            regex          = $regexText
+            action         = if ($rule.Action) { [string]$rule.Action } else { 'Scan' }
+            prefix         = if ($rule.Prefix) { [string]$rule.Prefix } else { 'OBJECT' }
+            splitOn        = if ($rule.SplitOn) { [string]$rule.SplitOn } else { $null }
+            protectedExact = @($rule.ProtectedExact)
+        })
+    }
+    return @($out.ToArray())
+}
+
+function ConvertTo-UlsPythonLabelRuleContract {
+    param($Rules)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($rule in @($Rules)) {
+        if ($null -eq $rule) { continue }
+        $labels = @()
+        $labels += @(Get-UlsObjectPropertyArray -Object $rule -Name 'Labels')
+        $labels += @(Get-UlsObjectPropertyArray -Object $rule -Name 'Label')
+        [void]$out.Add([ordered]@{
+            name   = [string](Get-UlsObjectPropertyValue -Object $rule -Name 'Name' -Default 'ProfileLabel')
+            labels = @($labels | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+            prefix = [string](Get-UlsObjectPropertyValue -Object $rule -Name 'Prefix' -Default 'OBJECT')
+        })
+    }
+    return @($out.ToArray())
+}
+
+function ConvertTo-UlsPythonColumnPrefixContract {
+    param($Rules)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($rule in @($Rules)) {
+        if ($null -eq $rule) { continue }
+        [void]$out.Add([ordered]@{
+            pattern        = [string](Get-UlsObjectPropertyValue -Object $rule -Name 'Pattern' -Default '')
+            prefix         = [string](Get-UlsObjectPropertyValue -Object $rule -Name 'Prefix' -Default 'OBJECT')
+            notOid         = [bool](Get-UlsObjectPropertyValue -Object $rule -Name 'NotOid' -Default $false)
+            dollarComputer = [bool](Get-UlsObjectPropertyValue -Object $rule -Name 'DollarComputer' -Default $false)
+        })
+    }
+    return @($out.ToArray())
+}
+
+function ConvertTo-UlsPythonProfileContract {
+    param([Parameter(Mandatory)]$Profile)
+    $allowedDomains = @()
+    try { if ($Profile.AllowedDomains) { $allowedDomains = @($Profile.AllowedDomains) } } catch { }
+    return [ordered]@{
+        name             = if ($Profile.Name) { [string]$Profile.Name } else { '' }
+        format           = if ($Profile.Format) { [string]$Profile.Format } else { 'Auto' }
+        delimiter        = if ($Profile.Delimiter) { [string]$Profile.Delimiter } else { ',' }
+        passThroughRegex = if ($Profile.PassThroughRegex) { [string]$Profile.PassThroughRegex } else { $null }
+        freeTextRegex    = if ($Profile.FreeTextRegex) { [string]$Profile.FreeTextRegex } else { '.*' }
+        denyByDefault    = [bool]$Profile.DenyByDefault
+        allowedDomains   = @($allowedDomains)
+        schemaColumns    = @(ConvertTo-UlsPythonColumnRuleContract -Rules $Profile.SchemaColumns)
+        wholeColumnRules = @(ConvertTo-UlsPythonColumnRuleContract -Rules $Profile.WholeColumnRules)
+        columnPrefix     = @(ConvertTo-UlsPythonColumnPrefixContract -Rules $Profile.ColumnPrefix)
+        labelRules       = @(ConvertTo-UlsPythonLabelRuleContract -Rules $Profile.LabelRules)
+    }
+}
+
+function Test-UlsPythonProfileContractSupported {
+    param([Parameter(Mandatory)]$Profile)
+    try {
+        if ($Profile.Protection -and $Profile.Protection.Enabled) { return [pscustomobject]@{ Supported=$false; Reason='Protected generated profiles need FIELD/LABEL parity coverage before Python acceleration.' } }
+    } catch { }
+    try {
+        if ($Profile.CustomRegexRules -and @($Profile.CustomRegexRules).Count -gt 0) { return [pscustomobject]@{ Supported=$false; Reason='CustomRegexRules stay on PowerShell until Python regex parity is proven.' } }
+    } catch { }
+    $columnRules = @($Profile.SchemaColumns) + @($Profile.WholeColumnRules)
+    foreach ($rule in $columnRules) {
+        if ($null -eq $rule) { continue }
+        try {
+            if ($rule.ProtectedExact -and @($rule.ProtectedExact).Count -gt 0) { return [pscustomobject]@{ Supported=$false; Reason='ProtectedExact column matching stays on PowerShell until FIELD parity is proven.' } }
+        } catch { }
+    }
+    foreach ($rule in @($Profile.LabelRules)) {
+        if ($null -eq $rule) { continue }
+        foreach ($advanced in @('LabelRegex','ProtectedLabels','SeparatorRegex','ValueRegex','PreserveRegex','Preserve')) {
+            if ((Get-UlsObjectPropertyArray -Object $rule -Name $advanced).Count -gt 0) {
+                return [pscustomobject]@{ Supported=$false; Reason=("Advanced LabelRules ({0}) stay on PowerShell until label parity is proven." -f $advanced) }
+            }
+        }
+    }
+    return [pscustomobject]@{ Supported=$true; Reason='Profile contract is eligible for Python acceleration.' }
+}
+
+function Invoke-UlsPythonProcessor {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [Parameter(Mandatory)][hashtable]$Control,
+        [int]$TimeoutSeconds = 15
+    )
+    $helperPath = Get-UlsPythonHelperPath
+    if (-not (Test-Path -LiteralPath $helperPath)) { throw "Python helper not found: $helperPath" }
+    if ($TimeoutSeconds -lt 1) { $TimeoutSeconds = 1 }
+
+    foreach ($progressKey in @('progressPath','progressActivity','progressFileName')) {
+        if ($Control.ContainsKey($progressKey)) { [void]$Control.Remove($progressKey) }
+    }
+
+    $controlJson = $Control | ConvertTo-Json -Depth 20 -Compress
+    $args = @()
+    if ($Candidate.PrefixArgs) { $args += @($Candidate.PrefixArgs) }
+    $args += $helperPath
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = [string]$Candidate.FilePath
+    $psi.Arguments = Join-UlsProcessArguments -Arguments ([string[]]$args)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $started = $false
+    try {
+        $started = $proc.Start()
+        if (-not $started) { throw "Could not start Python process." }
+        $proc.StandardInput.Write($controlJson)
+        $proc.StandardInput.Close()
+        $timeoutWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $proc.WaitForExit(500)) {
+            if ($timeoutWatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                try { $proc.Kill() } catch { }
+                throw "Python helper timed out after $TimeoutSeconds second(s)."
+            }
+        }
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        if ($proc.ExitCode -ne 0) { throw "Python helper exited $($proc.ExitCode): $stderr" }
+        if ([string]::IsNullOrWhiteSpace($stdout)) { throw "Python helper returned no JSON." }
+        try { return ($stdout | ConvertFrom-Json) }
+        catch { throw "Python helper returned malformed JSON: $stdout" }
+    }
+    finally {
+        try { $proc.Dispose() } catch { }
+    }
+}
+
+function Resolve-UlsPythonProcessor {
+    param([string]$PythonPath)
+    if ($script:PythonCandidate -and $script:PythonCapability) { return $script:PythonCandidate }
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+    if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
+        [void]$candidates.Add((New-UlsPythonCandidate -FilePath $PythonPath -DisplayPath $PythonPath))
+    }
+    else {
+        [void]$candidates.Add((New-UlsPythonCandidate -FilePath 'py' -PrefixArgs @('-3') -DisplayPath 'py -3'))
+        [void]$candidates.Add((New-UlsPythonCandidate -FilePath 'python' -DisplayPath 'python'))
+    }
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in $candidates) {
+        try {
+            $cap = Invoke-UlsPythonProcessor -Candidate $candidate -Control @{ mode = 'capability' } -TimeoutSeconds 10
+            if (-not $cap.ok) { throw ([string]$cap.error) }
+            $versionText = [string]$cap.version
+            $version = [version]$versionText
+            if ($version.Major -lt 3 -or ($version.Major -eq 3 -and $version.Minor -lt 8)) {
+                throw "Python 3.8+ required; found $versionText."
+            }
+            $script:PythonCandidate = $candidate
+            $script:PythonCapability = $cap
+            $script:PythonPath = [string]$candidate.DisplayPath
+            $script:PythonVersion = $versionText
+            return $candidate
+        }
+        catch {
+            [void]$errors.Add(("{0}: {1}" -f $candidate.DisplayPath, $_.Exception.Message))
+        }
+    }
+    throw ("No usable Python 3.8+ processor found. Tried: {0}" -f (($errors.ToArray()) -join '; '))
+}
+
+function Initialize-UlsProcessingEngine {
+    param(
+        [ValidateSet('PowerShell','Auto','Python')][string]$Requested = 'PowerShell',
+        [string]$PythonPath = '',
+        [int]$PythonMinSpeedupPercent = 15
+    )
+    Reset-UlsProcessingEngineState -Requested $Requested -PythonPath $PythonPath -PythonMinSpeedupPercent $PythonMinSpeedupPercent
+    if ($Requested -eq 'PowerShell') { return }
+    try {
+        [void](Resolve-UlsPythonProcessor -PythonPath $PythonPath)
+        Write-Info ("Processing engine {0}: Python helper available ({1}, {2})." -f $Requested, $script:PythonPath, $script:PythonVersion)
+    }
+    catch {
+        $script:ProcessingEngineFallbackReason = $_.Exception.Message
+        if ($Requested -eq 'Python') { throw }
+        Write-Warn ("ProcessingEngine Auto falling back to PowerShell: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Register-UlsProcessingEngineDecision {
+    param(
+        [string]$File,
+        [string]$Format,
+        [string]$Requested,
+        [string]$Chosen,
+        [bool]$Eligible,
+        [string]$Reason = '',
+        [double]$PowerShellSeconds = -1,
+        [double]$PythonSeconds = -1,
+        [double]$SpeedupPercent = 0
+    )
+    $row = [pscustomobject]@{
+        File              = [string]$File
+        Format            = [string]$Format
+        Requested         = [string]$Requested
+        Chosen            = [string]$Chosen
+        Eligible          = [bool]$Eligible
+        Reason            = [string]$Reason
+        PowerShellSeconds = [Math]::Round([double]$PowerShellSeconds, 4)
+        PythonSeconds     = [Math]::Round([double]$PythonSeconds, 4)
+        SpeedupPercent    = [Math]::Round([double]$SpeedupPercent, 1)
+    }
+    if ($null -eq $script:ProcessingEngineDecisions) { $script:ProcessingEngineDecisions = New-Object System.Collections.Generic.List[object] }
+    [void]$script:ProcessingEngineDecisions.Add($row)
+    $chosenEngines = @($script:ProcessingEngineDecisions | ForEach-Object { $_.Chosen } | Sort-Object -Unique)
+    if ($chosenEngines.Count -eq 1) { $script:ProcessingEngineChosen = [string]$chosenEngines[0] }
+    elseif ($chosenEngines.Count -gt 1) { $script:ProcessingEngineChosen = 'Mixed' }
+    if ($Chosen -ne 'Python' -and -not [string]::IsNullOrWhiteSpace($Reason)) { $script:ProcessingEngineFallbackReason = $Reason }
+    Add-UlsPerfPhase -Phase 'Processing engine' -Seconds 0 -File $File -Notes ("requested={0}; chosen={1}; eligible={2}; reason={3}; psSample={4}; pySample={5}; speedup={6:N1}%" -f $Requested,$Chosen,$Eligible,$Reason,$PowerShellSeconds,$PythonSeconds,$SpeedupPercent)
+    return $row
+}
+
+function Get-UlsProcessingEngineSummary {
+    $decisions = @()
+    if ($script:ProcessingEngineDecisions) { $decisions = @($script:ProcessingEngineDecisions.ToArray()) }
+    return [pscustomobject]@{
+        requested          = $script:ProcessingEngineRequested
+        chosen             = $script:ProcessingEngineChosen
+        pythonPath         = $script:PythonPath
+        pythonVersion      = $script:PythonVersion
+        minSpeedupPercent  = $script:PythonMinSpeedupPercent
+        fallbackReason     = $script:ProcessingEngineFallbackReason
+        decisions          = $decisions
+    }
+}
+
+function Get-UlsResolvedFormatInfo {
+    param([Parameter(Mandatory)][string]$InputPath, [Parameter(Mandatory)]$Profile)
+    $ext = [System.IO.Path]::GetExtension($InputPath).ToLowerInvariant()
+    $format = $Profile.Format
+    if ($format -eq 'Auto') {
+        if ($ext -eq '.csv') { $format = 'Csv' }
+        elseif ($ext -eq '.tsv') { $format = 'Tsv' }
+        elseif ($ext -eq '.psv') { $format = 'Psv' }
+        elseif ($ext -in @('.json','.ndjson','.jsonl')) { $format = 'Json' }
+        else { $format = 'Text' }
+    }
+    $delim = ','
+    try { if ($Profile.Delimiter) { $delim = [string]$Profile.Delimiter } } catch { }
+    if ($format -eq 'Tsv') { $delim = "`t" }
+    elseif ($format -eq 'Psv') { $delim = '|' }
+    return [pscustomobject]@{ Format = $format; Delimiter = $delim; Extension = $ext }
+}
+
+function Test-UlsPythonScrubEligibility {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$Format,
+        [string]$TokenMapCsv,
+        [string]$MapSource = '',
+        [switch]$DryRun,
+        [switch]$SkipLeakCheck,
+        [switch]$ExplainDetections,
+        [switch]$ParallelScrub,
+        [switch]$IsIntermediate
+    )
+    if ($script:ProcessingEngineRequested -eq 'PowerShell') { return [pscustomobject]@{ Eligible=$false; Reason='PowerShell engine requested.' } }
+    if (-not $script:PythonCandidate) { return [pscustomobject]@{ Eligible=$false; Reason=$script:ProcessingEngineFallbackReason } }
+    if ($DryRun) { return [pscustomobject]@{ Eligible=$false; Reason='Dry-run explanation stays on PowerShell.' } }
+    if ($ExplainDetections -or $script:FalsePositiveReport -or $script:DetectionSummaryReport) { return [pscustomobject]@{ Eligible=$false; Reason='Detection reports require the PowerShell detector trace.' } }
+    if ($ParallelScrub) { return [pscustomobject]@{ Eligible=$false; Reason='ParallelScrub requested; using PowerShell runspace workers.' } }
+    if ([string]::IsNullOrWhiteSpace($TokenMapCsv) -or -not (Test-Path -LiteralPath $TokenMapCsv)) { return [pscustomobject]@{ Eligible=$false; Reason='Python scrub requires an existing token map.' } }
+    $ext = [System.IO.Path]::GetExtension($InputPath).ToLowerInvariant()
+    if ($Format -eq 'Json' -and $ext -notin @('.jsonl','.ndjson')) { return [pscustomobject]@{ Eligible=$false; Reason='Only JSONL/NDJSON is eligible; nested JSON stays on PowerShell.' } }
+    if ($Format -notin @('Csv','Tsv','Psv','Text','Kv','Json')) { return [pscustomobject]@{ Eligible=$false; Reason="Format '$Format' is not eligible." } }
+    $profileSupport = Test-UlsPythonProfileContractSupported -Profile $Profile
+    if (-not $profileSupport.Supported) { return [pscustomobject]@{ Eligible=$false; Reason=[string]$profileSupport.Reason } }
+    return [pscustomobject]@{ Eligible=$true; Reason='Eligible for map-driven Python scrub.' }
+}
+
+function Measure-UlsPowerShellScrubSample {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$Format,
+        [string]$Delimiter = ',',
+        [string[]]$SensitiveTerms = @(),
+        [int]$MaxLines = 300,
+        [int]$MaxBytes = 1048576
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $rows = 0
+    $bytes = 0
+    $oldCellCache = $script:__cellCache
+    $oldHmacCache = $script:__hmacTokenCache
+    $script:__cellCache = @{}
+    $script:__hmacTokenCache = @{}
+    try {
+        if ($Format -eq 'Csv' -or $Format -eq 'Tsv' -or $Format -eq 'Psv') {
+            $reader = [System.IO.StreamReader]::new($InputPath)
+            try {
+                $headers = Read-UlsDelimitedRecord -Reader $reader -Delimiter $Delimiter
+                while ($rows -lt $MaxLines -and -not $reader.EndOfStream -and $bytes -lt $MaxBytes) {
+                    $record = Read-UlsDelimitedRecord -Reader $reader -Delimiter $Delimiter
+                    if ($null -eq $record) { break }
+                    $rows++
+                    $values = New-Object System.Collections.Generic.List[object]
+                    for ($hi = 0; $headers -and $hi -lt $headers.Count; $hi++) {
+                        $rawValue = if ($hi -lt $record.Count) { $record[$hi] } else { '' }
+                        [void]$values.Add((Scrub-Field -ColumnName $headers[$hi] -Value $rawValue -Profile $Profile))
+                    }
+                    $line = ConvertTo-UlsDelimitedLine -Values $values.ToArray() -Delimiter $Delimiter
+                    $line = Protect-SensitiveTerms -Text $line -SensitiveTerms $SensitiveTerms
+                    $bytes += [System.Text.Encoding]::UTF8.GetByteCount($line)
+                }
+            }
+            finally { $reader.Close() }
+        }
+        else {
+            $reader = [System.IO.StreamReader]::new($InputPath)
+            try {
+                while ($rows -lt $MaxLines -and -not $reader.EndOfStream -and $bytes -lt $MaxBytes) {
+                    $line = $reader.ReadLine()
+                    if ($null -eq $line) { break }
+                    $rows++
+                    $bytes += [System.Text.Encoding]::UTF8.GetByteCount($line)
+                    if ($Format -eq 'Json') {
+                        $scrubbed = Invoke-ScrubJsonText -Text $line.Trim() -IsNdjson -Profile $Profile
+                    }
+                    elseif ($Format -eq 'Kv') {
+                        $scrubbed = Invoke-KvValueOnlyText -Text $line
+                        $scrubbed = Invoke-LeakHardeningText -Text $scrubbed
+                    }
+                    else {
+                        $scrubbed = Invoke-LeakHardeningText -Text $line
+                    }
+                    [void](Protect-SensitiveTerms -Text $scrubbed -SensitiveTerms $SensitiveTerms)
+                }
+            }
+            finally { $reader.Close() }
+        }
+    }
+    finally {
+        $sw.Stop()
+        $script:__cellCache = $oldCellCache
+        $script:__hmacTokenCache = $oldHmacCache
+    }
+    return [pscustomobject]@{ Seconds = [Math]::Max($sw.Elapsed.TotalSeconds, 0.000001); Rows = $rows; Bytes = $bytes }
+}
+
+function Measure-UlsPowerShellDiscoverySample {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$Format,
+        [string]$Delimiter = ',',
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [int]$MaxLines = 1000,
+        [int]$MaxBytes = 1048576
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $rows = 0
+    $bytes = 0
+    $found = 0
+    $cache = @{}
+    try {
+        if ($Format -eq 'Csv' -or $Format -eq 'Tsv' -or $Format -eq 'Psv') {
+            $reader = [System.IO.StreamReader]::new($InputPath)
+            try {
+                $headers = Read-UlsDelimitedRecord -Reader $reader -Delimiter $Delimiter
+                if ($null -eq $headers) { $headers = @() }
+                $scanColumns = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($h in @($headers)) {
+                    if (Test-UlsDiscoveryShouldScanColumn -Profile $Profile -ColumnName $h) { [void]$scanColumns.Add($h) }
+                }
+                while ($rows -lt $MaxLines -and -not $reader.EndOfStream -and $bytes -lt $MaxBytes) {
+                    $record = Read-UlsDelimitedRecord -Reader $reader -Delimiter $Delimiter
+                    if ($null -eq $record) { break }
+                    $rows++
+                    for ($ci = 0; $ci -lt $headers.Count; $ci++) {
+                        $h = [string]$headers[$ci]
+                        if (-not $scanColumns.Contains($h)) { continue }
+                        $cell = if ($ci -lt $record.Count) { [string]$record[$ci] } else { '' }
+                        $bytes += [System.Text.Encoding]::UTF8.GetByteCount($cell)
+                        if ([string]::IsNullOrWhiteSpace($cell)) { continue }
+                        if ($cache.ContainsKey($cell)) { $ids = $cache[$cell] }
+                        else { $ids = @(Find-Identifiers -Text $cell); $cache[$cell] = $ids }
+                        foreach ($id in $ids) {
+                            if (Test-UlsShouldMapDiscoveredIdentifier -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -ScrubPolicy $ScrubPolicy) { $found++ }
+                        }
+                    }
+                }
+            }
+            finally { $reader.Close() }
+        }
+        else {
+            $reader = [System.IO.StreamReader]::new($InputPath)
+            try {
+                while ($rows -lt $MaxLines -and -not $reader.EndOfStream -and $bytes -lt $MaxBytes) {
+                    $line = $reader.ReadLine()
+                    if ($null -eq $line) { break }
+                    $rows++
+                    $bytes += [System.Text.Encoding]::UTF8.GetByteCount($line)
+                    foreach ($id in (Find-Identifiers -Text $line)) {
+                        if (Test-UlsShouldMapDiscoveredIdentifier -Raw ([string]$id.Raw) -Prefix ([string]$id.Prefix) -ScrubPolicy $ScrubPolicy) { $found++ }
+                    }
+                }
+            }
+            finally { $reader.Close() }
+        }
+    }
+    finally { $sw.Stop() }
+    return [pscustomobject]@{ Seconds = [Math]::Max($sw.Elapsed.TotalSeconds, 0.000001); Rows = $rows; Bytes = $bytes; Findings = $found }
+}
+
+function Test-UlsPythonDiscoveryEligibility {
+    param(
+        [Parameter(Mandatory)][string[]]$InputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [string[]]$AllowlistFile = @()
+    )
+    if ($script:ProcessingEngineRequested -eq 'PowerShell') { return [pscustomobject]@{ Eligible=$false; Reason='PowerShell engine requested.' } }
+    if (-not $script:PythonCandidate) { return [pscustomobject]@{ Eligible=$false; Reason=$script:ProcessingEngineFallbackReason } }
+    if ([string]::IsNullOrWhiteSpace($TokenMapCsv)) { return [pscustomobject]@{ Eligible=$false; Reason='Python discovery requires a token-map path.' } }
+    if ($script:FalsePositiveReport -or $script:DetectionSummaryReport) { return [pscustomobject]@{ Eligible=$false; Reason='Detection reports require the PowerShell detector trace.' } }
+    if ($AllowlistFile -and @($AllowlistFile).Count -gt 0) { return [pscustomobject]@{ Eligible=$false; Reason='External allowlist files stay on PowerShell until Python allowlist parity is proven.' } }
+    try {
+        if ($Profile.Allowlist -and @($Profile.Allowlist).Count -gt 0) { return [pscustomobject]@{ Eligible=$false; Reason='Profile allowlists stay on PowerShell until Python allowlist parity is proven.' } }
+        if ($Profile.AllowlistFile -or $Profile.AllowlistFiles) { return [pscustomobject]@{ Eligible=$false; Reason='Profile allowlist files stay on PowerShell until Python allowlist parity is proven.' } }
+    } catch { }
+    $profileSupport = Test-UlsPythonProfileContractSupported -Profile $Profile
+    if (-not $profileSupport.Supported) { return [pscustomobject]@{ Eligible=$false; Reason=[string]$profileSupport.Reason } }
+    foreach ($file in @($InputPath)) {
+        if (-not (Test-Path -LiteralPath $file)) { return [pscustomobject]@{ Eligible=$false; Reason=("Input not found: {0}" -f $file) } }
+        $info = Get-UlsResolvedFormatInfo -InputPath $file -Profile $Profile
+        $fmt = [string]$info.Format
+        if ($fmt -eq 'Json' -and $info.Extension -notin @('.jsonl','.ndjson')) { return [pscustomobject]@{ Eligible=$false; Reason='Only JSONL/NDJSON discovery is eligible; nested JSON stays on PowerShell.' } }
+        if ($fmt -notin @('Csv','Tsv','Psv','Text','Kv','Json')) { return [pscustomobject]@{ Eligible=$false; Reason=("Format '{0}' is not eligible." -f $fmt) } }
+    }
+    return [pscustomobject]@{ Eligible=$true; Reason='Eligible for Python discovery.' }
+}
+
+function Invoke-UlsPythonDiscoveryIfSelected {
+    param(
+        [Parameter(Mandatory)][string[]]$InputPath,
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [string[]]$SeedTerms = @(),
+        [switch]$NoCorrelate,
+        [ValidateSet('Merge','Replace')][string]$TokenMapMode = 'Merge',
+        [ValidateSet('Strict','Balanced','Readable')][string]$ScrubPolicy = $script:ScrubPolicy,
+        [string]$ProfileName = '',
+        [string]$WorkDir = '',
+        [string[]]$AllowlistFile = @()
+    )
+    if ($script:ProcessingEngineRequested -eq 'PowerShell') { return $null }
+    $profile = $script:CurrentProfile
+    if (-not $profile -and -not [string]::IsNullOrWhiteSpace($ProfileName)) { $profile = Get-ScrubProfile -Name $ProfileName }
+    if (-not $profile) { return $null }
+    $mapName = [System.IO.Path]::GetFileName($TokenMapCsv)
+    $eligible = Test-UlsPythonDiscoveryEligibility -InputPath $InputPath -Profile $profile -TokenMapCsv $TokenMapCsv -AllowlistFile $AllowlistFile
+    if (-not $eligible.Eligible) {
+        [void](Register-UlsProcessingEngineDecision -File $mapName -Format 'Discovery' -Requested $script:ProcessingEngineRequested -Chosen 'PowerShell' -Eligible:$false -Reason ([string]$eligible.Reason))
+        if ($script:ProcessingEngineRequested -eq 'Python') { throw "ProcessingEngine Python cannot build the discovery map: $($eligible.Reason)" }
+        Write-Info ("ProcessingEngine Auto using PowerShell for discovery: {0}" -f $eligible.Reason)
+        return $null
+    }
+
+    $firstInput = @($InputPath | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)[0]
+    $formatInfo = Get-UlsResolvedFormatInfo -InputPath $firstInput -Profile $profile
+    $psSeconds = -1.0
+    $pySeconds = -1.0
+    $speedup = 0.0
+    if ($script:ProcessingEngineRequested -eq 'Auto') {
+        try {
+            $psBench = Measure-UlsPowerShellDiscoverySample -InputPath $firstInput -Profile $profile -Format $formatInfo.Format -Delimiter $formatInfo.Delimiter -ScrubPolicy $ScrubPolicy
+            $pyBench = Invoke-UlsPythonProcessor -Candidate $script:PythonCandidate -TimeoutSeconds 30 -Control @{
+                mode           = 'benchmark'
+                operation      = 'discover'
+                inputPath      = $firstInput
+                format         = [string]$formatInfo.Format
+                delimiter      = [string]$formatInfo.Delimiter
+                sensitiveTerms = @($SeedTerms)
+                salt           = (Get-SessionSalt)
+                hmacLength     = $script:HmacLength
+                scrubPolicy    = $ScrubPolicy
+                profile        = (ConvertTo-UlsPythonProfileContract -Profile $profile)
+                maxLines       = 1000
+                maxBytes       = 1048576
+            }
+            if (-not $pyBench.ok) { throw ([string]$pyBench.error) }
+            $psSeconds = [double]$psBench.Seconds
+            $pySeconds = [double]$pyBench.seconds
+            if ($psSeconds -gt 0) { $speedup = (($psSeconds - $pySeconds) / $psSeconds) * 100.0 }
+            $fileBytes = 0
+            try { $fileBytes = (Get-Item -LiteralPath $firstInput).Length } catch { }
+            $sampleBytes = [Math]::Max([double]$psBench.Bytes, [double]$pyBench.bytes)
+            $projectedPsSeconds = 0.0
+            if ($sampleBytes -gt 0 -and $fileBytes -gt 0) { $projectedPsSeconds = $psSeconds * ([double]$fileBytes / $sampleBytes) }
+            if ($speedup -lt $script:PythonMinSpeedupPercent) {
+                $reason = ("Python discovery benchmark speedup {0:N1}% is below {1}%." -f $speedup, $script:PythonMinSpeedupPercent)
+                [void](Register-UlsProcessingEngineDecision -File $mapName -Format 'Discovery' -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+                Write-Info ("ProcessingEngine Auto using PowerShell for discovery: {0}" -f $reason)
+                return $null
+            }
+            if ($projectedPsSeconds -lt 1.0) {
+                $reason = ("Projected PowerShell discovery sample cost {0:N2}s is too small to justify Python startup." -f $projectedPsSeconds)
+                [void](Register-UlsProcessingEngineDecision -File $mapName -Format 'Discovery' -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+                Write-Info ("ProcessingEngine Auto using PowerShell for discovery: {0}" -f $reason)
+                return $null
+            }
+        }
+        catch {
+            $reason = "Python discovery benchmark failed: $($_.Exception.Message)"
+            [void](Register-UlsProcessingEngineDecision -File $mapName -Format 'Discovery' -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+            Write-Warn ("ProcessingEngine Auto falling back to PowerShell discovery: {0}" -f $_.Exception.Message)
+            return $null
+        }
+    }
+
+    $out = Resolve-OutPath -Path $TokenMapCsv
+    $sourceHashes = @{}
+    foreach ($file in @($InputPath)) {
+        try {
+            $resolvedFile = (Resolve-Path -LiteralPath $file).Path
+            $hash = Get-PathFingerprint -Path $resolvedFile -Length 12
+            $sourceHashes[$resolvedFile] = $hash
+            $sourceHashes[[System.IO.Path]::GetFileName($resolvedFile)] = $hash
+        } catch { }
+    }
+
+    [void](Register-UlsProcessingEngineDecision -File $mapName -Format 'Discovery' -Requested $script:ProcessingEngineRequested -Chosen 'Python' -Eligible:$true -Reason 'using Python discovery/map build' -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+    try {
+        Write-Work ("Python discovery/map build: {0}" -f $mapName)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-UlsPythonProcessor -Candidate $script:PythonCandidate -TimeoutSeconds 86400 -Control @{
+            mode             = 'discover'
+            inputPaths       = @($InputPath)
+            tokenMapCsv      = $out
+            tokenMapMode     = $TokenMapMode
+            seedTerms        = @($SeedTerms)
+            noCorrelate      = [bool]$NoCorrelate
+            format           = [string]$formatInfo.Format
+            delimiter        = [string]$formatInfo.Delimiter
+            salt             = (Get-SessionSalt)
+            hmacLength       = $script:HmacLength
+            scrubPolicy      = $ScrubPolicy
+            profile          = (ConvertTo-UlsPythonProfileContract -Profile $profile)
+            sourcePathHashes = $sourceHashes
+            progressActivity = 'Python discovery'
+            progressFileName = $mapName
+        }
+        $sw.Stop()
+        if (-not $result.ok) { throw ([string]$result.error) }
+        $rows = @()
+        try { $rows = @(Import-Csv -LiteralPath $out) } catch { }
+        if ($rows.Count -gt 0) { [void](Test-TokenMapCollisions -Rows $rows) }
+        [void](Import-ScrubTokenMap -TokenMapCsv $out)
+        Add-UlsPerfPhase -Phase 'Python discovery' -Seconds $sw.Elapsed.TotalSeconds -File $mapName -Rows ([int]$result.rows) -Notes ("entries={0}; hits={1}; helperSeconds={2}" -f $result.entries,$result.hits,$result.seconds)
+        Add-UlsPerfPhase -Phase 'Build/correlate map' -Seconds 0 -File $mapName -Rows ([int]$result.entries) -Notes ('Python discovery; NoCorrelate={0}; Mode={1}' -f [bool]$NoCorrelate, $TokenMapMode)
+        Write-Ok "Token map written: $out  ($($result.entries) entries)"
+        Write-Warn "DO NOT upload this token map -- it re-identifies everything."
+        return $out
+    }
+    catch {
+        if ($script:ProcessingEngineRequested -eq 'Python') { throw }
+        Write-Warn ("ProcessingEngine Auto falling back to PowerShell discovery: {0}" -f $_.Exception.Message)
+        $reason = "Python discovery failed: $($_.Exception.Message)"
+        [void](Register-UlsProcessingEngineDecision -File $mapName -Format 'Discovery' -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+        return $null
+    }
+}
+
+function Invoke-UlsPythonVerifiedScrubFile {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$Format,
+        [string]$Delimiter = ',',
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [string[]]$SensitiveTerms = @(),
+        [switch]$SkipLeakCheck,
+        [switch]$ExplicitPython
+    )
+    $outFull = Resolve-OutPath -Path $OutputPath
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    $profileContract = ConvertTo-UlsPythonProfileContract -Profile $Profile
+    Write-Work ("Python scrub ({0}, map-driven): {1}" -f $Format, $name)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $result = Invoke-UlsPythonProcessor -Candidate $script:PythonCandidate -TimeoutSeconds 86400 -Control @{
+        mode             = 'scrub'
+        inputPath        = $InputPath
+        outputPath       = $outFull
+        format           = $Format
+        delimiter        = $Delimiter
+        tokenMapCsv      = $TokenMapCsv
+        sensitiveTerms   = @($SensitiveTerms)
+        salt             = (Get-SessionSalt)
+        hmacLength       = $script:HmacLength
+        scrubPolicy      = $script:ScrubPolicy
+        profile          = $profileContract
+        mapOnlyScrub     = $true
+        progressActivity = 'Python scrub'
+        progressFileName = $name
+    }
+    $sw.Stop()
+    if (-not $result.ok) { throw ([string]$result.error) }
+    Add-UlsPerfPhase -Phase 'Python scrub' -Seconds $sw.Elapsed.TotalSeconds -File $name -Rows ([int]$result.rows) -Notes ("map replacements={0}; helperSeconds={1}" -f $result.replacements,$result.seconds)
+
+    if ($SkipLeakCheck) {
+        Write-Warn "Leak check SKIPPED (-SkipLeakCheck) -- output was NOT independently verified."
+        Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
+        return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $true; Rows = [int]$result.rows; Streamed = $true; LeakCheckSkipped = $true; Engine = 'Python' }
+    }
+
+    $skipHeader = ($Format -eq 'Csv' -or $Format -eq 'Tsv' -or $Format -eq 'Psv')
+    $leakSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $clean = $false
+    try {
+        $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine:$skipHeader -ProbeOnly
+        if (-not $clean) {
+            Write-Warn "Residue detected after Python scrub -- attempting one PowerShell re-harden and re-check."
+            Invoke-UlsLineWiseFileHardening -Path $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine:$skipHeader
+            $clean = Test-ScrubbedForLeaks -CsvPath $outFull -SensitiveTerms $SensitiveTerms -SkipFirstLine:$skipHeader
+        }
+    }
+    catch {
+        try { Remove-Item -LiteralPath $outFull -Force -ErrorAction SilentlyContinue } catch { }
+        throw "PowerShell verification after Python scrub failed: $($_.Exception.Message)"
+    }
+    finally {
+        $leakSw.Stop()
+        Add-UlsPerfPhase -Phase 'Leak check' -Seconds $leakSw.Elapsed.TotalSeconds -File $name -Rows ([int]$result.rows) -Notes 'PowerShell verification after Python scrub'
+    }
+
+    if (-not $clean) {
+        try { Remove-Item -LiteralPath $outFull -Force -ErrorAction SilentlyContinue } catch { }
+        throw "Python output did not pass the PowerShell leak check."
+    }
+    Write-Ok "Leak check PASSED (PowerShell verification after Python scrub): $name"
+    Write-Detail "Output: $([System.IO.Path]::GetFileName($outFull))"
+    return [pscustomobject]@{ Input = $InputPath; Output = $outFull; Clean = $true; Rows = [int]$result.rows; Streamed = $true; LeakCheckSkipped = $false; Engine = 'Python' }
+}
+
+function Invoke-UlsPythonScrubIfSelected {
+    param(
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][string]$Format,
+        [string]$Delimiter = ',',
+        [Parameter(Mandatory)][string]$TokenMapCsv,
+        [string[]]$SensitiveTerms = @(),
+        [string]$MapSource = '',
+        [switch]$DryRun,
+        [switch]$SkipLeakCheck,
+        [switch]$ExplainDetections,
+        [switch]$ParallelScrub,
+        [switch]$IsIntermediate
+    )
+    if ($script:ProcessingEngineRequested -eq 'PowerShell') { return $null }
+    $name = [System.IO.Path]::GetFileName($InputPath)
+    $eligible = Test-UlsPythonScrubEligibility -InputPath $InputPath -Profile $Profile -Format $Format -TokenMapCsv $TokenMapCsv -MapSource $MapSource -DryRun:$DryRun -SkipLeakCheck:$SkipLeakCheck -ExplainDetections:$ExplainDetections -ParallelScrub:$ParallelScrub -IsIntermediate:$IsIntermediate
+    if (-not $eligible.Eligible) {
+        [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested $script:ProcessingEngineRequested -Chosen 'PowerShell' -Eligible:$false -Reason ([string]$eligible.Reason))
+        if ($script:ProcessingEngineRequested -eq 'Python') { throw "ProcessingEngine Python cannot run for '$name': $($eligible.Reason)" }
+        Write-Info ("ProcessingEngine Auto using PowerShell for {0}: {1}" -f $name, $eligible.Reason)
+        return $null
+    }
+
+    $psSeconds = -1.0
+    $pySeconds = -1.0
+    $speedup = 0.0
+    if ($script:ProcessingEngineRequested -eq 'Auto') {
+        try {
+            $psBench = Measure-UlsPowerShellScrubSample -InputPath $InputPath -Profile $Profile -Format $Format -Delimiter $Delimiter -SensitiveTerms $SensitiveTerms
+            $pyBench = Invoke-UlsPythonProcessor -Candidate $script:PythonCandidate -TimeoutSeconds 30 -Control @{
+                mode           = 'benchmark'
+                operation      = 'scrub'
+                inputPath      = $InputPath
+                tokenMapCsv    = $TokenMapCsv
+                sensitiveTerms = @($SensitiveTerms)
+                salt           = (Get-SessionSalt)
+                hmacLength     = $script:HmacLength
+                scrubPolicy    = $script:ScrubPolicy
+                format         = $Format
+                delimiter      = $Delimiter
+                profile        = (ConvertTo-UlsPythonProfileContract -Profile $Profile)
+                mapOnlyScrub   = $true
+                maxLines       = 300
+                maxBytes       = 1048576
+            }
+            if (-not $pyBench.ok) { throw ([string]$pyBench.error) }
+            $psSeconds = [double]$psBench.Seconds
+            $pySeconds = [double]$pyBench.seconds
+            if ($psSeconds -gt 0) { $speedup = (($psSeconds - $pySeconds) / $psSeconds) * 100.0 }
+            $fileBytes = 0
+            try { $fileBytes = (Get-Item -LiteralPath $InputPath).Length } catch { }
+            $sampleBytes = [Math]::Max([double]$psBench.Bytes, [double]$pyBench.bytes)
+            $projectedPsSeconds = 0.0
+            if ($sampleBytes -gt 0 -and $fileBytes -gt 0) { $projectedPsSeconds = $psSeconds * ([double]$fileBytes / $sampleBytes) }
+            if ([int]$pyBench.changedRows -le 0) {
+                $reason = 'benchmark sample had no token-map replacements'
+                [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+                Write-Info ("ProcessingEngine Auto using PowerShell for {0}: {1}." -f $name, $reason)
+                return $null
+            }
+            if ($speedup -lt $script:PythonMinSpeedupPercent) {
+                $reason = ("Python benchmark speedup {0:N1}% is below {1}%." -f $speedup, $script:PythonMinSpeedupPercent)
+                [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+                Write-Info ("ProcessingEngine Auto using PowerShell for {0}: {1}" -f $name, $reason)
+                return $null
+            }
+            if ($projectedPsSeconds -lt 1.0) {
+                $reason = ("Projected PowerShell sample cost {0:N2}s is too small to justify Python startup." -f $projectedPsSeconds)
+                [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+                Write-Info ("ProcessingEngine Auto using PowerShell for {0}: {1}" -f $name, $reason)
+                return $null
+            }
+        }
+        catch {
+            $reason = "Python benchmark failed: $($_.Exception.Message)"
+            [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+            Write-Warn ("ProcessingEngine Auto falling back to PowerShell for {0}: {1}" -f $name, $_.Exception.Message)
+            return $null
+        }
+    }
+
+    [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested $script:ProcessingEngineRequested -Chosen 'Python' -Eligible:$true -Reason 'using map-driven Python scrub' -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+    try {
+        return Invoke-UlsPythonVerifiedScrubFile -InputPath $InputPath -OutputPath $OutputPath -Profile $Profile -Format $Format -Delimiter $Delimiter -TokenMapCsv $TokenMapCsv -SensitiveTerms $SensitiveTerms -SkipLeakCheck:$SkipLeakCheck -ExplicitPython:($script:ProcessingEngineRequested -eq 'Python')
+    }
+    catch {
+        if ($script:ProcessingEngineRequested -eq 'Python') { throw }
+        Write-Warn ("ProcessingEngine Auto discarded Python output for {0}: {1}" -f $name, $_.Exception.Message)
+        try { Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue } catch { }
+        $reason = "Python scrub failed verification: $($_.Exception.Message)"
+        [void](Register-UlsProcessingEngineDecision -File $name -Format $Format -Requested 'Auto' -Chosen 'PowerShell' -Eligible:$true -Reason $reason -PowerShellSeconds $psSeconds -PythonSeconds $pySeconds -SpeedupPercent $speedup)
+        return $null
+    }
+}
+
 
 function Invoke-UlsDiscoverTextBatch {
     [CmdletBinding()]
@@ -7899,6 +8772,7 @@ function Invoke-ScrubSelfTest {
     param([switch]$KeepFiles)
     Write-Banner ">_ ULS  v$script:ModuleVersion" "   self-test  ::  synthetic data only  ::  no real logs touched"
     $prevSalt = $script:Salt; $prevLen = $script:HmacLength; $prevAllowed = $script:AllowedDomains; $prevPolicy = $script:ScrubPolicy
+    $prevEngineRequested = $script:ProcessingEngineRequested; $prevEngineChosen = $script:ProcessingEngineChosen; $prevPythonPath = $script:PythonPath; $prevPythonVersion = $script:PythonVersion; $prevPythonMin = $script:PythonMinSpeedupPercent; $prevPythonFallback = $script:ProcessingEngineFallbackReason; $prevPythonCandidate = $script:PythonCandidate; $prevPythonCapability = $script:PythonCapability
     $script:Salt = 'selftest-fixed-salt'; $script:HmacLength = 16; $script:AllowedDomains = @($script:AllowedDomainsDefault)
     $script:__stPass = 0; $script:__stFail = 0
     $assert = {
@@ -7983,13 +8857,102 @@ function Invoke-ScrubSelfTest {
         try {
             Write-UlsProgress -Activity 'Self-test progress' -Phase 'compact' -File 'sample.csv' -RowsDone 1 -RowsTotal 2 -Workers 2 -Pending 1 -Ready 0 -Force
             Write-UlsProgress -Activity 'Self-test progress stale' -Phase 'old' -RowsDone 1 -Force
-            & $assert ($script:UlsProgressState.ContainsKey('Self-test progress stale')) "compact progress helper records active state"
+            & $assert (-not $script:UlsProgressState.ContainsKey('Self-test progress stale')) "progress helper accepts calls without retaining active console state"
             Write-UlsProgress -Activity 'Self-test progress stale' -Reset
             & $assert (-not $script:UlsProgressState.ContainsKey('Self-test progress stale')) "compact progress helper reset clears stale state"
             Write-UlsProgress -Activity 'Self-test progress' -Completed
             & $assert $true "compact progress helper accepts short status inputs"
         }
         catch { & $assert $false "compact progress helper accepts short status inputs" }
+        $helperPath = Get-UlsPythonHelperPath
+        & $assert (Test-Path -LiteralPath $helperPath) "Python processor helper is packaged with the module"
+        try {
+            Initialize-UlsProcessingEngine -Requested Auto -PythonPath (Join-Path $dir 'missing-python.exe') -PythonMinSpeedupPercent 15
+            & $assert ($script:ProcessingEngineRequested -eq 'Auto' -and -not [string]::IsNullOrWhiteSpace($script:ProcessingEngineFallbackReason)) "ProcessingEngine Auto falls back when Python is missing"
+        }
+        catch { & $assert $false "ProcessingEngine Auto falls back when Python is missing" }
+        $strictPythonFailed = $false
+        try { Initialize-UlsProcessingEngine -Requested Python -PythonPath (Join-Path $dir 'missing-python.exe') -PythonMinSpeedupPercent 15 }
+        catch { $strictPythonFailed = ($_.Exception.Message -match 'No usable Python') }
+        & $assert $strictPythonFailed "ProcessingEngine Python fails clearly when Python is missing"
+        try {
+            Initialize-UlsProcessingEngine -Requested Auto -PythonMinSpeedupPercent 15
+            if ($script:PythonCandidate) {
+                $psToken = Invoke-HmacToken -Value 'User.Name@Corp.Local' -Prefix 'UNMAPPED_UPN'
+                $pyToken = Invoke-UlsPythonProcessor -Candidate $script:PythonCandidate -Control @{ mode='token'; value='User.Name@Corp.Local'; prefix='UNMAPPED_UPN'; salt=(Get-SessionSalt); hmacLength=$script:HmacLength } -TimeoutSeconds 10
+                & $assert ($pyToken.ok -and [string]$pyToken.token -eq $psToken) "Python helper token generation matches PowerShell HMAC"
+            }
+            else {
+                & $assert $true "Python helper token parity skipped because Python is unavailable"
+            }
+        }
+        catch {
+            & $assert $true "Python helper token parity skipped because Python is unavailable"
+        }
+        if ($script:PythonCandidate) {
+            try {
+                Initialize-UlsProcessingEngine -Requested Python -PythonMinSpeedupPercent 15
+                $pyDir = Join-Path $dir 'python-accelerator'
+                New-Item -ItemType Directory -Path $pyDir -Force | Out-Null
+                $pyCsv = Join-Path $pyDir 'sample.csv'
+                @(
+                    'date,time,user,ip,host,comment',
+                    '2026-06-30,12:00:00,alice,10.25.30.40,app01.corp.example,user=alice secret=VerySecretValue12345',
+                    '2026-06-30,12:01:00,bob,10.25.30.41,app02.corp.example,caller=bob@example.com token=abcdef1234567890abcdef1234567890'
+                ) | Set-Content -Path $pyCsv -Encoding UTF8
+                $pyProfile = [pscustomobject]@{
+                    Name             = 'PyCsvSelfTest'
+                    Description      = 'Self-test profile for Python accelerator parity.'
+                    Format           = 'Csv'
+                    Delimiter        = ','
+                    PassThroughRegex = '^(date|time)$'
+                    FreeTextRegex    = 'comment'
+                    DenyByDefault    = $false
+                    AllowedDomains   = @()
+                    Allowlist        = @()
+                    AllowlistFile    = @()
+                    AllowlistFiles   = @()
+                    SeedTerms        = @()
+                    SeedFiles        = @()
+                    SchemaColumns    = @()
+                    WholeColumnRules = @()
+                    CustomRegexRules = @()
+                    LabelRules       = @()
+                    ColumnPrefix     = @(
+                        [pscustomobject]@{ Pattern='^user$'; Prefix='PRINCIPAL'; NotOid=$false; DollarComputer=$false },
+                        [pscustomobject]@{ Pattern='ip'; Prefix='IP'; NotOid=$false; DollarComputer=$false },
+                        [pscustomobject]@{ Pattern='host'; Prefix='DNS'; NotOid=$false; DollarComputer=$false }
+                    )
+                    ProfileRoot      = $pyDir
+                }
+                Initialize-ScrubProfileRuntime -Profile $pyProfile
+                $pyMap = Join-Path $pyDir 'scrub_token_map_DO_NOT_UPLOAD.csv'
+                [void](New-ScrubTokenMap -InputPath @($pyCsv) -TokenMapCsv $pyMap -TokenMapMode Replace -ScrubPolicy Balanced -ProfileName 'PyCsvSelfTest' -WorkDir $pyDir)
+                $pyMapManifest = (Get-UlsProcessingEngineSummary)
+                & $assert ((Test-Path -LiteralPath $pyMap) -and (@($pyMapManifest.decisions | Where-Object { $_.Format -eq 'Discovery' -and $_.Chosen -eq 'Python' }).Count -eq 0)) "PowerShell discovery remains token-map authority when Python engine is requested"
+
+                $pySkipOut = Join-Path $pyDir 'sample_skip_scrubbed.csv'
+                $pySkip = Invoke-UlsPythonVerifiedScrubFile -InputPath $pyCsv -OutputPath $pySkipOut -Profile $pyProfile -Format 'Csv' -Delimiter ',' -TokenMapCsv $pyMap -SensitiveTerms @() -SkipLeakCheck
+                $pySkipText = [System.IO.File]::ReadAllText($pySkipOut)
+                & $assert ([bool]$pySkip.LeakCheckSkipped) "Python scrub can run with SkipLeakCheck and records unverified output"
+                & $assert (($pySkipText -match 'PRINCIPAL_[A-F0-9]{4,}') -and ($pySkipText -match 'IP_[A-F0-9]{4,}') -and ($pySkipText -match 'DNS_[A-F0-9]{4,}')) "Python CSV scrub applies PowerShell-built map tokens"
+
+                $pyCheckOut = Join-Path $pyDir 'sample_verified_scrubbed.csv'
+                $pyCheck = Invoke-UlsPythonVerifiedScrubFile -InputPath $pyCsv -OutputPath $pyCheckOut -Profile $pyProfile -Format 'Csv' -Delimiter ',' -TokenMapCsv $pyMap -SensitiveTerms @()
+                & $assert ($pyCheck.Clean -and -not $pyCheck.LeakCheckSkipped) "PowerShell leak check verifies clean Python output"
+
+                $pyIntermediateOut = Join-Path $pyDir 'sample_intermediate_scrubbed.csv'
+                $pyIntermediate = Invoke-UlsPythonScrubIfSelected -InputPath $pyCsv -OutputPath $pyIntermediateOut -Profile $pyProfile -Format 'Csv' -Delimiter ',' -TokenMapCsv $pyMap -SensitiveTerms @() -MapSource 'Discover' -SkipLeakCheck -IsIntermediate
+                & $assert ($pyIntermediate -and $pyIntermediate.Engine -eq 'Python' -and [bool]$pyIntermediate.LeakCheckSkipped) "Python scrub can process PowerShell-converted eligible intermediates"
+            }
+            catch {
+                & $assert $false ("Python scrub-only accelerator self-test failed: {0}" -f $_.Exception.Message)
+            }
+        }
+        else {
+            & $assert $true "Python scrub-only accelerator self-test skipped because Python is unavailable"
+        }
+        Initialize-UlsProcessingEngine -Requested PowerShell -PythonMinSpeedupPercent 15
 
         # ---- 1) Local recommendation mode (no salt required) ----
         Write-Rule "Log format recommendations"
@@ -8642,6 +9605,8 @@ function Invoke-ScrubSelfTest {
         else { try { Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue } catch { } }
         $script:Salt = $prevSalt; $script:HmacLength = $prevLen; $script:AllowedDomains = $prevAllowed; $script:ScrubPolicy = $prevPolicy
         $script:TokenByNorm = @{}; $script:TokenMapCacheKey = $null
+        $script:ProcessingEngineRequested = $prevEngineRequested; $script:ProcessingEngineChosen = $prevEngineChosen; $script:PythonPath = $prevPythonPath; $script:PythonVersion = $prevPythonVersion; $script:PythonMinSpeedupPercent = $prevPythonMin; $script:ProcessingEngineFallbackReason = $prevPythonFallback; $script:PythonCandidate = $prevPythonCandidate; $script:PythonCapability = $prevPythonCapability
+        $script:ProcessingEngineDecisions = New-Object System.Collections.Generic.List[object]
     }
     Write-Host ""
     if ($script:__stFail -eq 0) { Write-Ok "SELF-TEST PASSED ($script:__stPass checks)." }
@@ -8948,17 +9913,18 @@ function Write-RunManifest {
     $manifest = [pscustomobject]@{
         tool            = "UniversalLogScrubber.psm1"
         toolVersion     = $script:ModuleVersion
-        schemaVersion   = "4.12"
+        schemaVersion   = "4.16"
         generatedUtc    = ((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))
         saltFingerprint = (Get-SaltFingerprint)
         hmacLength      = $script:HmacLength
         scrubPolicy     = $script:ScrubPolicy
+        processingEngine = (Get-UlsProcessingEngineSummary)
         tokenMapCsv     = $TokenMapCsv
         tokenMapMode    = $TokenMapMode
         scrubbedFiles   = $entries
     }
     $out = Resolve-OutPath -Path (Join-Path $WorkDir "scrub_run_manifest.json")
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $out -Encoding UTF8
+    $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path $out -Encoding UTF8
     Write-Ok "Run manifest written: $out"
     return $out
 }
@@ -9018,6 +9984,9 @@ function Invoke-UniversalScrubber {
         [switch]$SkipLeakCheck,
         [switch]$PerfReport,
         [switch]$PerfReportDetailed,
+        [ValidateSet('PowerShell','Auto','Python')][string]$ProcessingEngine = 'PowerShell',
+        [string]$PythonPath,
+        [int]$PythonMinSpeedupPercent = 15,
         [switch]$ParallelScrub,
         [switch]$NoParallelScrub,
         [switch]$ParallelDiscovery,
@@ -9061,6 +10030,7 @@ function Invoke-UniversalScrubber {
     $script:PerfReportTextPath = $null
 
     Write-Banner ">_ ULS  v$script:ModuleVersion" "   map first  ::  scrub second  ::  verify before upload"
+    Initialize-UlsProcessingEngine -Requested $ProcessingEngine -PythonPath $PythonPath -PythonMinSpeedupPercent $PythonMinSpeedupPercent
     if ($RecommendOnly) { Write-Info "RECOMMEND ONLY mode -- local sample analysis only." }
     if ($SafeFirstRun) { Write-Info "SAFE FIRST RUN mode -- local sample analysis only." }
     if ($AutoProfile) { Write-Info "AUTO PROFILE mode -- use one high-confidence recommendation when possible." }
@@ -9068,6 +10038,7 @@ function Invoke-UniversalScrubber {
     if ($Stream) { Write-Info "STREAM mode -- bounded memory for very large files." }
     if ($PerfReport -or $PerfReportDetailed) { Write-Info "PERF REPORT mode -- phase timings will be written locally." }
     if ($PerfReportDetailed) { Write-Info "PERF REPORT DETAILED mode -- per-column timings add overhead and should not be used for baseline timings." }
+    if ($ProcessingEngine -ne 'PowerShell') { Write-Info ("PROCESSING ENGINE {0} -- Python may be used for eligible map-driven scrub phases; discovery and leak-check remain PowerShell-authoritative." -f $ProcessingEngine) }
     if ($NoParallelScrub) { Write-Info "PARALLEL SCRUB disabled by -NoParallelScrub." }
     elseif ($ParallelScrub) { Write-Info ("PARALLEL SCRUB mode -- streaming runspace batches; throttle={0}; batchSize={1}." -f $ThrottleLimit, $chunkSizeLabel) }
     if ($NoParallelDiscovery) { Write-Info "PARALLEL DISCOVERY disabled by -NoParallelDiscovery." }
@@ -9450,6 +10421,35 @@ function Invoke-UniversalScrubber {
             try { if ($prof.Delimiter) { $parallelDelim = [string]$prof.Delimiter } } catch { }
             if ($parallelFormat -eq 'Tsv') { $parallelDelim = "`t" }
             elseif ($parallelFormat -eq 'Psv') { $parallelDelim = '|' }
+
+            $isIntermediateForEngine = $false
+            foreach ($mid in @($intermediateTargets)) {
+                try {
+                    if ([string]::Equals([string]$mid.FullName, [string]$t.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $isIntermediateForEngine = $true
+                        break
+                    }
+                } catch { }
+            }
+            $pythonResult = Invoke-UlsPythonScrubIfSelected `
+                -InputPath $t.FullName `
+                -OutputPath $outPath `
+                -Profile $prof `
+                -Format $parallelFormat `
+                -Delimiter $parallelDelim `
+                -TokenMapCsv $TokenMapCsv `
+                -SensitiveTerms $SensitiveTerms `
+                -MapSource $MapSource `
+                -DryRun:$DryRun `
+                -SkipLeakCheck:$SkipLeakCheck `
+                -ExplainDetections:$ExplainDetections `
+                -ParallelScrub:($ParallelScrub -and -not $NoParallelScrub) `
+                -IsIntermediate:$isIntermediateForEngine
+            if ($pythonResult) {
+                $results += $pythonResult
+                continue
+            }
+
             # Treat worker-progress parameters as an internal worker-mode signal so helper
             # paths can never recursively parallelize.
             $parallelWorkerMode = ((-not [string]::IsNullOrWhiteSpace($WorkerProgressFile)) -or ($WorkerProgressRowsTotal -gt 0) -or ($WorkerProgressChunk -gt 0) -or $DiscoveryOnly)
@@ -9514,14 +10514,18 @@ function Invoke-UniversalScrubber {
         }
     }
     $okCount = @($results | Where-Object { $_.Clean }).Count
+    $verifiedCount = @($results | Where-Object { $_.Clean -and -not $_.LeakCheckSkipped }).Count
+    $unverifiedCount = @($results | Where-Object { $_.Clean -and $_.LeakCheckSkipped }).Count
     $badCount = @($results | Where-Object { -not $_.Clean }).Count
     foreach ($r in $results) {
         $rn = if ($r.Output) { [System.IO.Path]::GetFileName($r.Output) } else { [System.IO.Path]::GetFileName($r.Input) }
-        if ($r.Clean) { Write-Ok $rn }
+        if ($r.Clean -and $r.LeakCheckSkipped) { Write-Warn ($rn + "  (leak check skipped -- NOT verified)") }
+        elseif ($r.Clean) { Write-Ok $rn }
         else { Write-Fail ($rn + "  (leak check did NOT pass or file failed -- review!)") }
     }
     Write-Host ""
-    if ($badCount -eq 0) { Write-Ok "$okCount file(s) scrubbed and verified clean." }
+    if ($badCount -eq 0 -and $unverifiedCount -eq 0) { Write-Ok "$verifiedCount file(s) scrubbed and verified clean." }
+    elseif ($badCount -eq 0) { Write-Warn "$verifiedCount verified clean, $unverifiedCount scrubbed but NOT verified (-SkipLeakCheck)." }
     else { Write-Warn "$okCount clean, $badCount need review before upload." }
     if ($SafeBundleOut) {
         try { [void](New-SafeScrubBundle -Results $results -OutputPath $SafeBundleOut -Force:$Force) }
@@ -9529,7 +10533,12 @@ function Invoke-UniversalScrubber {
     }
     Write-Host ""
     Write-Warn "NEVER upload: $TokenMapCsv"
-    Write-Ok  "Safe to upload: the *_scrubbed.* files in $WorkDir"
+    if ($badCount -eq 0 -and $unverifiedCount -eq 0) {
+        Write-Ok  "Safe to upload: the *_scrubbed.* files in $WorkDir"
+    }
+    else {
+        Write-Warn "Do NOT upload unverified or failed scrubbed files until a leak check passes."
+    }
     if ($script:PerfReportEnabled) { [void](Write-UlsPerfReport -WorkDir $WorkDir) }
     Write-Host ""
     return $results
